@@ -1,0 +1,536 @@
+Description: Fix loads of typos
+ During Debian packaging review, found these.
+Author: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/ccan/list/list.h
++++ b/ccan/list/list.h
+@@ -412,7 +412,7 @@
+ /**
+  * list_for_each_off - iterate through a list of memory regions.
+  * @h: the list_head
+- * @i: the pointer to a memory region wich contains list node data.
++ * @i: the pointer to a memory region which contains list node data.
+  * @off: offset(relative to @i) at which list node data resides.
+  *
+  * This is a low-level wrapper to iterate @i over the entire list, used to
+@@ -423,9 +423,9 @@
+  * nor care about the type of @i. The only assumtion made is that @i points
+  * to a chunk of memory that at some @offset, relative to @i, contains a
+  * properly filled `struct node_list' which in turn contains pointers to
+- * memory chunks and it's turtles all the way down. Whith all that in mind
++ * memory chunks and it's turtles all the way down. With all that in mind
+  * remember that given the wrong pointer/offset couple this macro will
+- * happilly churn all you memory untill SEGFAULT stops it, in other words
++ * happilly churn all you memory until SEGFAULT stops it, in other words
+  * caveat emptor.
+  *
+  * It is worth mentioning that one of legitimate use-cases for that wrapper
+@@ -448,7 +448,7 @@
+  * list_for_each_safe_off - iterate through a list of memory regions, maybe
+  * during deletion
+  * @h: the list_head
+- * @i: the pointer to a memory region wich contains list node data.
++ * @i: the pointer to a memory region which contains list node data.
+  * @nxt: the structure containing the list_node
+  * @off: offset(relative to @i) at which list node data resides.
+  *
+--- a/doc/device-tree.txt
++++ b/doc/device-tree.txt
+@@ -115,7 +115,7 @@
+ 	 *
+ 	 * Unless a component (skiboot or Linux) specifically knows about a region (usually
+ 	 * based on its name) and decides to change or remove it, all these regions are
+-	 * passed as-is to Linux and to subsequent kernels accross kexec and are kept
++	 * passed as-is to Linux and to subsequent kernels across kexec and are kept
+ 	 * preserved.
+ 	 *
+ 	 * NOTE: Do *NOT* copy the entries below, they are just an example and are actually
+@@ -189,7 +189,7 @@
+ 			ibm,segment-page-sizes = <0xc 0x0 0x3 0xc 0x0 0x10 0x7 0x18 0x38 0x10 0x110 0x2 0x10 0x1 0x18 0x8 0x18 0x100 0x1 0x18 0x0 0x22 0x120 0x1 0x22 0x3>;
+ 
+ 			/*
+-			 * Similarily that might need to be reviewed later but will do for now...
++			 * Similarly that might need to be reviewed later but will do for now...
+ 			 */			
+ 			ibm,pa-features = [0x6 0x0 0xf6 0x3f 0xc7 0x0 0x80 0xc0];
+ 
+@@ -333,7 +333,7 @@
+ 	 * In order to be able to handle affinity propertly, we require that
+ 	 * a memory node is created for each range of memory that has a different
+ 	 * "affinity", which in practice means for each chip since we don't
+-	 * support memory interleaved accross multiple chips on P8.
++	 * support memory interleaved across multiple chips on P8.
+ 	 *
+ 	 * Additionally, it is *not* required that one chip = one memory node,
+ 	 * it is perfectly acceptable to break down the memory of one chip into
+@@ -345,7 +345,7 @@
+ 
+ 		/*
+ 		 * We support multiple entries in the ibm,chip-id property for
+-		 * memory nodes in case the memory is interleaved accross multiple
++		 * memory nodes in case the memory is interleaved across multiple
+ 		 * chips but that shouldn't happen on P8
+ 		 */
+ 		ibm,chip-id = <0x0>;
+--- a/doc/device-tree/ibm,opal.txt
++++ b/doc/device-tree/ibm,opal.txt
+@@ -3,7 +3,7 @@
+ 		#size-cells = <0x0>;
+ 		compatible = "ibm,opal-v2", "ibm,opal-v3";
+ 
+-; v2 is maintained for possible compatibilty with very, very old kernels
++; v2 is maintained for possible compatibility with very, very old kernels
+ ; it will go away at some point in the future. Detect and rely on ibm,opal-v3
+ 
+ 		ibm,associativity-reference-points = <0x4 0x3>;
+--- a/doc/error-logging.txt
++++ b/doc/error-logging.txt
+@@ -52,7 +52,7 @@
+ 		#define OPAL_INPUT_OUTPUT_ERR_EVT       0x02
+ 		/* RESOURCE_DEALLOC: Hotplug events and errors */
+ 		#define OPAL_RESOURCE_DEALLOC_ERR_EVT   0x03
+-		/* MISC: Miscellanous error */
++		/* MISC: Miscellaneous error */
+ 		#define OPAL_MISC_ERR_EVT               0x04
+ 
+ 	uint16_t component_id: Component ID of Sapphire component as
+--- a/doc/nvlink.txt
++++ b/doc/nvlink.txt
+@@ -134,7 +134,7 @@
+ 
+ Link Number
+ 
+-   Physical link number this emulated PCI device is assoicated
++   Physical link number this emulated PCI device is associated
+    with. One of 0, 1, 4 or 5 (links 2 & 3 do not exist on Naples).
+ 
+ Reserved
+--- a/doc/opal-api/opal-pci-phb-mmio-enable-27.txt
++++ b/doc/opal-api/opal-pci-phb-mmio-enable-27.txt
+@@ -13,7 +13,7 @@
+ 
+ The host calls this function to enable or disable PHB decode of the PCI IO
+ and Memory address spaces below that PHB. Window_num selects an mmio window
+-within that addres space. Enable set to '1' enables the PHB to decode and
++within that address space. Enable set to '1' enables the PHB to decode and
+ forward system real addresses to PCI memory, while enable set to '0' disables
+ PHB decode and forwarding for the address range defined in a particular MMIO
+ window.
+--- a/doc/opal-api/opal-rtc-read-3.txt
++++ b/doc/opal-api/opal-rtc-read-3.txt
+@@ -21,7 +21,7 @@
+ Since RTC calls can be pretty slow, OPAL_RTC_READ is likely to first return
+ OPAL_BUSY_EVENT, requiring the caller to wait until the OPAL_EVENT_RTC event
+ has been signaled. Once the event has been signalled, a subsequent
+-OPAL_RTC_READ call will retreive the time. Since the OPAL_EVENT_RTC event is
++OPAL_RTC_READ call will retrieve the time. Since the OPAL_EVENT_RTC event is
+ used for both reading and writing the RTC, callers must be able to handle
+ the event being signalled for a concurrent in flight OPAL_RTC_WRITE rather
+ than this read request.
+--- a/doc/release-notes/skiboot-5.1.0-beta2.txt
++++ b/doc/release-notes/skiboot-5.1.0-beta2.txt
+@@ -44,7 +44,7 @@
+      to have shared mode. So we have to cut off the first M64 segment,
+      which corresponds to reserved PE#0 in kernel. If the first BAR
+      (for example PF's IOV BAR) requires huge alignment in kernel, we
+-     have to waste huge M64 space to accomodate the alignment. If we
++     have to waste huge M64 space to accommodate the alignment. If we
+      have reserved PE#256, the waste of M64 space will be avoided.
+ 
+ Other changes:
+--- a/doc/release-notes/skiboot-5.1.0.txt
++++ b/doc/release-notes/skiboot-5.1.0.txt
+@@ -104,7 +104,7 @@
+      to have shared mode. So we have to cut off the first M64 segment,
+      which corresponds to reserved PE#0 in kernel. If the first BAR
+      (for example PF's IOV BAR) requires huge alignment in kernel, we
+-     have to waste huge M64 space to accomodate the alignment. If we
++     have to waste huge M64 space to accommodate the alignment. If we
+      have reserved PE#256, the waste of M64 space will be avoided.
+ 
+ FSP-specific bugs fixed:
+--- a/doc/release-notes/skiboot-5.1.12.txt
++++ b/doc/release-notes/skiboot-5.1.12.txt
+@@ -25,7 +25,7 @@
+ - hw/phb3: Flush cache line after updating P/Q bits
+     When doing an MSI EOI, we update the P and Q bits in the IVE. That causes
+     the corresponding cache line to be dirty in the L3 which will cause a
+-    subsequent update by the PHB (upon recieving the next MSI) to get a few
++    subsequent update by the PHB (upon receiving the next MSI) to get a few
+     retries until it gets flushed.
+ 
+     We improve the situation (and thus performance) by doing a dcbf
+--- a/doc/release-notes/skiboot-5.1.2.txt
++++ b/doc/release-notes/skiboot-5.1.2.txt
+@@ -31,7 +31,7 @@
+ - build improvements
+   - fixes for two compiler warnings were squashed in 5.1.1 commit,
+     re-introduce the fixes.
+-  - misc complier/static analysis warning fixes
++  - misc compiler/static analysis warning fixes
+ 
+ - gard utility:
+   - If gard tool detects the GUARD PNOR partition is corrupted, it will
+--- a/doc/release-notes/skiboot-5.2.2.txt
++++ b/doc/release-notes/skiboot-5.2.2.txt
+@@ -9,7 +9,7 @@
+ 
+ Skiboot 5.2.2 replaces skiboot-5.2.1 as the current stable version, which was
+ released on April 27th, 2016. Over skiboot-5.2.1, skiboot 5.2.2 contains
+-one bug fix targetted at P8NVL systems, notably the Garrison platform.
++one bug fix targeted at P8NVL systems, notably the Garrison platform.
+ 
+ skiboot-5.2.2 contains all bug fixes as of skiboot-5.1.16.
+ 
+--- a/external/boot-tests/bmc_support.sh
++++ b/external/boot-tests/bmc_support.sh
+@@ -69,7 +69,7 @@
+ 		msg "Flashing full PNOR"
+ 		$SSHCMD "$PFLASH_BINARY -E -f -p /tmp/image.pnor"
+ 		if [ "$?" -ne "0" ] ; then
+-			error "An unexpected pflash error has occured";
++			error "An unexpected pflash error has occurred";
+ 		fi
+ 	fi
+ 
+@@ -77,7 +77,7 @@
+ 		msg "Flashing PAYLOAD PNOR partition"
+ 		$SSHCMD "$PFLASH_BINARY -e -f -P PAYLOAD -p /tmp/skiboot.lid"
+ 		if [ "$?" -ne "0" ] ; then
+-                        error "An unexpected pflash error has occured";
++                        error "An unexpected pflash error has occurred";
+                 fi
+ 	fi
+ 
+@@ -85,7 +85,7 @@
+                 msg "Flashing BOOTKERNEL PNOR partition"
+                 $SSHCMD "$PFLASH_BINARY -e -f -P BOOTKERNEL -p /tmp/bootkernel"
+                 if [ "$?" -ne "0" ] ; then
+-                        error "An unexpected pflash error has occured";
++                        error "An unexpected pflash error has occurred";
+                 fi
+         fi
+ }
+--- a/external/gard/gard.c
++++ b/external/gard/gard.c
+@@ -128,7 +128,7 @@
+ 			fprintf(stderr, "libflash ecc invalid\n");
+ 			break;
+ 		default:
+-			fprintf(stderr, "A libflash/libffs error has occured %d\n", rc);
++			fprintf(stderr, "A libflash/libffs error has occurred %d\n", rc);
+ 	}
+ }
+ 
+--- a/external/mambo/mambo_utils.tcl
++++ b/external/mambo/mambo_utils.tcl
+@@ -199,7 +199,7 @@
+     while { [mysim memory display 0x700 8] != 0 } {
+         mysim cycle 1
+     }
+-    puts "condition occured "
++    puts "condition occurred "
+     ipc
+ }
+ 
+--- a/external/opal-prd/hostboot-interface.h
++++ b/external/opal-prd/hostboot-interface.h
+@@ -181,7 +181,7 @@
+ 	 * @brief Write to Pnor
+ 	 * @param[in] i_proc: processor Id
+ 	 * @param[in] i_partitionName: name of the partition to write
+-	 * @param[in] i_offset: offset withing the partition
++	 * @param[in] i_offset: offset within the partition
+ 	 * @param[in] i_data: pointer to the data to write
+ 	 * @param[in] i_sizeBytes: size of data to write
+ 	 * @retval rc - number of bytes written, or non-zero on error
+--- a/external/opal-prd/i2c.c
++++ b/external/opal-prd/i2c.c
+@@ -149,7 +149,7 @@
+ 
+ 	/* Not all kernel driver versions support breaking up a write into
+ 	 * two components (offset, data), so we coalesce them first and
+-	 * issue a single write. The offset is layed out in BE format.
++	 * issue a single write. The offset is laid out in BE format.
+ 	 */
+ 	size = offset_size + length;
+ 	buf = malloc(size);
+--- a/external/opal-prd/opal-prd.8
++++ b/external/opal-prd/opal-prd.8
+@@ -47,7 +47,7 @@
+ process.
+ 
+ .PP
+-Currently, there's one command available, 'occ', for controling the
++Currently, there's one command available, 'occ', for controlling the
+ on-chip-controllers. That has 3 possible sub-commands: \fIreset\fP,
+ \fIenable\fP, and \fIdisable\fP.
+ 
+--- a/external/opal-prd/test/test_pnor_ops.c
++++ b/external/opal-prd/test/test_pnor_ops.c
+@@ -122,7 +122,7 @@
+ 		perror("mkstemp");
+ 		return EXIT_FAILURE;
+ 	}
+-	/* So the file dissapears when we exit */
++	/* So the file disappears when we exit */
+ 	unlink(filename);
+ 
+ 	/* E for empty */
+--- a/external/pflash/pflash.c
++++ b/external/pflash/pflash.c
+@@ -404,7 +404,7 @@
+ 	rc = arch_flash_4b_mode(bl, true);
+ 	if (rc) {
+ 		if (rc == -1) {
+-			fprintf(stderr, "Switching address mode not availible on this architecture\n");
++			fprintf(stderr, "Switching address mode not available on this architecture\n");
+ 		} else {
+ 			fprintf(stderr, "Error %d enabling 4b mode\n", rc);
+ 		}
+@@ -421,7 +421,7 @@
+ 	rc = arch_flash_4b_mode(bl, false);
+ 	if (rc) {
+ 		if (rc == -1) {
+-			fprintf(stderr, "Switching address mode not availible on this architecture\n");
++			fprintf(stderr, "Switching address mode not available on this architecture\n");
+ 		} else {
+ 			fprintf(stderr, "Error %d enabling 4b mode\n", rc);
+ 		}
+@@ -478,7 +478,7 @@
+ 	printf("\t\tto specify the size to read (or it will use the source\n");
+ 	printf("\t\tfile size if used in conjunction with -p and -s is not\n");
+ 	printf("\t\tspecified). When using -r together with -e or -p, the\n");
+-	printf("\t\tread will be peformed first\n\n");
++	printf("\t\tread will be performed first\n\n");
+ 	printf("\t-E, --erase-all\n");
+ 	printf("\t\tErase entire flash chip\n");
+ 	printf("\t\t(Not supported on all chips/controllers)\n\n");
+--- a/external/test/test.sh
++++ b/external/test/test.sh
+@@ -43,7 +43,7 @@
+ }
+ 
+ diff_with_result() {
+-	# Explicitly diff a file with an arbitary result file
++	# Explicitly diff a file with an arbitrary result file
+ 	if [ "$#" -eq 1 ] ; then
+ 		if ! diff -u "$RESULT" "$1" ; then
+ 			fail_test;
+--- a/hdata/spira.h
++++ b/hdata/spira.h
+@@ -400,14 +400,14 @@
+  * Note that slots meant for the addition of GX+ adapters that
+  * are currently unpopulated but support hotplug will have a
+  * minimum "placeholder" entry, which will be fully populated
+- * when the array is rebuild during concurrent maintainance.
++ * when the array is rebuild during concurrent maintenance.
+  * This "placeholder" is called a "reservation".
+  *
+- * WARNING: The array rebuild by concurrent maintainance is not
++ * WARNING: The array rebuild by concurrent maintenance is not
+  * guaranteed to be in the same order as the IPL array, not is
+- * the order stable between concurrent maintainance operations.
++ * the order stable between concurrent maintenance operations.
+  *
+- * There's also a child pointer to daugher card structures but
++ * There's also a child pointer to daughter card structures but
+  * we aren't going to handle that just yet.
+  */
+ #define CECHUB_FRU_HDIF_SIG	"IO HUB"
+@@ -584,7 +584,7 @@
+  * child. A child has a pointer to its parent. Siblings are
+  * consecutive entries.
+  *
+- * Note: If we ever support concurrent maintainance... this is
++ * Note: If we ever support concurrent maintenance... this is
+  * completely rebuilt, invalidating all indices, though other
+  * structures that may reference SLCA by index will be rebuilt
+  * as well.
+--- a/hw/npu.c
++++ b/hw/npu.c
+@@ -1496,7 +1496,7 @@
+ 	/* 0x10 - BARs, always 64-bits non-prefetchable
+ 	 *
+ 	 * Each emulated device represents one link and therefore
+-	 * there is one BAR for the assocaited DLTL region.
++	 * there is one BAR for the associated DLTL region.
+ 	 */
+ 
+ 	/* Low 32-bits */
+--- a/hw/phb3.c
++++ b/hw/phb3.c
+@@ -1221,7 +1221,7 @@
+ 	 * To avoid this race, we increment the generation count in
+ 	 * the IVT when we clear P. When software writes the IVC with
+ 	 * P cleared but with gen=n, the IVC won't actually clear P
+-	 * becuase gen doesn't match what it just cached from the IVT.
++	 * because gen doesn't match what it just cached from the IVT.
+ 	 * Hence we don't lose P being set.
+ 	 */
+ 
+--- a/include/spcn.h
++++ b/include/spcn.h
+@@ -137,7 +137,7 @@
+ #define SENSOR_STATUS_FAULTED	0x0002
+ #define SENSOR_STATUS_PRESENT	0x0001
+ 
+-/* Power sensor is retrieved thru a new PRS modifier 0x1C, data
++/* Power sensor is retrieved through a new PRS modifier 0x1C, data
+  * response is as follows:
+  *
+  * Byte 0:
+--- a/libc/stdio/vsnprintf.c
++++ b/libc/stdio/vsnprintf.c
+@@ -240,7 +240,7 @@
+ 
+ 
+ /*
+- * The vsnprintf function prints a formated strings into a buffer.
++ * The vsnprintf function prints a formatted strings into a buffer.
+  * BUG: buffer size checking does not fully work yet
+  */
+ int
+--- a/libc/time.c
++++ b/libc/time.c
+@@ -57,7 +57,7 @@
+ 	 * Work out the year. We subtract one day for every four years
+ 	 * and every 400 years after 1969. However as leap years don't
+ 	 * occur every 100 years we add one day back to counteract the
+-	 * the substraction for every 4 years.
++	 * the subtraction for every 4 years.
+ 	 */
+ 	Y = (D - (1+D/365)/4 + (69+D/365)/100 - (369+D/365)/400)/365;
+ 
+--- a/libpore/p8_pore_table_gen_api_fixed.C
++++ b/libpore/p8_pore_table_gen_api_fixed.C
+@@ -715,7 +715,7 @@
+   //   except the APPEND command, incl the translated REPLACE->APPEND, which will result 
+   //   in the previously mentioned code error being returned.
+   // - The table can be full but still include NOOPs. If so, we can still APPEND since
+-  //   we append at first occurrance of a NOOP or at the end of the table (at the RET).
++  //   we append at first occurrence of a NOOP or at the end of the table (at the RET).
+   switch (i_section)  {
+   case P8_SCOM_SECTION_NC:
+     if ( ( (operation==P8_PORE_SCOM_APPEND && entriesCount==SLW_MAX_SCOMS_NC) &&
+--- a/libpore/pgas.h
++++ b/libpore/pgas.h
+@@ -34,7 +34,7 @@
+ /// \file pgas.h
+ /// \brief Pore GAS
+ ///
+-/// PGAS is documented in a seperate standalone document entitled <em> PGAS :
++/// PGAS is documented in a separate standalone document entitled <em> PGAS :
+ /// PORE GAS (GNU Assembler) User's and Reference Manual </em>.
+ ///
+ /// This file defines support macros for the GNU PORE assembler, and the PORE
+@@ -600,7 +600,7 @@
+         // HW274735 documents that BC and BS are broken for the PORE-GPE0/1
+         // pair. This bug is unfixed in POWER8, and by default we require BSI
+         // and BCI to be implemented as macros on all engines. For
+-        // compatability we continue to require that dx == D0.
++        // compatibility we continue to require that dx == D0.
+ 
+         .macro  bsi, dx:req, offset:req, base:req, imm:req
+         ..d0    (\dx)
+--- a/libpore/pore_inline.h
++++ b/libpore/pore_inline.h
+@@ -291,7 +291,7 @@
+ /// PORE inline assembler context
+ ///
+ /// See the documentation page \ref pore_inline_assembler and the function
+-/// pore_inline_context_create() for futher details.
++/// pore_inline_context_create() for further details.
+ 
+ typedef struct {
+ 
+--- a/libpore/pore_inline_assembler.c
++++ b/libpore/pore_inline_assembler.c
+@@ -108,7 +108,7 @@
+ /// 
+ /// Since the PORE instruction APIs are effectivly predicates, linear code
+ /// sequences are easily assembled using the C-language logical OR construct.
+-/// Any non-0 return code will immediatly break the sequence and set the
++/// Any non-0 return code will immediately break the sequence and set the
+ /// expression value to 1.  The failure code can then be recovered from the \a
+ /// error field of the context.  This coding technique is illustrated in the
+ /// following example of assembling a memory-memory copy sequence.
+--- a/libpore/sbe_xip_image.c
++++ b/libpore/sbe_xip_image.c
+@@ -906,7 +906,7 @@
+ // "FNV hash algorithms and source code have been released into the public
+ // domain. The authors of the FNV algorithmm look deliberate steps to disclose
+ // the algorhtm (sic) in a public forum soon after it was invented. More than
+-// a year passed after this public disclosure and the authors deliberatly took
++// a year passed after this public disclosure and the authors deliberately took
+ // no steps to patent the FNV algorithm. Therefore it is safe to say that the
+ // FNV authors have no patent claims on the FNV algorithm as published."
+ 
+--- a/libpore/sbe_xip_image.h
++++ b/libpore/sbe_xip_image.h
+@@ -215,7 +215,7 @@
+ /// Final alignment constraint for SBE-XIP images.
+ ///
+ /// PORE images are required to be multiples of 8 bytes in length, to
+-/// gaurantee that the PoreVe will be able to complete any 8-byte load/store.
++/// guarantee that the PoreVe will be able to complete any 8-byte load/store.
+ #define SBE_XIP_FINAL_ALIGNMENT 8
+ 
+ 
+@@ -270,7 +270,7 @@
+     /// unaligned instruction or data fetches.  Some sections and subsections
+     /// must also be POWER cache-line aligned. The \a iv_alignment applies to
+     /// the first byte of the section. PORE images are also required to be
+-    /// multiples of 8 bytes in length, to gaurantee that the PoreVe will be
++    /// multiples of 8 bytes in length, to guarantee that the PoreVe will be
+     /// able to complete any 8-byte load/store.  These constraints are checked
+     /// by sbe_xip_validate() and enforced by sbe_xip_append(). The alignment
+     /// constraints may force a section to be padded, which may create "holes"
+@@ -811,7 +811,7 @@
+ /// images in terms of their relocatable PORE addresses.  The API checks that
+ /// the \a i_poreAddress is properly aligned and contained in the image, then
+ /// reads the contents of \a i_poreAddress into \a o_data, performing
+-/// image-to-host endianess conversion if required.
++/// image-to-host endianness conversion if required.
+ ///
+ /// \retval 0 Success
+ ///
+@@ -926,7 +926,7 @@
+ /// images in terms of their relocatable PORE addresses.  The API checks that
+ /// the \a i_poreAddress is properly aligned and contained in the image, then
+ /// updates the contents of \a i_poreAddress with \a i_data, performing
+-/// host-to-image endianess conversion if required.
++/// host-to-image endianness conversion if required.
+ ///
+ /// \retval 0 Success
+ ///
+@@ -1332,7 +1332,7 @@
+ /// \param[in] i_hostAddress A host address addressing data within the image.
+ ///
+ /// \param[out] o_poreAddress The API updates the location pointed to by \a
+-/// o_poreAddress with the equivelent relocatable PORE address of the memory
++/// o_poreAddress with the equivalent relocatable PORE address of the memory
+ /// addressed by i_hostAddress.  Since valid PORE addresses are always either
+ /// 4-byte (code) or 8-byte (data) aligned, this API checks the aligment of
+ /// the translated address and returns SBE_XIP_ALIGNMENT_ERROR if the PORE
+@@ -1416,7 +1416,7 @@
+ /// Attempt to grow the image past its defined memory allocation
+ #define SBE_XIP_WOULD_OVERFLOW 14
+ 
+-/// Error associated with the disassembler occured.
++/// Error associated with the disassembler occurred.
+ #define SBE_XIP_DISASSEMBLER_ERROR 15
+ 
+ /// hash collision creating the .fixed_toc section
+--- a/external/opal-prd/opal-prd.c
++++ b/external/opal-prd/opal-prd.c
+@@ -1618,7 +1618,7 @@
+ 	pr_debug("HBRT: calling hservices_init");
+ 	rc = hservices_init(ctx, ctx->code_addr);
+ 	if (rc) {
+-		pr_log(LOG_ERR, "HBRT: Can't initiliase HBRT");
++		pr_log(LOG_ERR, "HBRT: Can't initialise HBRT");
+ 		goto out_close;
+ 	}
+ 	pr_debug("HBRT: hservices_init done");

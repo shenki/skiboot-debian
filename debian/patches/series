@@ -1,0 +1,3 @@
+uninitialized_uses.patch
+fix-typos.patch
+fix-hardening-for-opal-gard.patch

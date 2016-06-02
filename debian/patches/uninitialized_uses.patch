@@ -1,0 +1,19 @@
+Description: Uninitialized uses
+ Fix up uninitialized variables that make our build fail.
+Author: Mathieu Trudel-Lapierre <mathieu-tl@ubuntu.com>
+---
+ external/gard/gard.c |    2 +-
+ libflash/libffs.c    |    2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+--- a/libflash/libffs.c
++++ b/libflash/libffs.c
+@@ -160,7 +160,7 @@
+ 
+ 	if (mark_ecc) {
+ 		uint32_t start, total_size;
+-		bool ecc;
++		bool ecc = false;
+ 		for (i = 0; i < f->hdr.entry_count; i++) {
+ 			rc = ffs_part_info(f, i, NULL, &start, &total_size,
+ 					NULL, &ecc);

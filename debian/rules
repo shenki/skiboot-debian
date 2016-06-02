@@ -1,0 +1,35 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+UPSTREAM_VERSION := $(shell dpkg-parsechangelog -S Version | sed 's/-.*//')
+
+# Uncomment this to turn on verbose mode.
+export DH_VERBOSE=1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+
+%:
+	dh $@ --with systemd
+
+override_dh_auto_build:
+	OPAL_PRD_VERSION=opal-prd-$(UPSTREAM_VERSION) make V=1 -C external/opal-prd/
+	GARD_VERSION=gard-$(UPSTREAM_VERSION) make V=1 -C external/gard/
+
+override_dh_auto_install:
+	make -C external/opal-prd/ prefix=/usr DESTDIR=../../debian/tmp/ install
+	make -C external/gard/ prefix=/usr DESTDIR=../../debian/tmp/ install
+
+override_dh_auto_clean:
+	make -C external/opal-prd/ clean
+	make -C external/gard/ clean
+	rm -f external/opal-prd/ccan \
+		external/opal-prd/.version \
+		external/opal-prd/version.c \
+		external/opal-prd/common \
+		external/opal-prd/libflash \
+		external/gard/version.c \
+		external/gard/common \
+		external/gard/ccan \
+		external/gard/make_version.sh \
+		external/gard/libflash
+	dh_auto_clean

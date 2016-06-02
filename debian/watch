@@ -1,0 +1,2 @@
+version=3
+https://github.com/open-power/skiboot/tags .*/skiboot-(\d\S*)\.tar\.gz

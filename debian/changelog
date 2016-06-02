@@ -1,0 +1,5 @@
+skiboot (5.2.2-1) unstable; urgency=medium
+
+  * Import from Ubuntu and update to upstream release  (Closes: #797987)
+
+ -- Frederic Bonnard <frediz@linux.vnet.ibm.com>  Thu, 02 Jun 2016 15:34:47 +0200
