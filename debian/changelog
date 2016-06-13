@@ -1,3 +1,9 @@
+skiboot (5.2.2-2) unstable; urgency=medium
+
+  * Fixed d/copyright 3 files
+
+ -- Frederic Bonnard <frediz@linux.vnet.ibm.com>  Mon, 13 Jun 2016 11:49:19 +0200
+
 skiboot (5.2.2-1) unstable; urgency=medium
 
   * Import from Ubuntu and update to upstream release  (Closes: #797987)

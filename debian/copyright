@@ -6,6 +6,11 @@ Files: *
 Copyright: 2015 International Business Machines Corporation and others.
 License: Apache-2.0
 
+Files: debian/*
+Copyright: 2015 Jeremy Kerr <jk@ozlabs.org>
+           2016 Frederic Bonnard <frediz@linux.vnet.ibm.com>
+License: GPL-2+
+
 Files: ccan/*
 Copyright: http://ccodearchive.net
 License: CC0
@@ -14,11 +19,6 @@ Files: ccan/list/*
 Copyright: Rusty Russell <rusty@rustcorp.com.au>
 License: MIT/X11-BSD-like
 
-Files: debian/*
-Copyright: 2015 Jeremy Kerr <jk@ozlabs.org>
-           2016 Frederic Bonnard <frediz@linux.vnet.ibm.com>
-License: GPL-2+
-
 Files: libc/ctype/* libc/include/* libc/stdio/* libc/stdlib/* libc/string/*
 Copyright: 2015 International Business Machines Corporation and others.
 License: BSD-2-Clause
@@ -26,6 +26,15 @@ License: BSD-2-Clause
 Files: libfdt/*
 Copyright: 2015 International Business Machines Corporation and others.
 License: BSD-2-Clause or GPL-2+
+
+Files: platforms/astbmc/barreleye.c
+Copyright: 2016 Ingrasys
+License: Apache-2.0
+
+Files: include/ec/gpio.h
+       hw/ec/gpio.c
+Copyright: 2013-2014 Google Corp.
+License: Apache-2.0
 
 License: Apache-2.0
  Licensed under the Apache License, Version 2.0 (the "License");
