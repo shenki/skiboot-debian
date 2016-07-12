@@ -1,3 +1,12 @@
+skiboot (5.2.4-1) unstable; urgency=medium
+
+  * New upstream release
+  * Disabled PIE build as this makes opal-prd segfault and there is no
+    possibility to improve that on the code side soon.
+  * Removed typos patch as it was partially applied in new version.
+
+ -- Frederic Bonnard <frediz@linux.vnet.ibm.com>  Tue, 12 Jul 2016 17:54:46 +0200
+
 skiboot (5.2.2-2) unstable; urgency=medium
 
   * Fixed d/copyright 3 files

@@ -5,7 +5,8 @@ UPSTREAM_VERSION := $(shell dpkg-parsechangelog -S Version | sed 's/-.*//')
 
 # Uncomment this to turn on verbose mode.
 export DH_VERBOSE=1
-export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+# Disable PIE flag has it makes opal-prd segfault
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-pie
 
 
 %:
