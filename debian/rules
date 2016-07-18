@@ -7,6 +7,10 @@ UPSTREAM_VERSION := $(shell dpkg-parsechangelog -S Version | sed 's/-.*//')
 export DH_VERBOSE=1
 # Disable PIE flag has it makes opal-prd segfault
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-pie
+# Also force no-pie for Ubuntu 16.10 where gcc's defaults have been set to
+# build Position Independent Executables (PIE) on amd64 and ppc64le (gcc was
+# configured this way for s390x in Ubuntu 16.04 LTS).
+export DEB_LDFLAGS_MAINT_APPEND = -no-pie
 
 
 %:

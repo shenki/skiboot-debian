@@ -1,3 +1,10 @@
+skiboot (5.2.4-2) unstable; urgency=medium
+
+  * Forced no-pie for Ubuntu 16.10 as previous change was not enough : in 16.10
+    gcc's default change to build PIE by default.
+
+ -- Frederic Bonnard <frediz@linux.vnet.ibm.com>  Mon, 18 Jul 2016 15:52:41 +0200
+
 skiboot (5.2.4-1) unstable; urgency=medium
 
   * New upstream release
