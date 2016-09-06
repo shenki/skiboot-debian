@@ -1,1 +1,4 @@
+usr/sbin/getscom
 usr/sbin/opal-gard
+usr/sbin/pflash
+usr/sbin/putscom

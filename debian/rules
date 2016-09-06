@@ -19,22 +19,31 @@ export DEB_LDFLAGS_MAINT_APPEND = -no-pie
 override_dh_auto_build:
 	OPAL_PRD_VERSION=opal-prd-$(UPSTREAM_VERSION) make V=1 -C external/opal-prd/
 	GARD_VERSION=gard-$(UPSTREAM_VERSION) make V=1 -C external/gard/
+	PFLASH_VERSION=pflash-$(UPSTREAM_VERSION) make V=1 -C external/pflash
+	XSCOM_VERSION=xcom-$(UPSTREAM_VERSION) make V=1 -C external/xscom-utils
 
 override_dh_auto_install:
 	make -C external/opal-prd/ prefix=/usr DESTDIR=../../debian/tmp/ install
 	make -C external/gard/ prefix=/usr DESTDIR=../../debian/tmp/ install
+	make -C external/pflash/ prefix=/usr DESTDIR=../../debian/tmp/ install
+	make -C external/xscom-utils/ prefix=/usr DESTDIR=../../debian/tmp/ install
 
 override_dh_auto_clean:
 	make -C external/opal-prd/ clean
 	make -C external/gard/ clean
+	make -C external/pflash/ clean
+	make -C external/xscom-utils/ clean
 	rm -f external/opal-prd/ccan \
-		external/opal-prd/.version \
-		external/opal-prd/version.c \
+		external/*/.version \
+		external/*/version.c \
 		external/opal-prd/common \
 		external/opal-prd/libflash \
 		external/gard/version.c \
 		external/gard/common \
 		external/gard/ccan \
 		external/gard/make_version.sh \
-		external/gard/libflash
+		external/gard/libflash \
+		external/pflash/libflash \
+		external/pflash/common \
+		external/pflash/ccan
 	dh_auto_clean

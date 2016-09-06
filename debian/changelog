@@ -1,3 +1,13 @@
+skiboot (5.3.3-1) unstable; urgency=medium
+
+  * New upstream release
+  * Build and distribute getscom, putscom, pflash. Created basic manpages
+    (Closes: #836405))
+  * Changed d/opal-prd.docs, d/opal-utils.docs because README got renamed to
+    README
+
+ -- Frederic Bonnard <frediz@linux.vnet.ibm.com>  Tue, 06 Sep 2016 10:11:25 +0200
+
 skiboot (5.2.4-2) unstable; urgency=medium
 
   * Forced no-pie for Ubuntu 16.10 as previous change was not enough : in 16.10
