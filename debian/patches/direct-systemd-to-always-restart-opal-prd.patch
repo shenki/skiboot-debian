@@ -1,0 +1,18 @@
+Description: [PATCH] opal-prd: Direct systemd to always restart opal-prd
+ Always restart the opal-prd daemon, irrespective of why it stopped.
+Origin: upstream, https://lists.ozlabs.org/pipermail/skiboot/2017-March/006612.html
+Author: Ananth N Mavinakayanahalli <ananth at linux.vnet.ibm.com>
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+diff --git a/external/opal-prd/opal-prd.service b/external/opal-prd/opal-prd.service
+index 9956912..a53d8d9 100644
+--- a/external/opal-prd/opal-prd.service
++++ b/external/opal-prd/opal-prd.service
+@@ -5,6 +5,7 @@ ConditionPathExists=/sys/firmware/devicetree/base/ibm,opal/diagnostics
+ 
+ [Service]
+ ExecStart=/usr/sbin/opal-prd --pnor /dev/mtd0
++Restart=always
+ 
+ [Install]
+ WantedBy=multi-user.target

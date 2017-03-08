@@ -29,21 +29,12 @@ override_dh_auto_install:
 	make -C external/xscom-utils/ prefix=/usr DESTDIR=../../debian/tmp/ install
 
 override_dh_auto_clean:
-	make -C external/opal-prd/ clean
-	make -C external/gard/ clean
-	make -C external/pflash/ clean
-	make -C external/xscom-utils/ clean
-	rm -f external/opal-prd/ccan \
-		external/*/.version \
-		external/*/version.c \
-		external/opal-prd/common \
-		external/opal-prd/libflash \
-		external/gard/version.c \
-		external/gard/common \
-		external/gard/ccan \
-		external/gard/make_version.sh \
-		external/gard/libflash \
-		external/pflash/libflash \
-		external/pflash/common \
-		external/pflash/ccan
+	make -C external/opal-prd/ distclean
+	make -C external/gard/ distclean
+	make -C external/pflash/ distclean
+	make -C external/xscom-utils/ distclean
 	dh_auto_clean
+
+override_dh_auto_test:
+	# We only run test for the directories we build utils from and where tests exists
+	make -C external/gard/ check

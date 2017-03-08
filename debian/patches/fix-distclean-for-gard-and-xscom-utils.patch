@@ -1,0 +1,32 @@
+Description: Fix distclean targets
+ Some files still need to be added to distclean targets.
+ Upstream gard's Makefile already does it but not this version of skiboot.
+ Fixing xcom-utils distclean target as well
+Author: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/external/gard/Makefile
++++ b/external/gard/Makefile
+@@ -35,5 +35,5 @@
+ 
+ distclean: clean
+ 	rm -f *.c~ *.h~ *.sh~ Makefile~ config.mk~ libflash/*.c~ libflash/*.h~
+-	rm -f libflash ccan common io.h make_version.sh
++	rm -f libflash ccan common io.h version.c make_version.sh test/test.sh
+ 
+--- a/external/xscom-utils/Makefile
++++ b/external/xscom-utils/Makefile
+@@ -37,11 +37,11 @@
+ 
+ .PHONY: clean
+ clean:
+-	rm -rf *.[od] getscom putscom getsram
++	rm -rf *.[od] getscom putscom getsram .version
+ 
+ .PHONY: distclean
+ distclean: clean
+-	rm -rf *.c~ *.h~ *.i *.s Makefile~
++	rm -rf *.c~ *.h~ *.i *.s Makefile~ version.c
+ 
+ version.c: ../../make_version.sh  .version
+ 	@(if [ "a$(XSCOM_VERSION)" = "a" ]; then \

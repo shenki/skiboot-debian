@@ -1,4 +1,4 @@
 debian/getscom.1
+debian/opal-gard.1
 debian/pflash.1
 debian/putscom.1
-debian/opal-gard.1

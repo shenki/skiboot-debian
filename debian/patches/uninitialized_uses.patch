@@ -8,7 +8,7 @@ Author: Mathieu Trudel-Lapierre <mathieu-tl@ubuntu.com>
 
 --- a/libflash/libffs.c
 +++ b/libflash/libffs.c
-@@ -160,7 +160,7 @@
+@@ -184,7 +184,7 @@
  
  	if (mark_ecc) {
  		uint32_t start, total_size;

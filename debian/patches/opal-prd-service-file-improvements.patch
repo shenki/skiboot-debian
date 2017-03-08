@@ -1,0 +1,22 @@
+Description: opal-prd.service improvements
+ Added reference to the man page
+ Take into account /etc/default/opal-prd on Debian to read parameters for the
+ daemon.
+Author: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/external/opal-prd/opal-prd.service
++++ b/external/opal-prd/opal-prd.service
+@@ -2,9 +2,11 @@
+ Description=OPAL PRD daemon
+ ConditionVirtualization=false
+ ConditionPathExists=/sys/firmware/devicetree/base/ibm,opal/diagnostics
++Documentation=man:opal-prd(8)
+ 
+ [Service]
+-ExecStart=/usr/sbin/opal-prd --pnor /dev/mtd0
++EnvironmentFile=/etc/default/opal-prd
++ExecStart=/usr/sbin/opal-prd --pnor $PNOR_DEVICE $DAEMON_OPTS
+ Restart=always
+ 
+ [Install]

@@ -1,3 +1,30 @@
+skiboot (5.4.3-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/patches/fix-hardening-for-opal-gard.patch removed as it's applied upstream
+  * d/control : 
+    - added Depends on lsb-base for opal-prd.init
+    - added ppc64 arch
+  * d/rules :
+    - proper clean is almost done by upstream, override_dh_auto_clean stripped
+    - enabled tests where they make sense
+  * d/patches/fix-distclean-for-gard-and-xscom-utils.patch : remaining cleanup
+    to be forwarded upstream
+  * d/opal-prd.socket : removed
+    d/opal-prd.service : linked to upstream service file
+    we now use service file from upstream that doesn't use systemd's socket
+    : opal-prd already does all the socket handling.
+  * d/patches/opal-prd-service-file-improvements.patch : added to handle man
+    page and /etc/default/opal-prd properly (Closes: LP : #1549098)
+  * Use upstream manpage :
+    d/opal-prd.8 : fixes were applied upstream
+    d/opal-prd.manpages : use upstream manpage 
+  * d/patches/direct-systemd-to-always-restart-opal-prd.patch : applying
+    upstream patch in advance to restart opal-prd irrespective of why it
+    stopped.  (Closes: LP : #1671019)
+
+ -- Frederic Bonnard <frediz@linux.vnet.ibm.com>  Wed, 08 Mar 2017 16:06:12 +0000
+
 skiboot (5.3.3-1) unstable; urgency=medium
 
   * New upstream release
