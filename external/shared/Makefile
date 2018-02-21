@@ -1,26 +1,16 @@
 .DEFAULT_GOAL := all
 GET_ARCH = ../../external/common/get_arch.sh
 include ../../external/common/rules.mk
+include rules.mk
 
 PREFIX ?= /usr/local/
 LIBDIR = $(PREFIX)/lib
 INCDIR = $(PREFIX)/include/libflash
 
-VERSION = $(shell ../../make_version.sh)
-
-CFLAGS += -m64 -Werror -Wall -g2 -ggdb -I. -fPIC
-
-.PHONY: links
-links: libflash ccan common
-
-libflash:
-	ln -sf ../../libflash .
-
-common:
-	ln -sf ../common .
-
-ccan:
-	ln -sf ../../ccan .
+ifneq ($(ARCH), ARCH_ARM)
+CFLAGS += -m64
+endif
+CFLAGS += -Werror -Wall -g2 -ggdb -I. -fPIC
 
 LIBFLASH_OBJS = libflash-file.o libflash-libflash.o libflash-libffs.o libflash-ecc.o libflash-blocklevel.o
 ARCHFLASH_OBJS = common-arch_flash.o
@@ -39,11 +29,11 @@ distclean: clean
 	rm -f ccan libflash common
 
 all: links arch_links $(OBJS)
-	$(CC) -shared -Wl,-soname,libflash.so -o libflash.so.$(VERSION) $(OBJS)
+	$(CC) -shared -Wl,-soname,libflash.so -o $(SHARED_NAME) $(OBJS)
 
 install-lib: all
-	install -D -m 0755 libflash.so.$(VERSION) $(LIBDIR)/libflash.so.$(VERSION)
-	ln -sf libflash.so.$(VERSION) $(LIBDIR)/libflash.so
+	install -D -m 0755 $(SHARED_NAME) $(LIBDIR)/$(SHARED_NAME)
+	ln -sf $(SHARED_NAME) $(LIBDIR)/libflash.so
 
 install-dev: links arch_links
 	mkdir -p $(INCDIR)

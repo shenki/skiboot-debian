@@ -1,30 +1,8 @@
-# Use make V=1 for a verbose build.
-ifndef V
-        Q_CC=	@echo '    CC ' $@;
-        Q_LD=	@echo '    LD ' $@;
-        Q_LN=   @echo '    LN ' $@;
-        Q_MKDIR=@echo ' MKDIR ' $@;
-endif
-
 include rules.mk
 GET_ARCH = ../../external/common/get_arch.sh
 include ../../external/common/rules.mk
 
-all: $(EXE)
-
-.PHONY: links
-links: libflash ccan common
-
-libflash:
-	$(Q_LN)ln -sf ../../libflash .
-
-ccan:
-	$(Q_LN)ln -sf ../../ccan .
-
-common:
-	$(Q_LN)ln -sf ../common .
-
-$(OBJS): | links arch_links
+all: links arch_links $(EXE)
 
 .PHONY: VERSION-always
 .version: VERSION-always
@@ -32,7 +10,7 @@ $(OBJS): | links arch_links
 	@cmp -s $@ $@.tmp || cp $@.tmp $@
 	@rm -f $@.tmp
 
-install: all
+install: all $(INSTALLDEPS)
 	install -D pflash $(DESTDIR)$(sbindir)/pflash
 
 .PHONY: dist
