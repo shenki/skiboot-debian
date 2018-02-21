@@ -140,7 +140,7 @@ static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *paren
 	uint16_t capreg;
 	bool had_crs = false;
 
-	for (retries = 40; retries; retries--) {
+	for (retries = 0; retries < 40; retries++) {
 		rc = pci_cfg_read32(phb, bdfn, 0, &vdid);
 		if (rc)
 			return NULL;
@@ -156,7 +156,7 @@ static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *paren
 		return NULL;
 	}
 	if (had_crs)
-		PCIDBG(phb, bdfn, "Probe success after CRS\n");
+		PCIDBG(phb, bdfn, "Probe success after %d CRS\n", retries);
 
 	/* Perform a dummy write to the device in order for it to
 	 * capture it's own bus number, so any subsequent error
@@ -258,6 +258,16 @@ static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *paren
 	       pd->is_multifunction ? "+" : "-",
 	       pd->is_bridge ? "+" : "-",
 	       pci_has_cap(pd, PCI_CFG_CAP_ID_EXP, false) ? "+" : "-");
+
+	/* Try to get PCI slot behind the device */
+	if (platform.pci_get_slot_info)
+		platform.pci_get_slot_info(phb, pd);
+
+	/* Put it to the child device of list of PHB or parent */
+	if (!parent)
+		list_add_tail(&phb->devices, &pd->link);
+	else
+		list_add_tail(&parent->children, &pd->link);
 
 	/*
 	 * Call PHB hook
@@ -491,6 +501,7 @@ void pci_remove_bus(struct phb *phb, struct list_head *list)
 static void pci_slot_power_off(struct phb *phb, struct pci_device *pd)
 {
 	struct pci_slot *slot;
+	uint8_t pstate;
 	int32_t wait = 100;
 	int64_t rc;
 
@@ -498,7 +509,9 @@ static void pci_slot_power_off(struct phb *phb, struct pci_device *pd)
 		return;
 
 	slot = pd->slot;
-	if (!slot->pluggable || !slot->ops.set_power_state)
+	if (!slot->pluggable ||
+	    !slot->ops.get_power_state ||
+	    !slot->ops.set_power_state)
 		return;
 
 	/* Bail if there're something connected */
@@ -506,11 +519,23 @@ static void pci_slot_power_off(struct phb *phb, struct pci_device *pd)
 		return;
 
 	pci_slot_add_flags(slot, PCI_SLOT_FLAG_BOOTUP);
+	rc = slot->ops.get_power_state(slot, &pstate);
+	if (rc != OPAL_SUCCESS) {
+		pci_slot_remove_flags(slot, PCI_SLOT_FLAG_BOOTUP);
+		PCINOTICE(phb, pd->bdfn, "Error %lld getting slot power state\n", rc);
+		return;
+	} else if (pstate == PCI_SLOT_POWER_OFF) {
+		pci_slot_remove_flags(slot, PCI_SLOT_FLAG_BOOTUP);
+		return;
+	}
+
 	rc = slot->ops.set_power_state(slot, PCI_SLOT_POWER_OFF);
 	if (rc == OPAL_SUCCESS) {
+		pci_slot_remove_flags(slot, PCI_SLOT_FLAG_BOOTUP);
 		PCIDBG(phb, pd->bdfn, "Power off hotpluggable slot\n");
 		return;
 	} else if (rc != OPAL_ASYNC_COMPLETION) {
+		pci_slot_remove_flags(slot, PCI_SLOT_FLAG_BOOTUP);
 		pci_slot_set_state(slot, PCI_SLOT_STATE_NORMAL);
 		PCINOTICE(phb, pd->bdfn, "Error %lld powering off slot\n", rc);
 		return;
@@ -521,9 +546,10 @@ static void pci_slot_power_off(struct phb *phb, struct pci_device *pd)
 			break;
 
 		check_timers(false);
-		time_wait(10);
+		time_wait_ms(10);
 	} while (--wait >= 0);
 
+	pci_slot_remove_flags(slot, PCI_SLOT_FLAG_BOOTUP);
 	pci_slot_set_state(slot, PCI_SLOT_STATE_NORMAL);
 	if (wait >= 0)
 		PCIDBG(phb, pd->bdfn, "Power off hotpluggable slot\n");
@@ -548,9 +574,10 @@ uint8_t pci_scan_bus(struct phb *phb, uint8_t bus, uint8_t max_bus,
 		     struct list_head *list, struct pci_device *parent,
 		     bool scan_downstream)
 {
-	struct pci_device *pd = NULL;
+	struct pci_device *pd = NULL, *rc = NULL;
 	uint8_t dev, fn, next_bus, max_sub, save_max;
 	uint32_t scan_map;
+	bool use_max;
 
 	/* Decide what to scan  */
 	scan_map = parent ? parent->scan_map : phb->scan_map;
@@ -566,12 +593,9 @@ uint8_t pci_scan_bus(struct phb *phb, uint8_t bus, uint8_t max_bus,
 		if (!pd)
 			continue;
 
-		/* Get slot info if any */
-		if (platform.pci_get_slot_info)
-			platform.pci_get_slot_info(phb, pd);
-
-		/* Link it up */
-		list_add_tail(list, &pd->link);
+		/* Record RC when its downstream link is down */
+		if (!scan_downstream && dev == 0 && !rc)
+			rc = pd;
 
 		/* XXX Handle ARI */
 		if (!pd->is_multifunction)
@@ -580,12 +604,21 @@ uint8_t pci_scan_bus(struct phb *phb, uint8_t bus, uint8_t max_bus,
 			pd = pci_scan_one(phb, parent,
 					  ((uint16_t)bus << 8) | (dev << 3) | fn);
 			pci_check_clear_freeze(phb);
-			if (pd) {
-				if (platform.pci_get_slot_info)
-					platform.pci_get_slot_info(phb, pd);
-				list_add_tail(list, &pd->link);
-			}
 		}
+	}
+
+	/* Reserve all possible buses if RC's downstream link is down
+	 * if PCI hotplug is supported.
+	 */
+	if (rc && rc->slot && rc->slot->pluggable) {
+		next_bus = phb->ops->choose_bus(phb, rc, bus + 1,
+						&max_bus, &use_max);
+		rc->secondary_bus = next_bus;
+		rc->subordinate_bus = max_bus;
+		pci_cfg_write8(phb, rc->bdfn, PCI_CFG_SECONDARY_BUS,
+			       rc->secondary_bus);
+		pci_cfg_write8(phb, rc->bdfn, PCI_CFG_SUBORDINATE_BUS,
+			       rc->subordinate_bus);
 	}
 
 	/*
@@ -607,7 +640,7 @@ uint8_t pci_scan_bus(struct phb *phb, uint8_t bus, uint8_t max_bus,
 
 	/* Scan down bridges */
 	list_for_each(list, pd, link) {
-		bool use_max, do_scan;
+		bool do_scan;
 
 		if (!pd->is_bridge)
 			continue;
@@ -1456,6 +1489,7 @@ static void __pci_reset(struct list_head *list)
 
 	while ((pd = list_pop(list, struct pci_device, link)) != NULL) {
 		__pci_reset(&pd->children);
+		dt_free(pd->dn);
 		free(pd);
 	}
 }
@@ -1472,10 +1506,17 @@ void pci_reset(void)
 	 * state machine could be done in parallel)
 	 */
 	for (i = 0; i < ARRAY_SIZE(phbs); i++) {
-		if (!phbs[i])
+		struct phb *phb = phbs[i];
+		if (!phb)
 			continue;
-		__pci_reset(&phbs[i]->devices);
+		__pci_reset(&phb->devices);
+		if (phb->ops->ioda_reset)
+			phb->ops->ioda_reset(phb, true);
 	}
+
+	/* Re-Initialize all discovered PCI slots */
+	pci_init_slots();
+
 }
 
 static void pci_do_jobs(void (*fn)(void *))

@@ -210,12 +210,15 @@ void add_opal_interrupts(void)
 	lock(&irq_lock);
 	list_for_each(&irq_sources, is, link) {
 		/*
-		 * Add a source to opal-interrupts if it has an
-		 * ->interrupt callback
+		 * Don't even consider sources that don't have an interrupts
+		 * callback or don't have an attributes one.
 		 */
-		if (!is->ops->interrupt)
+		if (!is->ops->interrupt || !is->ops->attributes)
 			continue;
 		for (isn = is->start; isn < is->end; isn++) {
+			uint64_t attr = is->ops->attributes(is, isn);
+			if (attr & IRQ_ATTR_TARGET_LINUX)
+				continue;
 			i = count++;
 			irqs = realloc(irqs, 4 * count);
 			irqs[i] = isn;
@@ -237,7 +240,7 @@ void add_opal_interrupts(void)
 /*
  * This is called at init time (and one fast reboot) to sanitize the
  * ICP. We set our priority to 0 to mask all interrupts and make sure
- * no IPI is on the way.
+ * no IPI is on the way. This is also called on wakeup from nap
  */
 void reset_cpu_icp(void)
 {
@@ -245,6 +248,9 @@ void reset_cpu_icp(void)
 
 	if (!icp)
 		return;
+
+	/* Dummy fetch */
+	in_be32(icp + ICP_XIRR);
 
 	/* Clear pending IPIs */
 	out_8(icp + ICP_MFRR, 0xff);
@@ -267,10 +273,10 @@ void icp_send_eoi(uint32_t interrupt)
 	out_be32(icp + ICP_XIRR, interrupt & 0xffffff);
 }
 
-/* This is called before winkle, we clear pending IPIs and set our priority
- * to 1 to mask all but the IPI
+/* This is called before winkle or nap, we clear pending IPIs and
+ * set our priority to 1 to mask all but the IPI.
  */
-void icp_prep_for_rvwinkle(void)
+void icp_prep_for_pm(void)
 {
 	void *icp = this_cpu()->icp_regs;
 
@@ -405,6 +411,9 @@ static int64_t opal_get_xive(uint32_t isn, uint16_t *server, uint8_t *priority)
 {
 	struct irq_source *is = irq_find_source(isn);
 
+	if (!opal_addr_valid(server))
+		return OPAL_PARAMETER;
+
 	if (!is || !is->ops->get_xive)
 		return OPAL_PARAMETER;
 
@@ -416,6 +425,9 @@ static int64_t opal_handle_interrupt(uint32_t isn, __be64 *outstanding_event_mas
 {
 	struct irq_source *is = irq_find_source(isn);
 	int64_t rc = OPAL_SUCCESS;
+
+	if (!opal_addr_valid(outstanding_event_mask))
+		return OPAL_PARAMETER;
 
 	/* No source ? return */
 	if (!is || !is->ops->interrupt) {

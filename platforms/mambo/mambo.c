@@ -24,8 +24,6 @@
 #include <time-utils.h>
 #include <time.h>
 
-extern int64_t mambo_get_time(void);
-
 static bool mambo_probe(void)
 {
 	if (!dt_find_by_path(dt_root, "/mambo"))
@@ -34,44 +32,27 @@ static bool mambo_probe(void)
 	return true;
 }
 
-static int64_t mambo_rtc_read(uint32_t *ymd, uint64_t *hmsm)
+static inline unsigned long callthru0(int command)
 {
-	int64_t mambo_time;
-	struct tm t;
-	time_t mt;
-
-	if (!ymd || !hmsm)
-		return OPAL_PARAMETER;
-
-	mambo_time = mambo_get_time();
-	mt = mambo_time >> 32;
-	gmtime_r(&mt, &t);
-	tm_to_datetime(&t, ymd, hmsm);
-
-	return OPAL_SUCCESS;
+	register uint64_t c asm("r3") = command;
+	asm volatile (".long 0x000eaeb0":"=r" (c):"r"(c));
+	return (c);
 }
 
-static void mambo_rtc_init(void)
+static inline unsigned long callthru2(int command, unsigned long arg1,
+				      unsigned long arg2)
 {
-	struct dt_node *np = dt_new(opal_node, "rtc");
-	dt_add_property_strings(np, "compatible", "ibm,opal-rtc");
-
-	opal_register(OPAL_RTC_READ, mambo_rtc_read, 2);
-}
-
-static inline int callthru2(int command, unsigned long arg1, unsigned long arg2)
-{
-	register int c asm("r3") = command;
+	register unsigned long c asm("r3") = command;
 	register unsigned long a1 asm("r4") = arg1;
 	register unsigned long a2 asm("r5") = arg2;
 	asm volatile (".long 0x000eaeb0":"=r" (c):"r"(c), "r"(a1), "r"(a2));
 	return (c);
 }
 
-static inline int callthru3(int command, unsigned long arg1, unsigned long arg2,
-			    unsigned long arg3)
+static inline unsigned long callthru3(int command, unsigned long arg1,
+				      unsigned long arg2, unsigned long arg3)
 {
-	register int c asm("r3") = command;
+	register unsigned long c asm("r3") = command;
 	register unsigned long a1 asm("r4") = arg1;
 	register unsigned long a2 asm("r5") = arg2;
 	register unsigned long a3 asm("r6") = arg3;
@@ -88,28 +69,42 @@ static inline int callthru3(int command, unsigned long arg1, unsigned long arg2,
 
 #define BD_SECT_SZ		512
 
-#define BOGUS_DISK_READ		116
-#define BOGUS_DISK_WRITE	117
-#define BOGUS_DISK_INFO		118
+/* Mambo callthru commands */
+#define SIM_WRITE_CONSOLE_CODE	0
+#define SIM_EXIT_CODE		31
+#define SIM_READ_CONSOLE_CODE	60
+#define SIM_GET_TIME_CODE	70
+#define SIM_CALL_TCL		86
+#define SIM_BOGUS_DISK_READ	116
+#define SIM_BOGUS_DISK_WRITE	117
+#define SIM_BOGUS_DISK_INFO	118
 
 static inline int callthru_disk_read(int id, void *buf, unsigned long sect,
 				     unsigned long nrsect)
 {
-	return callthru3(BOGUS_DISK_READ, (unsigned long)buf, sect,
+	return callthru3(SIM_BOGUS_DISK_READ, (unsigned long)buf, sect,
 			 (nrsect << 16) | id);
 }
 
 static inline int callthru_disk_write(int id, void *buf, unsigned long sect,
 				      unsigned long nrsect)
 {
-	return callthru3(BOGUS_DISK_WRITE, (unsigned long)buf, sect,
+	return callthru3(SIM_BOGUS_DISK_WRITE, (unsigned long)buf, sect,
 			 (nrsect << 16) | id);
 }
 
 static inline unsigned long callthru_disk_info(int op, int id)
 {
-	return callthru2(BOGUS_DISK_INFO, (unsigned long)op,
+	return callthru2(SIM_BOGUS_DISK_INFO, (unsigned long)op,
 			 (unsigned long)id);
+}
+
+extern unsigned long callthru_tcl(const char *str, int len);
+
+unsigned long callthru_tcl(const char *str, int len)
+{
+	prlog(PR_DEBUG, "Sending TCL to Mambo, cmd: %s\n", str);
+	return callthru2(SIM_CALL_TCL, (unsigned long)str, (unsigned long)len);
 }
 
 struct bogus_disk_info {
@@ -117,31 +112,38 @@ struct bogus_disk_info {
 	int id;
 };
 
-static int bogus_disk_read(struct blocklevel_device *bl, uint32_t pos, void *buf,
-			  uint32_t len)
+static int bogus_disk_read(struct blocklevel_device *bl, uint64_t pos, void *buf,
+			  uint64_t len)
 {
 	struct bogus_disk_info *bdi = bl->priv;
-	int rc;
+	int rc, read_sectors = 0;
 	char b[BD_SECT_SZ];
 
-	if ((len % BD_SECT_SZ) == 0)
-		return callthru_disk_read(bdi->id, buf, pos/BD_SECT_SZ,
+	if (len >= BD_SECT_SZ) {
+		rc = callthru_disk_read(bdi->id, buf, pos/BD_SECT_SZ,
 					  len/BD_SECT_SZ);
+		if (rc)
+			return rc;
+		read_sectors = (len / BD_SECT_SZ);
+	}
 
-	/* We don't support block reads > BD_SECT_SZ */
-	if (len > BD_SECT_SZ)
-		return OPAL_PARAMETER;
+	if ((len % BD_SECT_SZ) == 0)
+		return 0;
 
-	/* Skiboot does small reads for system flash header checking */
-	rc =  callthru_disk_read(bdi->id, b, pos/BD_SECT_SZ, 1);
+	/*
+	 * Read any unaligned data into a temporaty buffer b, then copy
+	 * to buf
+	 */
+	rc =  callthru_disk_read(bdi->id, b, (pos/BD_SECT_SZ) + read_sectors, 1);
 	if (rc)
 		return rc;
-	memcpy(buf, &b[pos % BD_SECT_SZ], len);
+	memcpy(buf + (read_sectors * BD_SECT_SZ) , &b[pos % BD_SECT_SZ],
+			len - (read_sectors * BD_SECT_SZ));
 	return rc;
 }
 
-static int bogus_disk_write(struct blocklevel_device *bl, uint32_t pos,
-			    const void *buf, uint32_t len)
+static int bogus_disk_write(struct blocklevel_device *bl, uint64_t pos,
+			    const void *buf, uint64_t len)
 {
 	struct bogus_disk_info *bdi = bl->priv;
 
@@ -154,13 +156,13 @@ static int bogus_disk_write(struct blocklevel_device *bl, uint32_t pos,
 }
 
 static int bogus_disk_erase(struct blocklevel_device *bl __unused,
-			   uint32_t pos __unused, uint32_t len __unused)
+			   uint64_t pos __unused, uint64_t len __unused)
 {
 	return 0; /* NOP */
 }
 
 static int bogus_disk_get_info(struct blocklevel_device *bl, const char **name,
-			      uint32_t *total_size, uint32_t *erase_granule)
+			      uint64_t *total_size, uint32_t *erase_granule)
 {
 	struct bogus_disk_info *bdi = bl->priv;
 
@@ -213,12 +215,47 @@ static void bogus_disk_flash_init(void)
 		bl->priv = bdi;
 		bl->erase_mask = BD_SECT_SZ - 1;
 
-		rc = flash_register(bl, true);
+		rc = flash_register(bl);
 		if (rc)
 			prerror("mambo: Failed to register bogus disk: %li\n",
 				id);
 		id++;
 	}
+}
+
+static int64_t mambo_rtc_read(uint32_t *ymd, uint64_t *hmsm)
+{
+	int64_t mambo_time;
+	struct tm t;
+	time_t mt;
+
+	if (!ymd || !hmsm)
+		return OPAL_PARAMETER;
+
+	mambo_time = callthru0(SIM_GET_TIME_CODE);
+	mt = mambo_time >> 32;
+	gmtime_r(&mt, &t);
+	tm_to_datetime(&t, ymd, hmsm);
+
+	return OPAL_SUCCESS;
+}
+
+static void mambo_rtc_init(void)
+{
+	struct dt_node *np = dt_new(opal_node, "rtc");
+	dt_add_property_strings(np, "compatible", "ibm,opal-rtc");
+
+	opal_register(OPAL_RTC_READ, mambo_rtc_read, 2);
+}
+
+int mambo_console_read(void)
+{
+	return callthru0(SIM_READ_CONSOLE_CODE);
+}
+
+void mambo_console_write(const char *buf, size_t count)
+{
+	callthru2(SIM_WRITE_CONSOLE_CODE, (unsigned long)buf, count);
 }
 
 static void mambo_platform_init(void)
@@ -231,7 +268,7 @@ static void mambo_platform_init(void)
 static int64_t mambo_cec_power_down(uint64_t request __unused)
 {
 	if (chip_quirk(QUIRK_MAMBO_CALLOUTS))
-		mambo_sim_exit();
+		callthru0(SIM_EXIT_CODE);
 
 	return OPAL_UNSUPPORTED;
 }
@@ -239,7 +276,7 @@ static int64_t mambo_cec_power_down(uint64_t request __unused)
 static void __attribute__((noreturn)) mambo_terminate(const char *msg __unused)
 {
 	if (chip_quirk(QUIRK_MAMBO_CALLOUTS))
-		mambo_sim_exit();
+		callthru0(SIM_EXIT_CODE);
 
 	for (;;) ;
 }

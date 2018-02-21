@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2016 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,9 +23,12 @@
 #include <chip.h>
 #include <xscom.h>
 #include <errorlog.h>
+#include <bt.h>
+#include <nvram.h>
 
 bool manufacturing_mode = false;
 struct platform	platform;
+const struct bmc_platform *bmc_platform = NULL;
 
 DEFINE_LOG_ENTRY(OPAL_RC_ABNORMAL_REBOOT, OPAL_PLATFORM_ERR_EVT, OPAL_CEC,
 		 OPAL_CEC_HARDWARE, OPAL_PREDICTIVE_ERR_FAULT_RECTIFY_REBOOT,
@@ -36,7 +39,7 @@ DEFINE_LOG_ENTRY(OPAL_RC_ABNORMAL_REBOOT, OPAL_PLATFORM_ERR_EVT, OPAL_CEC,
  */
 static int64_t opal_cec_power_down(uint64_t request)
 {
-	printf("OPAL: Shutdown request type 0x%llx...\n", request);
+	prlog(PR_NOTICE, "OPAL: Shutdown request type 0x%llx...\n", request);
 
 	console_complete_flush();
 
@@ -49,14 +52,14 @@ opal_call(OPAL_CEC_POWER_DOWN, opal_cec_power_down, 1);
 
 static int64_t opal_cec_reboot(void)
 {
-	printf("OPAL: Reboot request...\n");
+	prlog(PR_NOTICE, "OPAL: Reboot request...\n");
 
 	console_complete_flush();
 
-#ifdef ENABLE_FAST_RESET
-	/* Try a fast reset first */
-	fast_reset();
-#endif
+	/* Try a fast reset first, if enabled */
+	if (nvram_query_eq("experimental-fast-reset","feeling-lucky"))
+		fast_reboot();
+
 	if (platform.cec_reboot)
 		return platform.cec_reboot();
 
@@ -87,9 +90,10 @@ static int64_t opal_cec_reboot2(uint32_t reboot_type, char *diag)
 		} else {
 			prerror("OPAL: failed to log an error\n");
 		}
+		disable_fast_reboot("Reboot due to Platform Error");
 		return xscom_trigger_xstop();
 	default:
-		printf("OPAL: Unsupported reboot request %d\n", reboot_type);
+		prlog(PR_NOTICE, "OPAL: Unsupported reboot request %d\n", reboot_type);
 		return OPAL_UNSUPPORTED;
 		break;
 	}
@@ -106,6 +110,11 @@ static void generic_platform_init(void)
 		uart_setup_opal_console();
 	else
 		force_dummy_console();
+
+	/* Enable a BT interface if we find one too */
+	bt_init();
+
+	/* Fake a real time clock */
 	fake_rtc_init();
 }
 
@@ -114,11 +123,23 @@ static int64_t generic_cec_power_down(uint64_t request __unused)
 	return OPAL_UNSUPPORTED;
 }
 
+static struct bmc_platform generic_bmc = {
+	.name = "generic",
+};
+
 static struct platform generic_platform = {
 	.name		= "generic",
+	.bmc		= &generic_bmc,
 	.init		= generic_platform_init,
 	.cec_power_down	= generic_cec_power_down,
 };
+
+void set_bmc_platform(const struct bmc_platform *bmc)
+{
+	if (bmc)
+		prlog(PR_NOTICE, "PLAT: Detected BMC platform %s\n", bmc->name);
+	bmc_platform = bmc;
+}
 
 void probe_platform(void)
 {
@@ -127,6 +148,12 @@ void probe_platform(void)
 
 	/* Detect Manufacturing mode */
 	if (dt_find_property(dt_root, "ibm,manufacturing-mode")) {
+		/**
+		 * @fwts-label ManufacturingMode
+		 * @fwts-advice You are running in manufacturing mode.
+		 * This mode should only be enabled in a factory during
+		 * manufacturing.
+		 */
 		prlog(PR_NOTICE, "PLAT: Manufacturing mode ON\n");
 		manufacturing_mode = true;
 	}
@@ -139,8 +166,11 @@ void probe_platform(void)
 		}
 	}
 
-	printf("PLAT: Detected %s platform\n", platform.name);
+	prlog(PR_NOTICE, "PLAT: Detected %s platform\n", platform.name);
+
+	set_bmc_platform(platform.bmc);
 }
+
 
 int start_preload_resource(enum resource_id id, uint32_t subid,
 			   void *buf, size_t *len)

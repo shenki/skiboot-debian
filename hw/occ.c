@@ -154,8 +154,8 @@ static bool wait_for_all_occ_init(void)
 		      *(uint64_t *)occ_data_area);
 	}
 	end_time = mftb();
-	prlog(PR_NOTICE, "OCC: All Chip Rdy after %lld ms\n",
-	      (end_time - start_time) / 512 / 1000);
+	prlog(PR_NOTICE, "OCC: All Chip Rdy after %lu ms\n",
+	      tb_to_msecs(end_time - start_time));
 	return true;
 }
 
@@ -517,9 +517,13 @@ void occ_pstates_init(void)
 	struct proc_chip *chip;
 	struct cpu_thread *c;
 	s8 pstate_nom;
+	static bool occ_pstates_initialized;
 
 	/* OCC is P8 only */
 	if (proc_gen != proc_gen_p8)
+		return;
+	/* Handle fast reboots */
+	if (occ_pstates_initialized)
 		return;
 
 	chip = next_chip(NULL);
@@ -558,6 +562,7 @@ void occ_pstates_init(void)
 	for_each_chip(chip)
 		chip->throttle = 0;
 	opal_add_poller(occ_throttle_poll, NULL);
+	occ_pstates_initialized = true;
 }
 
 struct occ_load_req {
@@ -742,6 +747,38 @@ static void occ_do_load(u8 scope, u32 dbob_id __unused, u32 seq_id)
 	__occ_do_load(scope, dbob_id, seq_id);
 }
 
+int occ_msg_queue_occ_reset(void)
+{
+	struct opal_occ_msg occ_msg = { OCC_RESET, 0, 0 };
+	struct proc_chip *chip;
+	int rc;
+
+	lock(&occ_lock);
+	rc = _opal_queue_msg(OPAL_MSG_OCC, NULL, NULL, 3,
+			     (uint64_t *)&occ_msg);
+	if (rc) {
+		prlog(PR_INFO, "OCC: Failed to queue OCC_RESET message\n");
+		goto out;
+	}
+	/*
+	 * Set 'valid' byte of chip_occ_data to 0 since OCC
+	 * may not clear this byte on a reset.
+	 * OCC will set the 'valid' byte to 1 when it becomes
+	 * active again.
+	 */
+	for_each_chip(chip) {
+		struct occ_pstate_table *occ_data;
+
+		occ_data = chip_occ_data(chip);
+		occ_data->valid = 0;
+		chip->throttle = 0;
+	}
+	occ_reset = true;
+out:
+	unlock(&occ_lock);
+	return rc;
+}
+
 static void occ_do_reset(u8 scope, u32 dbob_id, u32 seq_id)
 {
 	struct fsp_msg *rsp, *stat;
@@ -790,8 +827,6 @@ static void occ_do_reset(u8 scope, u32 dbob_id, u32 seq_id)
 		rc = 0;
 	}
 	if (!rc) {
-		struct opal_occ_msg occ_msg = { OCC_RESET, 0, 0 };
-
 		/* Send a single success response for all chips */
 		stat = fsp_mkmsg(FSP_CMD_RESET_OCC_STAT, 2, 0, seq_id);
 		if (stat)
@@ -802,27 +837,7 @@ static void occ_do_reset(u8 scope, u32 dbob_id, u32 seq_id)
 				"OCC: Error %d queueing FSP OCC RESET"
 					" STATUS message\n", rc);
 		}
-		lock(&occ_lock);
-		rc = _opal_queue_msg(OPAL_MSG_OCC, NULL, NULL, 3,
-				     (uint64_t *)&occ_msg);
-		if (rc)
-			prlog(PR_INFO, "OCC: Failed to queue message %d\n",
-			      OCC_RESET);
-		/*
-		 * Set 'valid' byte of chip_occ_data to 0 since OCC
-		 * may not clear this byte on a reset.
-		 * OCC will set the 'valid' byte to 1 when it becomes
-		 * active again.
-		 */
-		for_each_chip(chip) {
-			struct occ_pstate_table *occ_data;
-
-			occ_data = chip_occ_data(chip);
-			occ_data->valid = 0;
-			chip->throttle = 0;
-		}
-		occ_reset = true;
-		unlock(&occ_lock);
+		occ_msg_queue_occ_reset();
 	} else {
 
 		/*

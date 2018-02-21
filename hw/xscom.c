@@ -130,6 +130,7 @@ static int64_t xscom_handle_error(uint64_t hmer, uint32_t gcid, uint32_t pcb_add
 {
 	struct timespec ts;
 	unsigned int stat = GETFIELD(SPR_HMER_XSCOM_STATUS, hmer);
+	int64_t rc = OPAL_HARDWARE;
 
 	/* XXX Figure out error codes from doc and error
 	 * recovery procedures
@@ -167,16 +168,25 @@ static int64_t xscom_handle_error(uint64_t hmer, uint32_t gcid, uint32_t pcb_add
 				"XSCOM: %s-busy error gcid=0x%x pcb_addr=0x%x "
 				"stat=0x%x\n", is_write ? "write" : "read",
 				gcid, pcb_addr, stat);
-		return OPAL_BUSY;
+		return OPAL_XSCOM_BUSY;
 
 	case 2: /* CPU is asleep, reset XSCOM engine and return */
 		xscom_reset(gcid);
-		return OPAL_WRONG_STATE;
+		return OPAL_XSCOM_CHIPLET_OFF;
 	case 3: /* Partial good */
+		rc = OPAL_XSCOM_PARTIAL_GOOD;
+		break;
 	case 4: /* Invalid address / address error */
+		rc = OPAL_XSCOM_ADDR_ERROR;
+		break;
 	case 5: /* Clock error */
+		rc = OPAL_XSCOM_CLOCK_ERROR;
+		break;
 	case 6: /* Parity error  */
+		rc = OPAL_XSCOM_PARITY_ERROR;
+		break;
 	case 7: /* Time out */
+		rc = OPAL_XSCOM_TIMEOUT;
 		break;
 	}
 
@@ -189,7 +199,7 @@ static int64_t xscom_handle_error(uint64_t hmer, uint32_t gcid, uint32_t pcb_add
 	xscom_reset(gcid);
 
 	/* Non recovered ... just fail */
-	return OPAL_HARDWARE;
+	return rc;
 }
 
 static void xscom_handle_ind_error(uint64_t data, uint32_t gcid,
@@ -392,13 +402,33 @@ static uint32_t xscom_decode_chiplet(uint32_t partid, uint64_t *pcb_addr)
 	return gcid;
 }
 
+void _xscom_lock(void)
+{
+	lock(&xscom_lock);
+}
+
+void _xscom_unlock(void)
+{
+	unlock(&xscom_lock);
+}
+
 /*
  * External API
  */
-int xscom_read(uint32_t partid, uint64_t pcb_addr, uint64_t *val)
+int _xscom_read(uint32_t partid, uint64_t pcb_addr, uint64_t *val, bool take_lock)
 {
 	uint32_t gcid;
 	int rc;
+
+	if (!opal_addr_valid(val))
+		return OPAL_PARAMETER;
+
+	/* Due to a bug in some versions of the PRD wrapper app, errors
+	 * might not be properly forwarded to PRD, in which case the data
+	 * set here will be used. Rather than a random value let's thus
+	 * initialize the data to a known clean state.
+	 */
+	*val = 0xdeadbeefdeadbeefull;
 
 	/* Handle part ID decoding */
 	switch(partid >> 28) {
@@ -425,7 +455,8 @@ int xscom_read(uint32_t partid, uint64_t pcb_addr, uint64_t *val)
 	}
 
 	/* HW822317 requires us to do global locking */
-	lock(&xscom_lock);
+	if (take_lock)
+		lock(&xscom_lock);
 
 	/* Direct vs indirect access */
 	if (pcb_addr & XSCOM_ADDR_IND_FLAG)
@@ -434,13 +465,14 @@ int xscom_read(uint32_t partid, uint64_t pcb_addr, uint64_t *val)
 		rc = __xscom_read(gcid, pcb_addr & 0x7fffffff, val);
 
 	/* Unlock it */
-	unlock(&xscom_lock);
+	if (take_lock)
+		unlock(&xscom_lock);
 	return rc;
 }
 
 opal_call(OPAL_XSCOM_READ, xscom_read, 3);
 
-int xscom_write(uint32_t partid, uint64_t pcb_addr, uint64_t val)
+int _xscom_write(uint32_t partid, uint64_t pcb_addr, uint64_t val, bool take_lock)
 {
 	uint32_t gcid;
 	int rc;
@@ -468,7 +500,8 @@ int xscom_write(uint32_t partid, uint64_t pcb_addr, uint64_t val)
 	}
 
 	/* HW822317 requires us to do global locking */
-	lock(&xscom_lock);
+	if (take_lock)
+		lock(&xscom_lock);
 
 	/* Direct vs indirect access */
 	if (pcb_addr & XSCOM_ADDR_IND_FLAG)
@@ -477,7 +510,8 @@ int xscom_write(uint32_t partid, uint64_t pcb_addr, uint64_t val)
 		rc = __xscom_write(gcid, pcb_addr & 0x7fffffff, val);
 
 	/* Unlock it */
-	unlock(&xscom_lock);
+	if (take_lock)
+		unlock(&xscom_lock);
 	return rc;
 }
 opal_call(OPAL_XSCOM_WRITE, xscom_write, 3);

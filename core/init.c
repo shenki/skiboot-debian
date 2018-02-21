@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2016 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,12 +44,18 @@
 #include <ipmi.h>
 #include <sensor.h>
 #include <xive.h>
+#include <nvram.h>
+#include <libstb/stb.h>
+#include <libstb/container.h>
 
 enum proc_gen proc_gen;
 
 static uint64_t kernel_entry;
+static size_t kernel_size;
 static bool kernel_32bit;
-static char zero_location[16];
+
+/* We backup the previous vectors here before copying our own */
+static uint8_t old_vectors[0x2000];
 
 #ifdef SKIBOOT_GCOV
 void skiboot_gcov_done(void);
@@ -61,7 +67,11 @@ struct debug_descriptor debug_descriptor = {
 	.state_flags	= 0,
 	.memcons_phys	= (uint64_t)&memcons,
 	.trace_mask	= 0, /* All traces disabled by default */
+#ifdef DEBUG
+	.console_log_levels = (PR_DEBUG << 4) | PR_DEBUG,
+#else
 	.console_log_levels = (PR_DEBUG << 4) | PR_NOTICE,
+#endif
 };
 
 static bool try_load_elf64_le(struct elf_hdr *header)
@@ -102,7 +112,11 @@ static bool try_load_elf64_le(struct elf_hdr *header)
 	kernel_entry += load_base;
 	kernel_32bit = false;
 
-	printf("INIT: 64-bit kernel entry at 0x%llx\n", kernel_entry);
+	kernel_size = le64_to_cpu(kh->e_shoff) +
+		(le16_to_cpu(kh->e_shentsize) * le16_to_cpu(kh->e_shnum));
+
+	printf("INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
+	       kernel_entry, kernel_size);
 
 	return true;
 }
@@ -176,7 +190,10 @@ static bool try_load_elf64(struct elf_hdr *header)
 	kernel_entry += load_base;
 	kernel_32bit = false;
 
-	printf("INIT: 64-bit kernel entry at 0x%llx\n", kernel_entry);
+	kernel_size = kh->e_shoff + (kh->e_shentsize * kh->e_shnum);
+
+	printf("INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
+	       kernel_entry, kernel_size);
 
 	return true;
 }
@@ -284,10 +301,9 @@ extern char __builtin_kernel_start[];
 extern char __builtin_kernel_end[];
 extern uint64_t boot_offset;
 
-static size_t kernel_size;
 static size_t initramfs_size;
 
-static bool start_preload_kernel(void)
+bool start_preload_kernel(void)
 {
 	int loaded;
 
@@ -318,8 +334,10 @@ static bool start_preload_kernel(void)
 
 static bool load_kernel(void)
 {
+	void* stb_container = NULL;
 	struct elf_hdr *kh;
 	int loaded;
+	bool do_stb = false;
 
 	prlog(PR_NOTICE, "INIT: Waiting for kernel...\n");
 
@@ -342,6 +360,7 @@ static bool load_kernel(void)
 			printf("Using built-in kernel\n");
 			memmove(KERNEL_LOAD_BASE, (void*)builtin_base,
 				kernel_size);
+			do_stb = true;
 		}
 	}
 
@@ -351,16 +370,28 @@ static bool load_kernel(void)
 		printf("INIT: Kernel image at 0x%llx\n",kernel_entry);
 		kh = (struct elf_hdr *)kernel_entry;
 		/*
-		 * If the kernel is at 0, copy back what we wrote over
-		 * for the null branch catcher.
+		 * If the kernel is at 0, restore it as it was overwritten
+		 * by our vectors.
 		 */
-		if (kernel_entry == 0)
-			memcpy(0, zero_location, 16);
+		if (kernel_entry < 0x2000) {
+			cpu_set_pm_enable(false);
+			memcpy(NULL, old_vectors, 0x2000);
+		}
+		do_stb = true;
+		stb_container = kh; /* probably incorrect */
 	} else {
-		if (!kernel_size)
+		if (!kernel_size) {
 			printf("INIT: Assuming kernel at %p\n",
 			       KERNEL_LOAD_BASE);
-		kh = (struct elf_hdr *)KERNEL_LOAD_BASE;
+			/* Hack for STB in Mambo, assume at least 4kb in mem */
+			kernel_size = SECURE_BOOT_HEADERS_SIZE;
+			do_stb = true;
+		}
+		kh = (struct elf_hdr *) (KERNEL_LOAD_BASE);
+		if (stb_is_container(KERNEL_LOAD_BASE, kernel_size)) {
+			stb_container = kh;
+			kh = (struct elf_hdr *) (KERNEL_LOAD_BASE + SECURE_BOOT_HEADERS_SIZE);
+		}
 	}
 
 	printf("INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
@@ -371,13 +402,32 @@ static bool load_kernel(void)
 		return true;
 	}
 
-	if (kh->ei_class == ELF_CLASS_64)
-		return try_load_elf64(kh);
-	else if (kh->ei_class == ELF_CLASS_32)
-		return try_load_elf32(kh);
+	if (kh->ei_class == ELF_CLASS_64) {
+		if (!try_load_elf64(kh))
+			return false;
+	} else if (kh->ei_class == ELF_CLASS_32) {
+		if (!try_load_elf32(kh))
+			return false;
+	} else {
+		printf("INIT: Neither ELF32 not ELF64 ?\n");
+		return false;
+	}
 
-	printf("INIT: Neither ELF32 not ELF64 ?\n");
-	return false;
+	if (do_stb)
+	{
+		sb_verify(RESOURCE_ID_KERNEL, stb_container,
+			  kernel_size + SECURE_BOOT_HEADERS_SIZE);
+		tb_measure(RESOURCE_ID_KERNEL, stb_container,
+			   kernel_size + SECURE_BOOT_HEADERS_SIZE);
+	}
+
+	/*
+	 * Verify and measure the retrieved PNOR partition as part of the
+	 * secure boot and trusted boot requirements
+	 */
+	stb_final();
+
+	return true;
 }
 
 static void load_initramfs(void)
@@ -390,6 +440,9 @@ static void load_initramfs(void)
 	if (loaded != OPAL_SUCCESS || !initramfs_size)
 		return;
 
+	dt_check_del_prop(dt_chosen, "linux,initrd-start");
+	dt_check_del_prop(dt_chosen, "linux,initrd-end");
+
 	printf("INIT: Initramfs loaded, size: %zu bytes\n", initramfs_size);
 
 	dt_add_property_u64(dt_chosen, "linux,initrd-start",
@@ -400,11 +453,13 @@ static void load_initramfs(void)
 
 int64_t mem_dump_free(void);
 
+void *fdt;
+
 void __noreturn load_and_boot_kernel(bool is_reboot)
 {
 	const struct dt_property *memprop;
+	const char *cmdline;
 	uint64_t mem_top;
-	void *fdt;
 
 	memprop = dt_find_property(dt_root, DT_PRIVATE "maxmem");
 	if (memprop)
@@ -436,7 +491,9 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 
 		/* Wait for FW VPD data read to complete */
 		fsp_code_update_wait_vpd(true);
-	}
+	} else
+		nvram_reinit();
+
 	fsp_console_select_stdout();
 
 	/*
@@ -445,10 +502,12 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	 */
 	occ_pstates_init();
 
-	/* Set kernel command line argument if specified */
-#ifdef KERNEL_COMMAND_LINE
-	dt_add_property_string(dt_chosen, "bootargs", KERNEL_COMMAND_LINE);
-#endif
+	/* Use nvram bootargs over device tree */
+	cmdline = nvram_query("bootargs");
+	if (cmdline) {
+		dt_check_del_prop(dt_chosen, "bootargs");
+		dt_add_property_string(dt_chosen, "bootargs", cmdline);
+	}
 
 	op_display(OP_LOG, OP_MOD_INIT, 0x000B);
 
@@ -471,6 +530,9 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	cpu_give_self_os();
 
 	mem_dump_free();
+
+	/* Take processours out of nap */
+	cpu_set_pm_enable(false);
 
 	printf("INIT: Starting kernel at 0x%llx, fdt at %p (size 0x%x)\n",
 	       kernel_entry, fdt, fdt_totalsize(fdt));
@@ -550,25 +612,10 @@ static void branch_null(void)
 	assert_fail("Branch to NULL !");
 }
 
-static void setup_branch_null_catcher(void)
-{
-	void (*bn)(void) = branch_null;
-
-	/*
-	 * FIXME: This copies the function descriptor (16 bytes) for
-	 * ABI v1 (ie. big endian).  This will be broken if we ever
-	 * move to ABI v2 (ie little endian)
-	 */
-	memcpy(zero_location, 0, 16); /* Save away in case we need it later */
-	memcpy(0, bn, 16);
-}
-
-/* Called from head.S, thus no prototype. */
-void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu);
 
 typedef void (*ctorcall_t)(void);
 
-static void do_ctors(void)
+static void __nomcount do_ctors(void)
 {
 	extern ctorcall_t __ctors_start[], __ctors_end[];
 	ctorcall_t *call;
@@ -577,7 +624,73 @@ static void do_ctors(void)
 		(*call)();
 }
 
-void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
+static void setup_branch_null_catcher(void)
+{
+       void (*bn)(void) = branch_null;
+
+       /*
+        * FIXME: This copies the function descriptor (16 bytes) for
+        * ABI v1 (ie. big endian).  This will be broken if we ever
+        * move to ABI v2 (ie little endian)
+        */
+       memcpy(0, bn, 16);
+}
+
+void setup_reset_vector(void)
+{
+	uint32_t *src, *dst;
+
+	/* Copy the reset code over the entry point. */
+	src = &reset_patch_start;
+	dst = (uint32_t *)0x100;
+	while(src < &reset_patch_end)
+		*(dst++) = *(src++);
+}
+
+void copy_exception_vectors(void)
+{
+	/* Backup previous vectors as this could contain a kernel
+	 * image.
+	 */
+	memcpy(old_vectors, NULL, 0x2000);
+
+	/* Copy from 0x100 to 0x2000, avoid below 0x100 as this is
+	 * the boot flag used by CPUs still potentially entering
+	 * skiboot.
+	 */
+	BUILD_ASSERT((&reset_patch_end - &reset_patch_start) < 0x1f00);
+	memcpy((void *)0x100, (void *)(SKIBOOT_BASE + 0x100), 0x1f00);
+	sync_icache();
+}
+
+static void per_thread_sanity_checks(void)
+{
+	struct cpu_thread *cpu = this_cpu();
+
+	/**
+	 * @fwts-label NonZeroHRMOR
+	 * @fwts-advice The contents of the hypervisor real mode offset register
+	 * (HRMOR) is bitwise orded with the address of any hypervisor real mode
+	 * (i.e Skiboot) memory accesses. Skiboot does not support operating
+	 * with a non-zero HRMOR and setting it will break some things (e.g
+	 * XSCOMs) in hard-to-debug ways.
+	 */
+	assert(mfspr(SPR_HRMOR) == 0);
+
+	/**
+	 * @fwts-label UnknownSecondary
+	 * @fwts-advice The boot CPU attampted to call in a secondary thread
+	 * without initialising the corresponding cpu_thread structure. This may
+	 * happen if the HDAT or devicetree reports too few threads or cores for
+	 * this processor.
+	 */
+	assert(cpu->state != cpu_state_no_cpu);
+}
+
+/* Called from head.S, thus no prototype. */
+void main_cpu_entry(const void *fdt);
+
+void __noreturn __nomcount main_cpu_entry(const void *fdt)
 {
 	/*
 	 * WARNING: At this point. the timebases have
@@ -600,11 +713,13 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	 */
 	clear_console();
 
-	/* Put at 0 an OPD to a warning function in case we branch through
-	 * a NULL function pointer
-	 */
+	/* Copy all vectors down to 0 */
+	copy_exception_vectors();
+
+	/* Setup a NULL catcher to catch accidental NULL ptr calls */
 	setup_branch_null_catcher();
 
+	/* Call library constructors */
 	do_ctors();
 
 	printf("SkiBoot %s starting...\n", version);
@@ -635,15 +750,21 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	 * Hack alert: When entering via the OPAL entry point, fdt
 	 * is set to -1, we record that and pass it to parse_hdat
 	 */
+
+	dt_root = dt_new_root("");
+
 	if (fdt == (void *)-1ul) {
-		if (parse_hdat(true, master_cpu) < 0)
+		if (parse_hdat(true) < 0)
 			abort();
 	} else if (fdt == NULL) {
-		if (parse_hdat(false, master_cpu) < 0)
+		if (parse_hdat(false) < 0)
 			abort();
 	} else {
 		dt_expand(fdt);
 	}
+
+	/* Now that we have a full devicetree, verify that we aren't on fire. */
+	per_thread_sanity_checks();
 
 	/*
 	 * From there, we follow a fairly strict initialization order.
@@ -724,11 +845,25 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	/* Initialize PSI (depends on probe_platform being called) */
 	psi_init();
 
+	/* Initialize/enable LPC interrupts. This must be done after the
+	 * PSI interface has been initialized since it serves as an interrupt
+	 * source for LPC interrupts.
+	 */
+	lpc_init_interrupts();
+
 	/* Call in secondary CPUs */
 	cpu_bringup();
 
+	/* We can now overwrite the 0x100 vector as we are no longer being
+	 * entered there.
+	 */
+	setup_reset_vector();
+
+	/* We can now do NAP mode */
+	cpu_set_pm_enable(true);
+
 	/*
-	 * Sycnhronize time bases. Thi resets all the TB values to a small
+	 * Synchronize time bases. Thi resets all the TB values to a small
 	 * value (so they appear to go backward at this point), and synchronize
 	 * all core timebases to the global ChipTOD network
 	 */
@@ -740,6 +875,13 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	/* Register routine to dispatch and read sensors */
 	sensor_init();
 
+        /*
+	 * Initialize the opal messaging before platform.init as we are
+	 *  getting request to queue occ load opal message when host services
+	 *  got load occ request from FSP
+	 */
+        opal_init_msg();
+
 	/*
 	 * We have initialized the basic HW, we can now call into the
 	 * platform to perform subsequent inits, such as establishing
@@ -747,6 +889,12 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	 */
 	if (platform.init)
 		platform.init();
+
+	/* Read in NVRAM and set it up */
+	nvram_init();
+
+	/* Secure/Trusted Boot init. We look for /ibm,secureboot in DT */
+	stb_init();
 
 	/* Setup dummy console nodes if it's enabled */
 	if (dummy_console_enabled())
@@ -757,18 +905,12 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 
 	op_display(OP_LOG, OP_MOD_INIT, 0x0002);
 
-	/* Read in NVRAM and set it up */
-	nvram_init();
-
 	phb3_preload_vpd();
 	phb3_preload_capp_ucode();
 	start_preload_kernel();
 
 	/* NX init */
 	nx_init();
-
-	/* Initialize the opal messaging */
-	opal_init_msg();
 
 	/* Probe IO hubs */
 	probe_p7ioc();
@@ -828,31 +970,21 @@ void __noreturn __secondary_cpu_entry(void)
 
 	/* Wait for work to do */
 	while(true) {
-		int i;
-
-		/* Process pending jobs on this processor */
-		cpu_process_jobs();
-
-		/* Relax a bit to give the simulator some breathing space */
-		i = 1000;
-		smt_very_low();
-		asm volatile("mtctr %0;\n"
-			     "1: nop; nop; nop; nop;\n"
-			     "   nop; nop; nop; nop;\n"
-			     "   nop; nop; nop; nop;\n"
-			     "   nop; nop; nop; nop;\n"
-			     "   bdnz 1b"
-			     : : "r" (i) : "memory", "ctr");
-		smt_medium();
+		if (cpu_check_jobs(cpu))
+		    cpu_process_jobs();
+		else
+		    cpu_idle(cpu_wake_on_job);
 	}
 }
 
 /* Called from head.S, thus no prototype. */
-void __noreturn secondary_cpu_entry(void);
+void secondary_cpu_entry(void);
 
-void __noreturn secondary_cpu_entry(void)
+void __noreturn __nomcount secondary_cpu_entry(void)
 {
 	struct cpu_thread *cpu = this_cpu();
+
+	per_thread_sanity_checks();
 
 	prlog(PR_DEBUG, "INIT: CPU PIR 0x%04x called in\n", cpu->pir);
 

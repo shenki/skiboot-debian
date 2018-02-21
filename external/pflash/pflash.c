@@ -29,6 +29,7 @@
 #include <limits.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #include <libflash/libflash.h>
 #include <libflash/libffs.h>
@@ -41,6 +42,7 @@
 /* Full pflash version number (possibly includes gitid). */
 extern const char version[];
 
+const char *flashfilename = NULL;
 static bool must_confirm = true;
 static bool dummy_run;
 static int need_relock;
@@ -53,7 +55,8 @@ static uint8_t file_buf[FILE_BUF_SIZE] __aligned(0x1000);
 
 static struct blocklevel_device *bl;
 static struct ffs_handle	*ffsh;
-static uint32_t			fl_total_size, fl_erase_granule;
+static uint64_t			fl_total_size;
+static uint32_t			fl_erase_granule;
 static const char		*fl_name;
 static int32_t			ffs_index = -1;
 
@@ -134,7 +137,7 @@ static void print_flash_info(uint32_t toc)
 	printf("Flash info:\n");
 	printf("-----------\n");
 	printf("Name          = %s\n", fl_name);
-	printf("Total size    = %dMB \n", fl_total_size >> 20);
+	printf("Total size    = %"PRIu64"MB \n", fl_total_size >> 20);
 	printf("Erase granule = %dKB \n", fl_erase_granule >> 10);
 
 	if (bmc_flash)
@@ -302,8 +305,7 @@ static void set_ecc(uint32_t start, uint32_t size)
 
 static void program_file(const char *file, uint32_t start, uint32_t size)
 {
-	int fd, rc;
-	ssize_t len;
+	int fd;
 	uint32_t actual_size = 0;
 
 	fd = open(file, O_RDONLY);
@@ -324,6 +326,9 @@ static void program_file(const char *file, uint32_t start, uint32_t size)
 	printf("Programming & Verifying...\n");
 	progress_init(size >> 8);
 	while(size) {
+		ssize_t len;
+		int rc;
+
 		len = read(fd, file_buf, FILE_BUF_SIZE);
 		if (len < 0) {
 			perror("Error reading file");
@@ -360,8 +365,7 @@ static void program_file(const char *file, uint32_t start, uint32_t size)
 
 static void do_read_file(const char *file, uint32_t start, uint32_t size)
 {
-	int fd, rc;
-	ssize_t len;
+	int fd;
 	uint32_t done = 0;
 
 	fd = open(file, O_WRONLY | O_TRUNC | O_CREAT, 00666);
@@ -374,6 +378,9 @@ static void do_read_file(const char *file, uint32_t start, uint32_t size)
 
 	progress_init(size >> 8);
 	while(size) {
+		ssize_t len;
+		int rc;
+
 		len = size > FILE_BUF_SIZE ? FILE_BUF_SIZE : size;
 		rc = blocklevel_read(bl, start, file_buf, len);
 		if (rc) {
@@ -453,10 +460,15 @@ static void print_help(const char *pname)
 	printf("\t\tDon't ask for confirmation before erasing or flashing\n\n");
 	printf("\t-d, --dummy\n");
 	printf("\t\tDon't write to flash\n\n");
-	printf("\t-m, --mtd\n");
-	printf("\t\tAvoid accessing the flash directly if the BMC supports it.\n");
-	printf("\t\tThis will access the flash through the kernel MTD layer and\n");
-	printf("\t\tnot the flash directly\n");
+	printf("\t--direct\n");
+	printf("\t\tBypass all safety provided to you by the kernel driver\n");
+	printf("\t\tand use the flash driver built into pflash.\n");
+	printf("\t\tIf you have mtd devices and you use this command, the\n");
+	printf("\t\tsystem may become unstable.\n");
+	printf("\t\tIf you are reading this sentence then this flag is not\n");
+	printf("\t\twhat you want! Using this feature without knowing\n");
+	printf("\t\twhat it does can and likely will result in a bricked\n");
+	printf("\t\tmachine\n\n");
 	printf("\t-b, --bmc\n");
 	printf("\t\tTarget BMC flash instead of host flash.\n");
 	printf("\t\tNote: This carries a high chance of bricking your BMC if you\n");
@@ -513,7 +525,7 @@ void exiting(void)
 {
 	if (need_relock)
 		arch_flash_set_wrprotect(bl, 1);
-	arch_flash_close(bl, NULL);
+	arch_flash_close(bl, flashfilename);
 }
 
 int main(int argc, char *argv[])
@@ -527,9 +539,8 @@ int main(int argc, char *argv[])
 	bool show_help = false, show_version = false;
 	bool no_action = false, tune = false;
 	char *write_file = NULL, *read_file = NULL, *part_name = NULL;
-	bool ffs_toc_seen = false, mtd = false;
+	bool ffs_toc_seen = false, direct = false;
 	int rc;
-	const char *flashfilename = NULL;
 
 	while(1) {
 		struct option long_opts[] = {
@@ -537,7 +548,7 @@ int main(int argc, char *argv[])
 			{"size",	required_argument,	NULL,	's'},
 			{"partition",	required_argument,	NULL,	'P'},
 			{"bmc",		no_argument,		NULL,	'b'},
-			{"mtd",		no_argument,		NULL,	'm'},
+			{"direct",	no_argument,		NULL,	'D'},
 			{"enable-4B",	no_argument,		NULL,	'4'},
 			{"disable-4B",	no_argument,		NULL,	'3'},
 			{"read",	required_argument,	NULL,	'r'},
@@ -559,7 +570,7 @@ int main(int argc, char *argv[])
 		};
 		int c, oidx = 0;
 
-		c = getopt_long(argc, argv, "+:a:s:P:r:43Eemp:fdihvbtgS:T:cF:",
+		c = getopt_long(argc, argv, "+:a:s:P:r:43Eep:fdihvbtgS:T:cF:",
 				long_opts, &oidx);
 		if (c == -1)
 			break;
@@ -589,8 +600,8 @@ int main(int argc, char *argv[])
 		case 'e':
 			erase = true;
 			break;
-		case 'm':
-			mtd = true;
+		case 'D':
+			direct = true;
 			break;
 		case 'p':
 			program = true;
@@ -737,6 +748,16 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
+	if (flashfilename && bmc_flash) {
+		fprintf(stderr, "Filename or bmc flash but not both\n");
+		exit(1);
+	}
+
+	if (flashfilename && direct) {
+		fprintf(stderr, "Filename or direct access but not both\n");
+		exit(1);
+	}
+
 	/* If file specified but not size, get size from file
 	 */
 	if (write_file && !write_size) {
@@ -749,22 +770,15 @@ int main(int argc, char *argv[])
 		write_size = stbuf.st_size;
 	}
 
-	if (bmc_flash) {
-		/*
-		 * Try to see if we can access BMC flash on this arch at all...
-		 * even if what we really want to do is use MTD.
-		 * This helps give a more meaningful error messages.
-		 */
-
-		if (arch_flash_bmc(NULL, BMC_DIRECT) == ACCESS_INVAL) {
-			fprintf(stderr, "Can't access BMC flash on this architecture\n");
+	if (direct) {
+		if (arch_flash_access(NULL, bmc_flash ? BMC_DIRECT : PNOR_DIRECT) == ACCESS_INVAL) {
+			fprintf(stderr, "Can't access %s flash directly on this architecture\n",
+			        bmc_flash ? "BMC" : "PNOR");
 			exit(1);
 		}
-	}
-
-	if (mtd) {
-		if (arch_flash_bmc(NULL, bmc_flash ? BMC_MTD : PNOR_MTD) == ACCESS_INVAL) {
-			fprintf(stderr, "Can't access %s flash through MTD on this architecture\n",
+	} else if (!flashfilename) {
+		if (arch_flash_access(NULL, bmc_flash ? BMC_MTD : PNOR_MTD) == ACCESS_INVAL) {
+			fprintf(stderr, "Can't access %s flash through MTD on this system\n",
 			        bmc_flash ? "BMC" : "PNOR");
 			exit(1);
 		}
@@ -825,13 +839,19 @@ int main(int argc, char *argv[])
 		if (!write_size)
 			write_size = pmaxsz;
 
-		/* Crop write size to partition size */
-		if (write_size > pmaxsz) {
+		/* Crop write size to partition size if --force was passed */
+		if (write_size > pmaxsz && !must_confirm) {
 			printf("WARNING: Size (%d bytes) larger than partition"
 			       " (%d bytes), cropping to fit\n",
 			       write_size, pmaxsz);
 			write_size = pmaxsz;
+		} else if (write_size > pmaxsz) {
+			printf("ERROR: Size (%d bytes) larger than partition"
+			       " (%d bytes). Use --force to force\n",
+			       write_size, pmaxsz);
+			exit(1);
 		}
+
 
 		/* If erasing, check partition alignment */
 		if (erase && ((pstart | pmaxsz) & 0xfff)) {
@@ -876,7 +896,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Unlock flash (PNOR only) */
-	if ((erase || program || do_clear) && !bmc_flash) {
+	if ((erase || program || do_clear) && !bmc_flash && !flashfilename) {
 		need_relock = arch_flash_set_wrprotect(bl, false);
 		if (need_relock == -1) {
 			fprintf(stderr, "Architecture doesn't support write protection on flash\n");

@@ -78,7 +78,7 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
 	struct ffs_hdr hdr;
 	struct ffs_hdr blank_hdr;
 	struct ffs_handle *f;
-	uint32_t total_size;
+	uint64_t total_size;
 	int rc, i;
 
 	if (!ffs || !bl)
@@ -90,6 +90,8 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
 		FL_ERR("FFS: Error %d retrieving flash info\n", rc);
 		return rc;
 	}
+	if (total_size > UINT_MAX)
+		return FLASH_ERR_VERIFY_FAILURE;
 	if ((offset + max_size) < offset)
 		return FLASH_ERR_PARM_ERROR;
 
@@ -133,7 +135,7 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
 	/* Convert and check flash header */
 	rc = ffs_check_convert_header(&f->hdr, &hdr);
 	if (rc) {
-		FL_ERR("FFS: Error %d checking flash header\n", rc);
+		FL_INF("FFS: Flash header not found. Code: %d\n", rc);
 		goto out;
 	}
 
@@ -194,7 +196,7 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
 			if (ecc) {
 				rc = blocklevel_ecc_protect(bl, start, total_size);
 				if (rc) {
-					FL_ERR("Failed to blocklevel_ecc_protect(0x%08x, 0x%08x)\n",
+					FL_ERR("FFS: Failed to blocklevel_ecc_protect(0x%08x, 0x%08x)\n",
 					       start, total_size);
 					goto out;
 				}
@@ -305,6 +307,8 @@ int ffs_part_info(struct ffs_handle *ffs, uint32_t part_idx,
 
 	if (name) {
 		n = malloc(PART_NAME_MAX + 1);
+		if (!n)
+			return FLASH_ERR_MALLOC_FAILED;
 		memset(n, 0, PART_NAME_MAX + 1);
 		strncpy(n, ent.name, PART_NAME_MAX);
 		*name = n;
@@ -383,6 +387,6 @@ int ffs_update_act_size(struct ffs_handle *ffs, uint32_t part_idx,
 	ent->actual = cpu_to_be32(act_size);
 	ent->checksum = ffs_checksum(ent, FFS_ENTRY_SIZE_CSUM);
 
-	return blocklevel_write(ffs->bl, offset, ent, FFS_ENTRY_SIZE);
+	return blocklevel_smart_write(ffs->bl, offset, ent, FFS_ENTRY_SIZE);
 }
 

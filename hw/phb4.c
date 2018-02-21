@@ -55,7 +55,7 @@
 #include <xive.h>
 
 /* Enable this to disable error interrupts for debug purposes */
-#undef DISABLE_ERR_INTS
+#define DISABLE_ERR_INTS
 
 static void phb4_init_hw(struct phb4 *p, bool first_init);
 
@@ -365,7 +365,7 @@ static int64_t phb4_pcicfg_read(struct phb4 *p, uint32_t bdfn,
 
 #define PHB4_PCI_CFG_READ(size, type)					\
 static int64_t phb4_pcicfg_read##size(struct phb *phb, uint32_t bdfn,	\
-                                      uint32_t offset, type *data)	\
+				      uint32_t offset, type *data)	\
 {									\
 	struct phb4 *p = phb_to_phb4(phb);				\
 									\
@@ -440,12 +440,12 @@ static int64_t phb4_pcicfg_write(struct phb4 *p, uint32_t bdfn,
 		}
 #endif
 	}
-        return OPAL_SUCCESS;
+	return OPAL_SUCCESS;
 }
 
 #define PHB4_PCI_CFG_WRITE(size, type)					\
 static int64_t phb4_pcicfg_write##size(struct phb *phb, uint32_t bdfn,	\
-                                       uint32_t offset, type data)	\
+				       uint32_t offset, type data)	\
 {									\
 	struct phb4 *p = phb_to_phb4(phb);				\
 									\
@@ -790,7 +790,7 @@ static int64_t phb4_wait_bit(struct phb4 *p, uint32_t reg,
 }
 
 static int64_t phb4_tce_kill(struct phb *phb, uint32_t kill_type,
-			     uint32_t pe_num, uint32_t tce_size,
+			     uint64_t pe_number, uint32_t tce_size,
 			     uint64_t dma_addr, uint32_t npages)
 {
 	struct phb4 *p = phb_to_phb4(phb);
@@ -808,7 +808,7 @@ static int64_t phb4_tce_kill(struct phb *phb, uint32_t kill_type,
 					   PHB_TCE_KILL_ONE, 0);
 			if (rc)
 				return rc;
-			val = SETFIELD(PHB_TCE_KILL_PENUM, dma_addr, pe_num);
+			val = SETFIELD(PHB_TCE_KILL_PENUM, dma_addr, pe_number);
 
 			/* Set appropriate page size */
 			switch(tce_size) {
@@ -850,7 +850,7 @@ static int64_t phb4_tce_kill(struct phb *phb, uint32_t kill_type,
 			return rc;
 		/* Perform kill */
 		out_be64(p->regs + PHB_TCE_KILL, PHB_TCE_KILL_PE |
-			 SETFIELD(PHB_TCE_KILL_PENUM, 0ull, pe_num));
+			 SETFIELD(PHB_TCE_KILL_PENUM, 0ull, pe_number));
 		break;
 	case OPAL_PCI_TCE_KILL_ALL:
 		/* Wait for a slot in the HW kill queue */
@@ -1146,7 +1146,7 @@ static int64_t phb4_phb_mmio_enable(struct phb __unused *phb,
 }
 
 static int64_t phb4_map_pe_mmio_window(struct phb *phb,
-				       uint16_t pe_num,
+				       uint64_t pe_number,
 				       uint16_t window_type,
 				       uint16_t window_num,
 				       uint16_t segment_num)
@@ -1154,7 +1154,7 @@ static int64_t phb4_map_pe_mmio_window(struct phb *phb,
 	struct phb4 *p = phb_to_phb4(phb);
 	uint64_t mbt0, mbt1, mdt;
 
-	if (pe_num >= p->num_pes)
+	if (pe_number >= p->num_pes)
 		return OPAL_PARAMETER;
 
 	/*
@@ -1172,7 +1172,7 @@ static int64_t phb4_map_pe_mmio_window(struct phb *phb,
 			return OPAL_PARAMETER;
 
 		mdt = p->mdt_cache[segment_num];
-		mdt = SETFIELD(IODA3_MDT_PE_A, mdt, pe_num);
+		mdt = SETFIELD(IODA3_MDT_PE_A, mdt, pe_number);
 		p->mdt_cache[segment_num] = mdt;
 		phb4_ioda_sel(p, IODA3_TBL_MDT, segment_num, false);
 		out_be64(p->regs + PHB_IODA_DATA0, mdt);
@@ -1191,7 +1191,7 @@ static int64_t phb4_map_pe_mmio_window(struct phb *phb,
 		/* Set to single PE mode and configure the PE */
 		mbt0 = SETFIELD(IODA3_MBT0_MODE, mbt0,
 				IODA3_MBT0_MODE_SINGLE_PE);
-		mbt1 = SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, mbt1, pe_num);
+		mbt1 = SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, mbt1, pe_number);
 		p->mbt_cache[window_num][0] = mbt0;
 		p->mbt_cache[window_num][1] = mbt1;
 		break;
@@ -1203,7 +1203,7 @@ static int64_t phb4_map_pe_mmio_window(struct phb *phb,
 }
 
 static int64_t phb4_map_pe_dma_window(struct phb *phb,
-				      uint16_t pe_num,
+				      uint64_t pe_number,
 				      uint16_t window_id,
 				      uint16_t tce_levels,
 				      uint64_t tce_table_addr,
@@ -1224,7 +1224,7 @@ static int64_t phb4_map_pe_dma_window(struct phb *phb,
 	 * Sanity check. We currently only support "2 window per PE" mode
 	 * ie, only bit 59 of the PCI address is used to select the window
 	 */
-	if (pe_num >= p->num_pes || (window_id >> 1) != pe_num)
+	if (pe_number >= p->num_pes || (window_id >> 1) != pe_number)
 		return OPAL_PARAMETER;
 
 	/*
@@ -1282,7 +1282,7 @@ static int64_t phb4_map_pe_dma_window(struct phb *phb,
 }
 
 static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
-					   uint16_t pe_num,
+					   uint64_t pe_number,
 					   uint16_t window_id,
 					   uint64_t pci_start_addr,
 					   uint64_t pci_mem_size)
@@ -1291,8 +1291,8 @@ static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 	uint64_t end = pci_start_addr + pci_mem_size;
 	uint64_t tve;
 
-	if (pe_num >= p->num_pes ||
-	    (window_id >> 1) != pe_num)
+	if (pe_number >= p->num_pes ||
+	    (window_id >> 1) != pe_number)
 		return OPAL_PARAMETER;
 
 	if (pci_mem_size) {
@@ -1346,7 +1346,7 @@ static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 }
 
 static int64_t phb4_set_ive_pe(struct phb *phb,
-			       uint32_t pe_num,
+			       uint64_t pe_number,
 			       uint32_t ive_num)
 {
 	struct phb4 *p = phb_to_phb4(phb);
@@ -1355,14 +1355,14 @@ static int64_t phb4_set_ive_pe(struct phb *phb,
 	uint32_t mist_shift;
 	uint64_t val;
 
-	if (pe_num >= p->num_pes || ive_num >= (p->num_irqs - 8))
+	if (pe_number >= p->num_pes || ive_num >= (p->num_irqs - 8))
 		return OPAL_PARAMETER;
 
 	mist_idx = ive_num >> 2;
 	mist_quad = ive_num & 3;
 	mist_shift = (3 - mist_quad) << 4;
 	p->mist_cache[mist_idx] &= ~(0x0fffull << mist_shift);
-	p->mist_cache[mist_idx] |=  ((uint64_t)pe_num) << mist_shift;
+	p->mist_cache[mist_idx] |=  ((uint64_t)pe_number) << mist_shift;
 
 	/* Note: This has the side effect of clearing P/Q, so this
 	 * shouldn't be called while the interrupt is "hot"
@@ -1384,7 +1384,7 @@ static int64_t phb4_set_ive_pe(struct phb *phb,
 }
 
 static int64_t phb4_get_msi_32(struct phb *phb,
-			       uint32_t pe_num,
+			       uint64_t pe_number,
 			       uint32_t ive_num,
 			       uint8_t msi_range,
 			       uint32_t *msi_address,
@@ -1398,7 +1398,7 @@ static int64_t phb4_get_msi_32(struct phb *phb,
 	 * by its DMA address and data, but the check isn't
 	 * harmful.
 	 */
-	if (pe_num >= p->num_pes ||
+	if (pe_number >= p->num_pes ||
 	    ive_num >= (p->num_irqs - 8) ||
 	    msi_range != 1 || !msi_address|| !message_data)
 		return OPAL_PARAMETER;
@@ -1414,7 +1414,7 @@ static int64_t phb4_get_msi_32(struct phb *phb,
 }
 
 static int64_t phb4_get_msi_64(struct phb *phb,
-			       uint32_t pe_num,
+			       uint64_t pe_number,
 			       uint32_t ive_num,
 			       uint8_t msi_range,
 			       uint64_t *msi_address,
@@ -1423,7 +1423,7 @@ static int64_t phb4_get_msi_64(struct phb *phb,
 	struct phb4 *p = phb_to_phb4(phb);
 
 	/* Sanity check */
-	if (pe_num >= p->num_pes ||
+	if (pe_number >= p->num_pes ||
 	    ive_num >= (p->num_irqs - 8) ||
 	    msi_range != 1 || !msi_address || !message_data)
 		return OPAL_PARAMETER;
@@ -1533,8 +1533,8 @@ static void phb4_read_phb_status(struct phb4 *p,
 }
 
 static int64_t phb4_set_pe(struct phb *phb,
-			   uint64_t pe_num,
-                           uint64_t bdfn,
+			   uint64_t pe_number,
+			   uint64_t bdfn,
 			   uint8_t bcompare,
 			   uint8_t dcompare,
 			   uint8_t fcompare,
@@ -1550,7 +1550,7 @@ static int64_t phb4_set_pe(struct phb *phb,
 		return OPAL_HARDWARE;
 	if (action != OPAL_MAP_PE && action != OPAL_UNMAP_PE)
 		return OPAL_PARAMETER;
-	if (pe_num >= p->num_pes || bdfn > 0xffff ||
+	if (pe_number >= p->num_pes || bdfn > 0xffff ||
 	    bcompare > OpalPciBusAll ||
 	    dcompare > OPAL_COMPARE_RID_DEVICE_NUMBER ||
 	    fcompare > OPAL_COMPARE_RID_FUNCTION_NUMBER)
@@ -1585,7 +1585,7 @@ static int64_t phb4_set_pe(struct phb *phb,
 	if (all == 0x7) {
 		if (action == OPAL_MAP_PE) {
 			for (idx = 0; idx < RTT_TABLE_ENTRIES; idx++)
-				p->rte_cache[idx] = pe_num;
+				p->rte_cache[idx] = pe_number;
 		} else {
 			for ( idx = 0; idx < ARRAY_SIZE(p->rte_cache); idx++)
 				p->rte_cache[idx] = PHB4_RESERVED_PE_NUM(p);
@@ -1597,7 +1597,7 @@ static int64_t phb4_set_pe(struct phb *phb,
 			if ((idx & mask) != val)
 				continue;
 			if (action == OPAL_MAP_PE)
-				p->rte_cache[idx] = pe_num;
+				p->rte_cache[idx] = pe_number;
 			else
 				p->rte_cache[idx] = PHB4_RESERVED_PE_NUM(p);
 			*rte = p->rte_cache[idx];
@@ -1901,7 +1901,7 @@ static int64_t phb4_hreset(struct pci_slot *slot)
 	return OPAL_HARDWARE;
 }
 
-static int64_t phb4_pfreset(struct pci_slot *slot)
+static int64_t phb4_freset(struct pci_slot *slot)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
 	uint8_t presence = 1;
@@ -1909,58 +1909,50 @@ static int64_t phb4_pfreset(struct pci_slot *slot)
 
 	switch(slot->state) {
 	case PHB4_SLOT_NORMAL:
-		PHBDBG(p, "PFRESET: Starts\n");
+		PHBDBG(p, "FRESET: Starts\n");
 
 		/* Nothing to do without adapter connected */
 		if (slot->ops.get_presence_state)
 			slot->ops.get_presence_state(slot, &presence);
 		if (!presence) {
-			PHBDBG(p, "PFRESET: No device\n");
+			PHBDBG(p, "FRESET: No device\n");
 			return OPAL_SUCCESS;
 		}
 
-		PHBDBG(p, "PFRESET: Prepare for link down\n");
-		slot->retry_state = PHB4_SLOT_PFRESET_START;
+		PHBDBG(p, "FRESET: Prepare for link down\n");
+		slot->retry_state = PHB4_SLOT_FRESET_START;
 		if (slot->ops.prepare_link_change)
 			slot->ops.prepare_link_change(slot, false);
 		/* fall through */
-	case PHB4_SLOT_PFRESET_START:
+	case PHB4_SLOT_FRESET_START:
 		if (!p->skip_perst) {
-			PHBDBG(p, "PFRESET: Assert\n");
+			PHBDBG(p, "FRESET: Assert\n");
 			reg = in_be64(p->regs + PHB_PCIE_CRESET);
 			reg &= ~PHB_PCIE_CRESET_PERST_N;
 			out_be64(p->regs + PHB_PCIE_CRESET, reg);
 			pci_slot_set_state(slot,
-				PHB4_SLOT_PFRESET_ASSERT_DELAY);
+				PHB4_SLOT_FRESET_ASSERT_DELAY);
 			return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
 		}
 
 		/* To skip the assert during boot time */
-		PHBDBG(p, "PFRESET: Assert skipped\n");
-		pci_slot_set_state(slot, PHB4_SLOT_PFRESET_ASSERT_DELAY);
+		PHBDBG(p, "FRESET: Assert skipped\n");
+		pci_slot_set_state(slot, PHB4_SLOT_FRESET_ASSERT_DELAY);
 		p->skip_perst = false;
 		/* fall through */
-	case PHB4_SLOT_PFRESET_ASSERT_DELAY:
-		PHBDBG(p, "PFRESET: Deassert\n");
+	case PHB4_SLOT_FRESET_ASSERT_DELAY:
+		PHBDBG(p, "FRESET: Deassert\n");
 		reg = in_be64(p->regs + PHB_PCIE_CRESET);
 		reg |= PHB_PCIE_CRESET_PERST_N;
 		out_be64(p->regs + PHB_PCIE_CRESET, reg);
 		pci_slot_set_state(slot,
-			PHB4_SLOT_PFRESET_DEASSERT_DELAY);
+			PHB4_SLOT_FRESET_DEASSERT_DELAY);
 
 		/* CAPP FPGA requires 1s to flash before polling link */
 		return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
-	case PHB4_SLOT_PFRESET_DEASSERT_DELAY:
-#if 0 /* PHB3 does a Hreset here. It's unnecessary I think and it's
-	 causing problems with the simulator croc model so don't do
-	 it until I figure out Gavin's reasons
-       */
-		pci_slot_set_state(slot, PHB4_SLOT_HRESET_START);
-		return slot->ops.hreset(slot);
-#else
+	case PHB4_SLOT_FRESET_DEASSERT_DELAY:
 		pci_slot_set_state(slot, PHB4_SLOT_LINK_START);
 		return slot->ops.poll_link(slot);
-#endif
 	default:
 		PHBERR(p, "Unexpected slot state %08x\n", slot->state);
 	}
@@ -2043,8 +2035,7 @@ static struct pci_slot *phb4_slot_create(struct phb *phb)
 	slot->ops.prepare_link_change	= phb4_prepare_link_change;
 	slot->ops.poll_link		= phb4_poll_link;
 	slot->ops.hreset		= phb4_hreset;
-	slot->ops.freset		= phb4_pfreset;
-	slot->ops.pfreset		= phb4_pfreset;
+	slot->ops.freset		= phb4_freset;
 	slot->ops.creset		= phb4_creset;
 
 	return slot;
@@ -2172,10 +2163,10 @@ static int64_t phb4_eeh_freeze_clear(struct phb *phb, uint64_t pe_number,
 }
 
 static int64_t phb4_eeh_freeze_set(struct phb *phb, uint64_t pe_number,
-                                   uint64_t eeh_action_token)
+				   uint64_t eeh_action_token)
 {
-        struct phb4 *p = phb_to_phb4(phb);
-        uint64_t data;
+	struct phb4 *p = phb_to_phb4(phb);
+	uint64_t data;
 
 	if (p->state == PHB4_STATE_BROKEN)
 		return OPAL_HARDWARE;
@@ -2256,7 +2247,7 @@ static int64_t phb4_eeh_next_error(struct phb *phb,
 				break;
 			}
 		}
-        }
+	}
 
 	/* Mapping errors */
 	if (phb4_err_pending(p)) {
@@ -2312,7 +2303,7 @@ static int64_t phb4_eeh_next_error(struct phb *phb,
 				phb4_set_err_pending(p, false);
 			}
 
-                        break;
+			break;
 		case PHB4_ERR_CLASS_INF:
 			*pci_error_type = OPAL_EEH_PHB_ERROR;
 			*severity = OPAL_EEH_SEV_INF;
@@ -2327,7 +2318,7 @@ static int64_t phb4_eeh_next_error(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
-static int64_t phb4_err_inject(struct phb *phb, uint32_t pe_no,
+static int64_t phb4_err_inject(struct phb *phb, uint64_t pe_number,
 			       uint32_t type, uint32_t func,
 			       uint64_t addr, uint64_t mask)
 {
@@ -2407,7 +2398,8 @@ static void phb4_init_ioda3(struct phb4 *p)
 	out_be64(p->regs + PHB_INT_NOTIFY_ADDR, p->irq_port);
 
 	/* Init_18 - Interrupt Notify Base Index */
-	out_be64(p->regs + PHB_INT_NOTIFY_INDEX, p->base_msi);
+	out_be64(p->regs + PHB_INT_NOTIFY_INDEX,
+		 xive_get_notify_base(p->base_msi));
 
 	/* Init_xx - Not in spec: Initialize source ID */
 	PHBDBG(p, "Reset state SRC_ID: %016llx\n",
@@ -2534,7 +2526,7 @@ static bool phb4_init_rc_cfg(struct phb4 *p)
 			     PCIECAP_AER_UE_POISON_TLP		|
 			     PCIECAP_AER_UE_COMPL_TIMEOUT	|
 			     PCIECAP_AER_UE_COMPL_ABORT);
- 
+
 	/* Clear all CE status */
 	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_CE_STATUS,
 			     0xffffffff);
@@ -2718,7 +2710,7 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 	phb4_init_errors(p);
 
 	/* Init_121..122 : Wait for link
-         * NOTE: At this point the spec waits for the link to come up. We
+	 * NOTE: At this point the spec waits for the link to come up. We
 	 * don't bother as we are doing a PERST soon.
 	 */
 
@@ -2726,7 +2718,7 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 	// XXX FIXME learn CAPI :-(
 
 	/* Init_124 : Setup PCI command/status on root complex
-         * I don't know why the spec does this now and not earlier, so
+	 * I don't know why the spec does this now and not earlier, so
 	 * to be sure to get it right we might want to move it to the freset
 	 * state machine, though the generic PCI layer will probably do
 	 * this anyway (ie, enable MEM, etc... in the RC)
@@ -2990,76 +2982,46 @@ static bool phb4_calculate_windows(struct phb4 *p)
 	return true;
 }
 
-
-static int64_t phb4_get_xive(struct irq_source *is __unused, uint32_t isn,
-			     uint16_t *server, uint8_t *prio)
-{
-	uint32_t target_id;
-
-	if (xive_get_eq_info(isn, &target_id, prio)) {
-		*server = target_id;
-		return OPAL_SUCCESS;
-	} else
-		return OPAL_PARAMETER;
-}
-
-static int64_t phb4_set_xive(struct irq_source *is, uint32_t isn,
-			     uint16_t server, uint8_t prio)
+static void phb4_err_interrupt(struct irq_source *is, uint32_t isn)
 {
 	struct phb4 *p = is->data;
-	uint32_t idx = isn - p->base_msi;
-	void *mmio_base;
 
-	/* Let XIVE configure the EQ */
-	if (!xive_set_eq_info(isn, server, prio))
-		return OPAL_PARAMETER;
+	PHBDBG(p, "Got interrupt 0x%08x\n", isn);
 
-	/* Ensure it's enabled/disabled in the PHB. This won't do much
-	 * for LSIs but will work for MSIs and will ensure that a stray
-	 * P bit left over won't block further interrupts when enabling
+#if 0
+	/* Update pending event */
+	opal_update_pending_evt(OPAL_EVENT_PCI_ERROR,
+				OPAL_EVENT_PCI_ERROR);
+
+	/* If the PHB is broken, go away */
+	if (p->state == PHB3_STATE_BROKEN)
+		return;
+
+	/*
+	 * Mark the PHB has pending error so that the OS
+	 * can handle it at late point.
 	 */
-	mmio_base = p->int_mmio + 0x10000 * idx;
-	if (prio == 0xff)
-		in_8(mmio_base + 0xd00); /* PQ = 01 */
-	else
-		in_8(mmio_base + 0xc00); /* PQ = 00 */
-
-	return OPAL_SUCCESS;
+	phb3_set_err_pending(p, true);
+#endif
 }
 
-static void phb4_eoi(struct irq_source *is, uint32_t isn)
+static uint64_t phb4_lsi_attributes(struct irq_source *is __unused,
+				uint32_t isn __unused)
 {
-	struct phb4 *p = is->data;
-	uint32_t idx = isn - p->base_msi;
-	void *mmio_base;
-	uint8_t eoi_val;
+#ifndef DISABLE_ERR_INTS
+	struct phb3 *p = is->data;
+	uint32_t idx = isn - p->base_lsi;
 
-	/* For EOI, we use the special MMIO that does a clear of both
-	 * P and Q and returns the old Q.
-	 *
-	 * This allows us to then do a re-trigger if Q was set rather
-	 * than synthetizing an interrupt in software
-	 */
-	mmio_base = p->int_mmio + 0x10000 * idx;
-	eoi_val = in_8(mmio_base + 0xc00);
-	if (eoi_val & 1) {
-		/* PHB doesn't use a separate replay, use the same page */
-		out_8(mmio_base, 0);
-	}
+	if (idx == PHB3_LSI_PCIE_INF || idx == PHB3_LSI_PCIE_ER)
+		return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_RARE;
+#endif
+	return IRQ_ATTR_TARGET_LINUX;
 }
 
-static const struct irq_source_ops phb4_irq_ops = {
-	.get_xive = phb4_get_xive,
-	.set_xive = phb4_set_xive,
-	.eoi = phb4_eoi
+static const struct irq_source_ops phb4_lsi_ops = {
+	.interrupt = phb4_err_interrupt,
+	.attributes = phb4_lsi_attributes,
 };
-
-/* Error LSIs (skiboot owned) */
-//static const struct irq_source_ops phb3_err_lsi_irq_ops = {
-//	.get_xive = phb3_lsi_get_xive,
-//	.set_xive = phb3_lsi_set_xive,
-//	.interrupt = phb3_err_interrupt,
-//};
 
 static void phb4_create(struct dt_node *np)
 {
@@ -3208,15 +3170,15 @@ static void phb4_create(struct dt_node *np)
 	/* Clear IODA3 cache */
 	phb4_init_ioda_cache(p);
 
-	/* Register interrupt sources */
-	register_irq_source(&phb4_irq_ops, p, p->base_msi, p->num_irqs);
-
-#ifndef DISABLE_ERR_INTS
-	//	register_irq_source(&phb4_err_lsi_irq_ops, p,
-	//		    p->base_lsi + PHB4_LSI_PCIE_INF, 2);
-#endif
 	/* Get the HW up and running */
 	phb4_init_hw(p, true);
+
+	/* Register all interrupt sources with XIVE */
+	xive_register_source(p->base_msi, p->num_irqs - 8, 16, p->int_mmio, 0,
+			     NULL, NULL);
+	xive_register_source(p->base_lsi, 8, 16,
+			     p->int_mmio + ((p->num_irqs - 8) << 16),
+			     XIVE_SRC_LSI, p, &phb4_lsi_ops);
 
 	/* Platform additional setup */
 	if (platform.pci_setup_phb)

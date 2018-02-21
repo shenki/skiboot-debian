@@ -581,6 +581,14 @@ const struct dt_property *dt_find_property(const struct dt_node *node,
 	return NULL;
 }
 
+void dt_check_del_prop(struct dt_node *node, const char *name)
+{
+	struct dt_property *p;
+
+	p = __dt_find_property(node, name);
+	if (p)
+		dt_del_property(node, p);
+}
 const struct dt_property *dt_require_property(const struct dt_node *node,
 					      const char *name, int wanted_len)
 {
@@ -804,8 +812,6 @@ int dt_expand_node(struct dt_node *node, const void *fdt, int fdt_node)
 void dt_expand(const void *fdt)
 {
 	printf("FDT: Parsing fdt @%p\n", fdt);
-
-	dt_root = dt_new_root("");
 
 	if (dt_expand_node(dt_root, fdt, 0) < 0)
 		abort();

@@ -44,8 +44,9 @@
 	. = 0
 .global __head
 __head:
-	/* When booted as an OPAL LID, this is a pointer to the OPAL
-	 * variant of the NACA
+	/*
+	 * When booting a P7 machine in OPAL mode this pointer is used to
+	 * find the opal variant of the NACA. Unused on other machines.
 	 */
 	.llong	opal_naca
 
@@ -56,7 +57,6 @@ __head:
 .global fdt_entry
 fdt_entry:
 	mr	%r27,%r3
-	li	%r25,0
 	b	boot_entry
 
 	/* This is a pointer to a descriptor used by debugging tools
@@ -94,6 +94,11 @@ attn_trigger:
 hir_trigger:
 	.long	0
 
+	/*
+	 * At 0x100 and 0x180 reside our entry points. Once started,
+	 * we will ovewrite them with our actual 0x100 exception handler
+	 * used for recovering from rvw or nap mode
+	 */
 	. = 0x100
 	/* BML entry, load up r3 with device tree location */
 	li	%r3, 0
@@ -103,7 +108,6 @@ hir_trigger:
 	/* Entry point set by the FSP */
 	.= 0x180
 	li	%r27,0
-	li	%r25,0
 	b	boot_entry
 
 #define EXCEPTION(nr)		\
@@ -243,7 +247,6 @@ boot_offset:
  *   r28 :  PVR
  *   r27 :  DTB pointer (or NULL)
  *   r26 :  PIR thread mask
- *   r25 :  Selected master CPU (OPAL boot)
  */
 .global boot_entry
 boot_entry:
@@ -293,7 +296,7 @@ boot_entry:
 	bne	secondary_wait
 
 	/* Initialize per-core SPRs */
-	bl init_shared_sprs
+	bl	init_shared_sprs
 
 	/* Pick a boot CPU, cpu index in r31 */
 	LOAD_IMM32(%r3, boot_sem - __head)
@@ -310,7 +313,7 @@ boot_entry:
 	smt_medium
 
 	/* Initialize thread SPRs */
-	bl init_replicated_sprs
+	bl	init_replicated_sprs
 
 	/* Save the initial offset. The secondary threads will spin on boot_flag
 	 * before relocation so we need to keep track of its location to wake
@@ -384,7 +387,6 @@ boot_entry:
 #endif
 	/* Jump to C */
 	mr	%r3,%r27
-	mr	%r4,%r25
 	bl	main_cpu_entry
 	b	.
 
@@ -409,11 +411,11 @@ secondary_wait:
 	add	%r3,%r3,%r30
 	mtctr	%r3
 	isync
-	bctr	
+	bctr
 1:
 	/* Now wait for cpu_secondary_start to be set */
 	LOAD_ADDR_FROM_TOC(%r3, cpu_secondary_start)
-1:	smt_very_low	
+1:	smt_very_low
 	ld	%r0,0(%r3)
 	cmpdi	%r0,0
 	beq	1b
@@ -456,64 +458,6 @@ call_relocate:
 1:	/* Fatal relocate failure */
 	attn
 
-/* This is a little piece of code that is copied down to
- * 0x100 when doing a "fast reset"
- */
-.global fast_reset_patch_start
-fast_reset_patch_start:	
-	smt_medium
-	LOAD_IMM64(%r30, SKIBOOT_BASE)
-	LOAD_IMM32(%r3, fast_reset_entry - __head)
-	add	%r3,%r30,%r3
-	mtctr	%r3
-	bctr
-.global fast_reset_patch_end
-fast_reset_patch_end:
-
-/* Fast reset code. We clean up the TLB and a few SPRs and
- * return to C code. All CPUs do that, the CPU triggering the
- * reset does it to itself last. The C code will sort out who
- * the master is. We come from the trampoline above with
- * r30 containing SKIBOOT_BASE
- */
-fast_reset_entry:
-	/* Clear out SLB */
-	li	%r6,0
-	slbmte	%r6,%r6
-	slbia
-	ptesync
-
-	/* Get PIR */
-	mfspr	%r31,SPR_PIR
-
-	/* Get a stack and restore r13 */
-	GET_STACK(%r1,%r31)
-	li	%r3,0
-	std	%r3,0(%r1)
-	std	%r3,8(%r1)
-	std	%r3,16(%r1)
-	GET_CPU()
-
-	/* Get our TOC */
-	addis	%r2,%r30,(__toc_start - __head)@ha
-	addi	%r2,%r2,(__toc_start - __head)@l
-
-	/* Go to C ! */
-	bl	fast_reboot
-	b	.
-
-.global cleanup_tlb
-cleanup_tlb:
-	/* Clean the TLB */
-	li	%r3,128
-	mtctr	%r3
-	li	%r4,0x800		/* IS field = 0b10 */
-	ptesync
-1:	tlbiel	%r4
-	addi	%r4,%r4,0x1000
-	bdnz	1b
-	ptesync
-
 #define FIXUP_ENDIAN                                              \
        tdi   0,0,0x48;   /* Reverse endian of b . + 8          */ \
        b     $+36;       /* Skip trampoline if endian is good  */ \
@@ -526,9 +470,9 @@ cleanup_tlb:
        .long 0xa6037b7d; /* mtsrr1 r11                         */ \
        .long 0x2400004c  /* rfid                               */
 
-.global enter_rvwinkle
-enter_rvwinkle:
-	/* Before entering rvwinkle, we create a stack frame
+.global enter_pm_state
+enter_pm_state:
+	/* Before entering map or rvwinkle, we create a stack frame
 	 * and save our non-volatile registers.
 	 *
 	 * We also save these SPRs:
@@ -538,6 +482,11 @@ enter_rvwinkle:
 	 *
 	 *  - xxx TODO: HIDs
 	 *  - TODO: Mask MSR:ME during the process
+	 *
+	 * On entry, r3 indicates:
+	 *
+	 *    0 = nap
+	 *    1 = rvwinkle
 	 */
 	mflr	%r0
 	std	%r0,16(%r1)
@@ -561,20 +510,32 @@ enter_rvwinkle:
 	SAVE_GPR(29,%r1)
 	SAVE_GPR(30,%r1)
 	SAVE_GPR(31,%r1)
-	mfcr	%r3
-	mfxer	%r4
-	mfspr	%r5,SPR_HSPRG0
-	mfspr	%r6,SPR_HSPRG1
-	stw	%r3,STACK_CR(%r1)
-	stw	%r4,STACK_XER(%r1)
-	std	%r5,STACK_GPR0(%r1)
-	std	%r6,STACK_GPR1(%r1)
+	mfcr	%r4
+	mfxer	%r5
+	mfspr	%r6,SPR_HSPRG0
+	mfspr	%r7,SPR_HSPRG1
+	stw	%r4,STACK_CR(%r1)
+	stw	%r5,STACK_XER(%r1)
+	std	%r6,STACK_GPR0(%r1)
+	std	%r7,STACK_GPR1(%r1)
 
 	/* Save stack pointer in struct cpu_thread */
 	std	%r1,CPUTHREAD_SAVE_R1(%r13)
 
-	/* rvwinkle sequence */
+	/* Winkle or nap ? */
+	cmpli	%cr0,0,%r3,0
+	bne	1f
+
+	/* nap sequence */
 	ptesync
+0:	ld	%r0,CPUTHREAD_SAVE_R1(%r13)
+	cmpd	cr0,%r0,%r0
+	bne	0b
+	PPC_INST_NAP
+	b	.
+
+	/* rvwinkle sequence */
+1:	ptesync
 0:	ld	%r0,CPUTHREAD_SAVE_R1(%r13)
 	cmpd	cr0,%r0,%r0
 	bne	0b
@@ -582,39 +543,35 @@ enter_rvwinkle:
 	b	.
 
 /* This is a little piece of code that is copied down to
- * 0x100 when doing a "rvwinkle reinit"
+ * 0x100 for handling power management wakeups
  */
-.global rvwinkle_patch_start
-rvwinkle_patch_start:
+.global reset_patch_start
+reset_patch_start:
 	FIXUP_ENDIAN
 	smt_medium
 	LOAD_IMM64(%r30, SKIBOOT_BASE)
-	LOAD_IMM32(%r3, rvwinkle_restore - __head)
+	LOAD_IMM32(%r3, reset_wakeup - __head)
 	add	%r3,%r30,%r3
 	mtctr	%r3
 	bctr
-.global rvwinkle_patch_end
-rvwinkle_patch_end:
+.global reset_patch_end
+reset_patch_end:
 
-rvwinkle_restore:
+reset_wakeup:
 	/* Get PIR */
 	mfspr	%r31,SPR_PIR
-
-	/* Initialize per-core SPRs
-	 *
-	 * XXX We do it on each thread ... oh well, improve that later
-	 */
-	bl init_shared_sprs
-
-	/* Initialize thread SPRs */
-	bl init_replicated_sprs
 
 	/* Get that CPU stack base and use it to restore r13 */
 	GET_STACK(%r1,%r31)
 	GET_CPU()
 
 	/* Restore original stack pointer */
-	ld	%r1,CPUTHREAD_SAVE_R1(%r13)
+	ld	%r3,CPUTHREAD_SAVE_R1(%r13)
+
+	/* If it's 0, we are doing a fast reboot */
+	cmpldi	%r3,0
+	beq	fast_reset_entry
+	mr	%r1,%r3
 
 	/* Restore more stuff */
 	lwz	%r3,STACK_CR(%r1)
@@ -649,6 +606,46 @@ rvwinkle_restore:
 	addi	%r1,%r1,STACK_FRAMESIZE
 	ld	%r0,16(%r1)
 	mtlr	%r0
+	blr
+
+/* Fast reset code. We clean up the TLB and a few SPRs and
+ * return to C code. All CPUs do that, the CPU triggering the
+ * reset does it to itself last. The C code will sort out who
+ * the master is. We come from the trampoline above with
+ * r30 containing SKIBOOT_BASE
+ */
+fast_reset_entry:
+	/* Clear out SLB */
+	li	%r6,0
+	slbmte	%r6,%r6
+	slbia
+	ptesync
+
+	/* Dummy stack frame */
+	li	%r3,0
+	std	%r3,0(%r1)
+	std	%r3,8(%r1)
+	std	%r3,16(%r1)
+
+	/* Get our TOC */
+	addis	%r2,%r30,(__toc_start - __head)@ha
+	addi	%r2,%r2,(__toc_start - __head)@l
+
+	/* Go to C ! */
+	bl	fast_reboot_entry
+	b	.
+
+.global cleanup_tlb
+cleanup_tlb:
+	/* Clean the TLB */
+	li	%r3,512
+	mtctr	%r3
+	li	%r4,0xc00		/* IS field = 0b11 */
+	ptesync
+1:	tlbiel	%r4
+	addi	%r4,%r4,0x1000
+	bdnz	1b
+	ptesync
 	blr
 
 /* Functions to initialize replicated and shared SPRs to sane
@@ -698,10 +695,14 @@ init_shared_sprs:
 	mtspr	SPR_LPCR,%r3
 	sync
 	isync
-	/* HID0: Clear bit 13 (enable core recovery) */
+	/* HID0: Clear bit 13 (enable core recovery)
+	 *       Clear bit 19 (HILE)
+	 */
 	mfspr	%r3,SPR_HID0
 	li	%r0,1
-	sldi	%r0,%r0,(63-13)
+	sldi	%r4,%r0,(63-13)
+	sldi	%r5,%r0,(63-19)
+	or	%r0,%r4,%r5,
 	andc	%r3,%r3,%r0
 	sync
 	mtspr	SPR_HID0,%r3
@@ -733,6 +734,15 @@ init_replicated_sprs:
 	/* XXX TODO: Add more */
 	blr
 
+	.global enter_nap
+enter_nap:
+	std	%r0,0(%r1)
+	ptesync
+	ld	%r0,0(%r1)
+1:	cmp	%cr0,0,%r0,%r0
+	bne	1b
+	nap
+	b	.
 /*
  *
  * NACA structure, accessed by the FPS to find the SPIRA
@@ -783,7 +793,7 @@ hv_lid_load_table:
 
 /*
  *
- * OPAL variant of NACA
+ * OPAL variant of NACA. This is only used when booting a P7 in OPAL mode.
  *
  */
 .global opal_naca
@@ -805,7 +815,6 @@ opal_naca:
 	 * got to the same entry we use for pHyp and FDT HB.
 	 */
 opal_boot_trampoline:
-	li	%r25,0
 	li	%r27,-1
 	ba	boot_entry - __head
 
@@ -858,7 +867,7 @@ opal_entry:
 	std	%r0,CPUTHREAD_CUR_TOKEN(%r13)
 
 	/* Mark the stack frame */
-	li	%r12,STACK_ENTRY_OPAL_API	
+	li	%r12,STACK_ENTRY_OPAL_API
 	std	%r12,STACK_TYPE(%r1)
 
 	/* Get our TOC */

@@ -38,15 +38,21 @@ static void pci_slot_prepare_link_change(struct pci_slot *slot, bool up)
 	if (pci_has_cap(pd, PCIECAP_ID_AER, true)) {
 		aercap = pci_cap(pd, PCIECAP_ID_AER, true);
 
-		/* Link down error */
-		pci_cfg_read32(phb, pd->bdfn, aercap + PCIECAP_AER_UE_MASK,
-			       &mask);
-		if (up)
-			mask &= ~PCIECAP_AER_UE_MASK_SURPRISE_DOWN;
-		else
-			mask |= PCIECAP_AER_UE_MASK_SURPRISE_DOWN;
-		pci_cfg_write32(phb, pd->bdfn, aercap + PCIECAP_AER_UE_MASK,
-				mask);
+		/* Mask link surprise down event. The event is always
+		 * masked when the associated PCI slot supports PCI
+		 * surprise hotplug. We needn't toggle it when the link
+		 * bounces caused by reset and just keep it always masked.
+		 */
+		if (!pd->slot || !pd->slot->surprise_pluggable) {
+			pci_cfg_read32(phb, pd->bdfn,
+				       aercap + PCIECAP_AER_UE_MASK, &mask);
+			if (up)
+				mask &= ~PCIECAP_AER_UE_MASK_SURPRISE_DOWN;
+			else
+				mask |= PCIECAP_AER_UE_MASK_SURPRISE_DOWN;
+			pci_cfg_write32(phb, pd->bdfn,
+					aercap + PCIECAP_AER_UE_MASK, mask);
+		}
 
 		/* Receiver error */
 		pci_cfg_read32(phb, pd->bdfn, aercap + PCIECAP_AER_CE_MASK,
@@ -91,9 +97,6 @@ static int64_t pci_slot_sm_poll(struct pci_slot *slot)
 	case PCI_SLOT_STATE_FRESET:
 		ret = slot->ops.freset(slot);
 		break;
-	case PCI_SLOT_STATE_PFRESET:
-		ret = slot->ops.pfreset(slot);
-		break;
 	case PCI_SLOT_STATE_CRESET:
 		ret = slot->ops.creset(slot);
 		break;
@@ -116,6 +119,8 @@ void pci_slot_add_dt_properties(struct pci_slot *slot,
 
 	dt_add_property_cells(np, "ibm,reset-by-firmware", 1);
 	dt_add_property_cells(np, "ibm,slot-pluggable", slot->pluggable);
+	dt_add_property_cells(np, "ibm,slot-surprise-pluggable",
+			      slot->surprise_pluggable);
 	dt_add_property_cells(np, "ibm,slot-power-ctl", slot->power_ctl);
 	dt_add_property_cells(np, "ibm,slot-power-led-ctlled",
 			      slot->power_led_ctl);

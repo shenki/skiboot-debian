@@ -86,6 +86,11 @@ struct debug_descriptor {
 };
 extern struct debug_descriptor debug_descriptor;
 
+static inline bool opal_booting(void)
+{
+	return !(debug_descriptor.state_flags & OPAL_BOOT_COMPLETE);
+}
+
 /* Console logging */
 #define PR_EMERG	0
 #define PR_ALERT	1
@@ -175,7 +180,7 @@ extern void start_kernel32(uint64_t entry, void* fdt,
 extern void start_kernel_secondary(uint64_t entry) __noreturn;
 
 /* Get description of machine from HDAT and create device-tree */
-extern int parse_hdat(bool is_opal, uint32_t master_cpu);
+extern int parse_hdat(bool is_opal);
 
 /* Root of device tree. */
 extern struct dt_node *dt_root;
@@ -190,12 +195,16 @@ extern unsigned long get_symbol(unsigned long addr,
 				char **sym, char **sym_end);
 
 /* Fast reboot support */
-extern void fast_reset(void);
+extern void disable_fast_reboot(const char *reason);
+extern void fast_reboot(void);
 extern void __noreturn __secondary_cpu_entry(void);
 extern void __noreturn load_and_boot_kernel(bool is_reboot);
 extern void cleanup_tlb(void);
 extern void init_shared_sprs(void);
 extern void init_replicated_sprs(void);
+extern bool start_preload_kernel(void);
+extern void copy_exception_vectors(void);
+extern void setup_reset_vector(void);
 
 /* Various probe routines, to replace with an initcall system */
 extern void probe_p7ioc(void);
@@ -216,14 +225,18 @@ extern void lpc_rtc_init(void);
 
 /* flash support */
 struct flash_chip;
-extern int flash_register(struct blocklevel_device *bl, bool is_system_flash);
+extern int flash_register(struct blocklevel_device *bl);
 extern int flash_start_preload_resource(enum resource_id id, uint32_t subid,
 					void *buf, size_t *len);
 extern int flash_resource_loaded(enum resource_id id, uint32_t idx);
 extern bool flash_reserve(void);
 extern void flash_release(void);
-
-
+#define FLASH_SUBPART_ALIGNMENT 0x1000
+#define FLASH_SUBPART_HEADER_SIZE FLASH_SUBPART_ALIGNMENT
+extern int flash_subpart_info(void *part_header, uint32_t header_len,
+			      uint32_t part_size, uint32_t *part_actual,
+			      uint32_t subid, uint32_t *offset,
+			      uint32_t *size);
 /* NVRAM support */
 extern void nvram_init(void);
 extern void nvram_read_complete(bool success);
@@ -266,7 +279,17 @@ extern void slw_update_timer_expiry(uint64_t new_target);
 /* Is SLW timer available ? */
 extern bool slw_timer_ok(void);
 
+/* Patch SPR in SLW image */
+extern int64_t opal_slw_set_reg(uint64_t cpu_pir, uint64_t sprn, uint64_t val);
+
+extern void fast_sleep_exit(void);
+
 /* Fallback fake RTC */
 extern void fake_rtc_init(void);
+
+/* Assembly in head.S */
+extern void enter_pm_state(bool winkle);
+extern uint32_t reset_patch_start;
+extern uint32_t reset_patch_end;
 
 #endif /* __SKIBOOT_H */

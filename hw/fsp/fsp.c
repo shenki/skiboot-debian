@@ -1689,6 +1689,7 @@ void fsp_interrupt(void)
 	unlock(&fsp_lock);
 }
 
+
 int fsp_sync_msg(struct fsp_msg *msg, bool autofree)
 {
 	int rc;
@@ -1897,8 +1898,6 @@ static void fsp_update_links_states(struct fsp *fsp)
 	for (i = 0; i < fsp->iopath_count; i++) {
 		fiop = &fsp->iopath[i];
 		if (!fiop->psi)
-			continue;
-		if (!fiop->psi->working)
 			fiop->state = fsp_path_bad;
 		else if (fiop->psi->active) {
 			fsp->active_iopath = i;
@@ -1977,6 +1976,36 @@ static void fsp_opal_poll(void *data __unused)
 		__fsp_poll(false);
 		unlock(&fsp_lock);
 	}
+}
+
+int fsp_fatal_msg(struct fsp_msg *msg)
+{
+	int rc = 0;
+
+	rc = fsp_queue_msg(msg, NULL);
+	if (rc)
+		return rc;
+
+	while(fsp_msg_busy(msg)) {
+		cpu_relax();
+		fsp_opal_poll(NULL);
+	}
+
+	switch(msg->state) {
+	case fsp_msg_done:
+		rc = 0;
+		break;
+	case fsp_msg_timeout:
+		rc = -1; /* XXX to improve */
+		break;
+	default:
+		rc = -1; /* Should not happen... (assert ?) */
+	}
+
+	if (msg->resp)
+		rc = (msg->resp->word1 >> 8) & 0xff;
+
+	return rc;
 }
 
 static bool fsp_init_one(const char *compat)

@@ -45,6 +45,14 @@
 #define OPAL_I2C_ARBT_LOST	-22
 #define OPAL_I2C_NACK_RCVD	-23
 #define OPAL_I2C_STOP_ERR	-24
+#define OPAL_XSCOM_BUSY		OPAL_BUSY
+#define OPAL_XSCOM_CHIPLET_OFF	OPAL_WRONG_STATE
+#define OPAL_XSCOM_PARTIAL_GOOD	-25
+#define OPAL_XSCOM_ADDR_ERROR	-26
+#define OPAL_XSCOM_CLOCK_ERROR	-27
+#define OPAL_XSCOM_PARITY_ERROR	-28
+#define OPAL_XSCOM_TIMEOUT	-29
+#define OPAL_XSCOM_CTR_OFFLINED	-30
 
 /* API Tokens (in r0) */
 #define OPAL_INVALID_CALL		       -1
@@ -172,7 +180,8 @@
 #define OPAL_INT_EOI				124
 #define OPAL_INT_SET_MFRR			125
 #define OPAL_PCI_TCE_KILL			126
-#define OPAL_LAST				126
+#define OPAL_NMMU_SET_PTCR			127
+#define OPAL_LAST				127
 
 /* Device tree flags */
 
@@ -212,6 +221,9 @@
 #define OPAL_PM_STOP_INST_DEEP		0x00200000
 
 #ifndef __ASSEMBLY__
+
+#include <stdbool.h>
+#include <types.h>
 
 /* Other enums */
 enum OpalVendorApiTokens {
@@ -911,6 +923,7 @@ enum opal_prd_msg_type {
 	OPAL_PRD_MSG_TYPE_ATTN_ACK,	/* HBRT --> OPAL */
 	OPAL_PRD_MSG_TYPE_OCC_ERROR,	/* HBRT <-- OPAL */
 	OPAL_PRD_MSG_TYPE_OCC_RESET,	/* HBRT <-- OPAL */
+	OPAL_PRD_MSG_TYPE_OCC_RESET_NOTIFY, /* HBRT --> OPAL */
 };
 
 struct opal_prd_msg_header {

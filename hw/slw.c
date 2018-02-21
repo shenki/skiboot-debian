@@ -49,9 +49,6 @@ static uint32_t slw_timer_chip;
 static uint64_t slw_last_gen;
 static uint64_t slw_last_gen_stamp;
 
-/* Assembly in head.S */
-extern void enter_rvwinkle(void);
-
 DEFINE_LOG_ENTRY(OPAL_RC_SLW_INIT, OPAL_PLATFORM_ERR_EVT, OPAL_SLW,
 		 OPAL_PLATFORM_FIRMWARE, OPAL_PREDICTIVE_ERR_GENERAL,
 		 OPAL_NA);
@@ -77,7 +74,7 @@ static void slw_do_rvwinkle(void *data)
 	struct proc_chip *chip;
 
 	/* Setup our ICP to receive IPIs */
-	icp_prep_for_rvwinkle();
+	icp_prep_for_pm();
 
 	/* Setup LPCR to wakeup on external interrupts only */
 	mtspr(SPR_LPCR, ((lpcr & ~SPR_LPCR_P8_PECE) | SPR_LPCR_P8_PECE2));
@@ -88,7 +85,11 @@ static void slw_do_rvwinkle(void *data)
 	/* Tell that we got it */
 	cpu->state = cpu_state_rvwinkle;
 
-	enter_rvwinkle();
+	enter_pm_state(1);
+
+	/* Restore SPRs */
+	init_shared_sprs();
+	init_replicated_sprs();
 
 	/* Ok, it's ours again */
 	cpu->state = cpu_state_active;
@@ -154,17 +155,15 @@ static void slw_do_rvwinkle(void *data)
 
 static void slw_patch_reset(void)
 {
-	extern uint32_t rvwinkle_patch_start;
-	extern uint32_t rvwinkle_patch_end;
 	uint32_t *src, *dst, *sav;
 
-	BUILD_ASSERT((&rvwinkle_patch_end - &rvwinkle_patch_start) <=
+	BUILD_ASSERT((&reset_patch_end - &reset_patch_start) <=
 		     MAX_RESET_PATCH_SIZE);
 
-	src = &rvwinkle_patch_start;
+	src = &reset_patch_start;
 	dst = (uint32_t *)0x100;
 	sav = slw_saved_reset;
-	while(src < &rvwinkle_patch_end) {
+	while(src < &reset_patch_end) {
 		*(sav++) = *(dst);
 		*(dst++) = *(src++);
 	}
@@ -173,14 +172,14 @@ static void slw_patch_reset(void)
 
 static void slw_unpatch_reset(void)
 {
-	extern uint32_t rvwinkle_patch_start;
-	extern uint32_t rvwinkle_patch_end;
+	extern uint32_t reset_patch_start;
+	extern uint32_t reset_patch_end;
 	uint32_t *src, *dst, *sav;
 
-	src = &rvwinkle_patch_start;
+	src = &reset_patch_start;
 	dst = (uint32_t *)0x100;
 	sav = slw_saved_reset;
-	while(src < &rvwinkle_patch_end) {
+	while(src < &reset_patch_end) {
 		*(dst++) = *(sav++);
 		src++;
 	}
@@ -1061,6 +1060,8 @@ static void fast_sleep_enter(void)
 	}
 
 	primary_thread->save_l2_fir_action1 = tmp;
+	primary_thread->in_fast_sleep = true;
+
 	tmp = tmp & ~0x0200000000000000ULL;
 	rc = xscom_write(chip_id, XSCOM_ADDR_P8_EX(core, L2_FIR_ACTION1),
 			 tmp);
@@ -1083,7 +1084,7 @@ static void fast_sleep_enter(void)
 
 /* Workarounds while exiting fast-sleep */
 
-static void fast_sleep_exit(void)
+void fast_sleep_exit(void)
 {
 	uint32_t core = pir_to_core_id(this_cpu()->pir);
 	uint32_t chip_id = this_cpu()->chip_id;
@@ -1091,6 +1092,7 @@ static void fast_sleep_exit(void)
 	int rc;
 
 	primary_thread = this_cpu()->primary;
+	primary_thread->in_fast_sleep = false;
 
 	rc = xscom_write(chip_id, XSCOM_ADDR_P8_EX(core, L2_FIR_ACTION1),
 			primary_thread->save_l2_fir_action1);
@@ -1132,7 +1134,7 @@ static int64_t opal_config_cpu_idle_state(uint64_t state, uint64_t enter)
 opal_call(OPAL_CONFIG_CPU_IDLE_STATE, opal_config_cpu_idle_state, 2);
 
 #ifdef __HAVE_LIBPORE__
-static int64_t opal_slw_set_reg(uint64_t cpu_pir, uint64_t sprn, uint64_t val)
+int64_t opal_slw_set_reg(uint64_t cpu_pir, uint64_t sprn, uint64_t val)
 {
 
 	struct cpu_thread *c = find_cpu_by_pir(cpu_pir);
@@ -1197,17 +1199,17 @@ static void slw_dump_timer_ffdc(void)
 	 * root-cause. OPAL/skiboot may be stuck on some operation that
 	 * requires SLW timer state machine (e.g. core powersaving)
 	 */
-	prlog(PR_ERR, "SLW: Register state:\n");
+	prlog(PR_DEBUG, "SLW: Register state:\n");
 
 	for (i = 0; i < ARRAY_SIZE(dump_regs); i++) {
 		uint32_t reg = dump_regs[i];
 		rc = xscom_read(slw_timer_chip, reg, &val);
 		if (rc) {
-			prlog(PR_ERR, "SLW: XSCOM error %lld reading"
+			prlog(PR_DEBUG, "SLW: XSCOM error %lld reading"
 			      " reg 0x%x\n", rc, reg);
 			break;
 		}
-		prlog(PR_ERR, "SLW:  %5x = %016llx\n", reg, val);
+		prlog(PR_DEBUG, "SLW:  %5x = %016llx\n", reg, val);
 	}
 }
 
@@ -1240,36 +1242,60 @@ void slw_update_timer_expiry(uint64_t new_target)
 
 	do {
 		/* Grab generation and spin if odd */
+		_xscom_lock();
 		for (;;) {
-			rc = xscom_read(slw_timer_chip, 0xE0006, &gen);
+			rc = _xscom_read(slw_timer_chip, 0xE0006, &gen, false);
 			if (rc) {
 				prerror("SLW: Error %lld reading tmr gen "
 					" count\n", rc);
+				_xscom_unlock();
 				return;
 			}
 			if (!(gen & 1))
 				break;
 			if (tb_compare(now + msecs_to_tb(1), mftb()) == TB_ABEFOREB) {
-				prerror("SLW: Stuck with odd generation !\n");
+				/**
+				 * @fwts-label SLWTimerStuck
+				 * @fwts-advice The SLeep/Winkle Engine (SLW)
+				 * failed to increment the generation number
+				 * within our timeout period (it *should* have
+				 * done so within ~10us, not >1ms. OPAL uses
+				 * the SLW timer to schedule some operations,
+				 * but can fall back to the (much less frequent
+				 * OPAL poller, which although does not affect
+				 * functionality, runs *much* less frequently.
+				 * This could have the effect of slow I2C
+				 * operations (for example). It may also mean
+				 * that you *had* an increase in jitter, due
+				 * to slow interactions with SLW.
+				 * This error may also occur if the machine
+				 * is connected to via soft FSI.
+				 */
+				prerror("SLW: timer stuck, falling back to OPAL pollers. You will likely have slower I2C and may have experienced increased jitter.\n");
+				prlog(PR_DEBUG, "SLW: Stuck with odd generation !\n");
+				_xscom_unlock();
 				slw_has_timer = false;
 				slw_dump_timer_ffdc();
 				return;
 			}
 		}
 
-		rc = xscom_write(slw_timer_chip, 0x5003A, req);
+		rc = _xscom_write(slw_timer_chip, 0x5003A, req, false);
 		if (rc) {
 			prerror("SLW: Error %lld writing tmr request\n", rc);
+			_xscom_unlock();
 			return;
 		}
 
 		/* Re-check gen count */
-		rc = xscom_read(slw_timer_chip, 0xE0006, &gen2);
+		rc = _xscom_read(slw_timer_chip, 0xE0006, &gen2, false);
 		if (rc) {
 			prerror("SLW: Error %lld re-reading tmr gen "
 				" count\n", rc);
+			_xscom_unlock();
 			return;
 		}
+		_xscom_unlock();
 	} while(gen != gen2);
 
 	/* Check if the timer is working. If at least 1ms has elapsed

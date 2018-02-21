@@ -107,6 +107,7 @@ struct dt_node;
 struct centaur_chip;
 struct mfsi;
 struct xive;
+struct lpcm;
 
 /* Chip type */
 enum proc_chip_type {
@@ -129,7 +130,10 @@ enum proc_chip_quirks {
 	QUIRK_NO_OCC_IRQ       	= 0x00000010,
 	QUIRK_SIMICS		= 0x00000020,
 	QUIRK_SLOW_SIM		= 0x00000040,
-} proc_chip_quirks;
+	QUIRK_NO_DIRECT_CTL	= 0x00000080,
+};
+
+extern enum proc_chip_quirks proc_chip_quirks;
 
 static inline bool chip_quirk(unsigned int q)
 {
@@ -169,12 +173,7 @@ struct proc_chip {
 	uint64_t		xscom_base;
 
 	/* Used by hw/lpc.c */
-	uint32_t		lpc_xbase;
-	void			*lpc_mbase;
-	struct lock		lpc_lock;
-	uint8_t			lpc_fw_idsel;
-	uint8_t			lpc_fw_rdsz;
-	struct list_head	lpc_clients;
+	struct lpcm		*lpc;
 
 	/* Used by hw/slw.c */
 	uint64_t		slw_base;
@@ -186,11 +185,11 @@ struct proc_chip {
 	uint64_t		homer_size;
 	uint64_t		occ_common_base;
 	uint64_t		occ_common_size;
-	u8			throttle;
+	uint8_t			throttle;
 
 	/* Must hold capi_lock to change */
-	u8			capp_phb3_attached_mask;
-	u8			capp_ucode_loaded;
+	uint8_t			capp_phb3_attached_mask;
+	uint8_t			capp_ucode_loaded;
 
 	/* Used by hw/centaur.c */
 	struct centaur_chip	*centaurs;

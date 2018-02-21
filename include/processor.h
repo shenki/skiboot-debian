@@ -67,6 +67,7 @@
 #define SPR_SPURR	0x134	/* RW: Scaled Processor Utilization Resource */
 #define SPR_PURR	0x135	/* RW: Processor Utilization Resource reg */
 #define SPR_HDEC	0x136	/* RW: Hypervisor Decrementer */
+#define SPR_HRMOR	0x139	/* RW: Hypervisor Real Mode Offset reg */
 #define SPR_HSRR0	0x13a	/* RW: HV Exception save/restore reg 0 */
 #define SPR_HSRR1	0x13b	/* RW: HV Exception save/restore reg 1 */
 #define SPR_TFMR	0x13d
@@ -163,6 +164,7 @@
 /* Bits in HID0 */
 #define SPR_HID0_POWER8_4LPARMODE	PPC_BIT(2)
 #define SPR_HID0_POWER8_2LPARMODE	PPC_BIT(6)
+#define SPR_HID0_POWER8_DYNLPARDIS	PPC_BIT(15)
 #define SPR_HID0_POWER8_HILE		PPC_BIT(19)
 #define SPR_HID0_POWER9_HILE		PPC_BIT(4)
 #define SPR_HID0_POWER8_ENABLE_ATTN	PPC_BIT(31)
