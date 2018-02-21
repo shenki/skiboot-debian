@@ -134,9 +134,12 @@ hir_trigger:
 	EXCEPTION(0xe20)
 	EXCEPTION(0xe40)
 	EXCEPTION(0xe60)
+	EXCEPTION(0xe80)
 	EXCEPTION(0xf00)
 	EXCEPTION(0xf20)
 	EXCEPTION(0xf40)
+	EXCEPTION(0xf60)
+	EXCEPTION(0xf80)
 	EXCEPTION(0x1000)
 	EXCEPTION(0x1100)
 	EXCEPTION(0x1200)
@@ -147,7 +150,6 @@ hir_trigger:
 
 	.= 0x1e00
 _exception:
-	std	%r4,16(%r1)
 	stdu	%r1,-STACK_FRAMESIZE(%r1)
 	std	%r3,STACK_CFAR(%r1)
 	std	%r4,STACK_TYPE(%r1)
@@ -259,6 +261,8 @@ boot_entry:
 	beq	2f
 	cmpwi	cr0,%r3,PVR_TYPE_P8NVL
 	beq	2f
+	cmpwi	cr0,%r3,PVR_TYPE_P9
+	beq 	1f
 	attn		/* Unsupported CPU type... what do we do ? */
 
 	/* P8 -> 8 threads */
@@ -737,7 +741,7 @@ init_replicated_sprs:
 	. = 0x4000
 .global naca
 naca:
-	.llong	0			/* 0x0000 : Reserved */
+	.llong	spirah			/* 0x0000 : SPIRA-H  */
 	.llong	0			/* 0x0008 : Reserved */
 	.llong	0			/* 0x0010 : Reserved */
 	.llong	hv_release_data		/* 0x0018 : HV release data */

@@ -43,6 +43,7 @@
 #include <timer.h>
 #include <ipmi.h>
 #include <sensor.h>
+#include <xive.h>
 
 enum proc_gen proc_gen;
 
@@ -344,13 +345,32 @@ static bool load_kernel(void)
 		}
 	}
 
-	if (!kernel_size)
-		printf("Assuming kernel at %p\n", KERNEL_LOAD_BASE);
+	if (dt_has_node_property(dt_chosen, "kernel-base-address", NULL)) {
+		kernel_entry = dt_prop_get_u64(dt_chosen,
+					       "kernel-base-address");
+		printf("INIT: Kernel image at 0x%llx\n",kernel_entry);
+		kh = (struct elf_hdr *)kernel_entry;
+		/*
+		 * If the kernel is at 0, copy back what we wrote over
+		 * for the null branch catcher.
+		 */
+		if (kernel_entry == 0)
+			memcpy(0, zero_location, 16);
+	} else {
+		if (!kernel_size)
+			printf("INIT: Assuming kernel at %p\n",
+			       KERNEL_LOAD_BASE);
+		kh = (struct elf_hdr *)KERNEL_LOAD_BASE;
+	}
 
 	printf("INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
 	       kernel_size);
 
-	kh = (struct elf_hdr *)KERNEL_LOAD_BASE;
+	if (kh->ei_ident != ELF_IDENT) {
+		printf("INIT: ELF header not found. Assuming raw binary.\n");
+		return true;
+	}
+
 	if (kh->ei_class == ELF_CLASS_64)
 		return try_load_elf64(kh);
 	else if (kh->ei_class == ELF_CLASS_32)
@@ -433,7 +453,7 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	op_display(OP_LOG, OP_MOD_INIT, 0x000B);
 
 	/* Create the device tree blob to boot OS. */
-	fdt = create_dtb(dt_root);
+	fdt = create_dtb(dt_root, false);
 	if (!fdt) {
 		op_display(OP_FATAL, OP_MOD_INIT, 2);
 		abort();
@@ -615,11 +635,13 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	 * Hack alert: When entering via the OPAL entry point, fdt
 	 * is set to -1, we record that and pass it to parse_hdat
 	 */
-	if (fdt == (void *)-1ul)
-		parse_hdat(true, master_cpu);
-	else if (fdt == NULL)
-		parse_hdat(false, master_cpu);
-	else {
+	if (fdt == (void *)-1ul) {
+		if (parse_hdat(true, master_cpu) < 0)
+			abort();
+	} else if (fdt == NULL) {
+		if (parse_hdat(false, master_cpu) < 0)
+			abort();
+	} else {
 		dt_expand(fdt);
 	}
 
@@ -636,10 +658,13 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	 * to access chips via that path early on.
 	 */
 	init_chips();
+
+	/* If we detect the mambo simulator, we can enable its special console
+	 * early on. Do that now.
+	 */
 	if (chip_quirk(QUIRK_MAMBO_CALLOUTS))
 		enable_mambo_console();
-	if (chip_quirk(QUIRK_SIMICS))
-		enable_simics_console();
+
 	xscom_init();
 	mfsi_init();
 
@@ -687,8 +712,11 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	/* Allocate our split trace buffers now. Depends add_opal_node() */
 	init_trace_buffers();
 
-	/* Get the ICPs and make sure they are in a sane state */
+	/* On P7/P8, get the ICPs and make sure they are in a sane state */
 	init_interrupts();
+
+	/* On P9, initialize XIVE */
+	init_xive();
 
 	/* Grab centaurs from device-tree if present (only on FSP-less) */
 	centaur_init();
@@ -748,6 +776,9 @@ void __noreturn main_cpu_entry(const void *fdt, u32 master_cpu)
 	/* Probe PHB3 on P8 */
 	probe_phb3();
 
+	/* Probe PHB4 on P9 */
+	probe_phb4();
+
 	/* Probe NPUs */
 	probe_npu();
 
@@ -789,6 +820,11 @@ void __noreturn __secondary_cpu_entry(void)
 
 	/* Secondary CPU called in */
 	cpu_callin(cpu);
+
+	init_hid();
+
+	/* Some XIVE setup */
+	xive_cpu_callin(cpu);
 
 	/* Wait for work to do */
 	while(true) {

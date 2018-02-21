@@ -13,7 +13,7 @@
 #endif
 
 /* Heartbeat requested from Linux */
-#define HEARTBEAT_DEFAULT_MS	2000
+#define HEARTBEAT_DEFAULT_MS	200
 
 static struct lock timer_lock = LOCK_UNLOCKED;
 static LIST_HEAD(timer_list);
@@ -245,9 +245,13 @@ void check_timers(bool from_interrupt)
 
 void late_init_timers(void)
 {
+	int heartbeat = HEARTBEAT_DEFAULT_MS;
+
 	/* Add a property requesting the OS to call opal_poll_event() at
 	 * a specified interval in order for us to run our background
 	 * low priority pollers.
+	 *
+	 * If a platform quirk exists, use that, else use the default.
 	 *
 	 * If we have an SLW timer facility, we run this 10 times slower,
 	 * we could possibly completely get rid of it.
@@ -255,12 +259,12 @@ void late_init_timers(void)
 	 * We use a value in milliseconds, we don't want this to ever be
 	 * faster than that.
 	 */
-	if (slw_timer_ok() || fsp_present()) {
-		dt_add_property_cells(opal_node, "ibm,heartbeat-ms",
-				      HEARTBEAT_DEFAULT_MS);
-	} else {
-		dt_add_property_cells(opal_node, "ibm,heartbeat-ms",
-				      HEARTBEAT_DEFAULT_MS / 10);
+	if (platform.heartbeat_time) {
+		heartbeat = platform.heartbeat_time();
+	} else if (slw_timer_ok() || fsp_present()) {
+		heartbeat = HEARTBEAT_DEFAULT_MS * 10;
 	}
+
+	dt_add_property_cells(opal_node, "ibm,heartbeat-ms", heartbeat);
 }
 #endif

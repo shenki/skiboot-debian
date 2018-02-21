@@ -217,30 +217,78 @@ uint32_t p8_irq_to_phb(uint32_t irq);
 #define P8_IRQ_PSI_LOCAL_COUNT		5
 #define P8_IRQ_PSI_ALL_COUNT		6
 
+/* TBD: NX, AS, ...
+ */
 /* These are passed onto Linux */
 #define P8_IRQ_PSI_LINUX_BASE		5
 #define P8_IRQ_PSI_HOST_ERR		5	/* Used for UART */
 #define P8_IRQ_PSI_LINUX_COUNT		1
 
-/* TBD: NX, AS, ...
+/* Note about interrupt numbers on P9
+ * ==================================
+ *
+ * P9 uses a completely different interrupt controller, XIVE.
+ *
+ * It targets objects using a combination of block number and
+ * index within a block. However, we try to avoid exposing that
+ * split to the OS in order to keep some abstraction in case the
+ * way we allocate these change.
+ *
+ * The lowest level entity in Xive is the ESB (state bits).
+ *
+ * Those are spread between PHBs, PSI bridge and XIVE itself which
+ * provide a large amount of state bits for IPIs and other SW and HW
+ * generated interrupts by sources that don't have their own ESB logic
+ *
+ * Due to that spread, they aren't a good representation of a global
+ * interrupt number.
+ *
+ * Each such source however needs to be targetted at an EAS (IVT)
+ * entry in a table which will control targetting information and
+ * associate that interrupt with a logical number.
+ *
+ * Thus that table entry number represents a good "global interrupt
+ * number". Additionally, for the host OS, we will keep the logical
+ * number equal to the global number.
+ *
+ * The details of how these are assigned on P9 can be found in
+ * hw/xive.c. P9 HW will only use a subset of the definitions and
+ * functions in this file (or the corresponding core/interrupts.c).
  */
+
+struct irq_source;
 
 /*
  * IRQ sources register themselves here. If an "interrupts" callback
  * is provided, then all interrupts in that source will appear in
  * 'opal-interrupts' and will be handled by us.
+ *
+ * The "eoi" callback is optional and can be used for interrupts
+ * requiring a special EOI at the source level. Typically will
+ * be used for XIVE interrupts coming from PHBs.
  */
 struct irq_source_ops {
-	int64_t (*set_xive)(void *data, uint32_t isn, uint16_t server,
-			    uint8_t priority);
-	int64_t (*get_xive)(void *data, uint32_t isn, uint16_t *server,
-			    uint8_t *priority);
-	void (*interrupt)(void *data, uint32_t isn);
+	int64_t (*set_xive)(struct irq_source *is, uint32_t isn,
+			    uint16_t server, uint8_t priority);
+	int64_t (*get_xive)(struct irq_source *is, uint32_t isn,
+			    uint16_t *server, uint8_t *priority);
+	void (*interrupt)(struct irq_source *is, uint32_t isn);
+	void (*eoi)(struct irq_source *is, uint32_t isn);
 };
 
+struct irq_source {
+	uint32_t			start;
+	uint32_t			end;
+	const struct irq_source_ops	*ops;
+	void				*data;
+	struct list_node		link;
+};
+
+extern void __register_irq_source(struct irq_source *is);
 extern void register_irq_source(const struct irq_source_ops *ops, void *data,
 				uint32_t start, uint32_t count);
 extern void unregister_irq_source(uint32_t start, uint32_t count);
+extern void adjust_irq_source(struct irq_source *is, uint32_t new_count);
 
 extern uint32_t get_psi_interrupt(uint32_t chip_id);
 
@@ -256,5 +304,8 @@ extern void icp_prep_for_rvwinkle(void);
 extern void icp_kick_cpu(struct cpu_thread *cpu);
 
 extern void init_interrupts(void);
+
+extern bool irq_source_eoi(uint32_t isn);
+
 
 #endif /* __INTERRUPTS_H */

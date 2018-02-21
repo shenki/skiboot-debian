@@ -1,3 +1,19 @@
+/* Copyright 2014-2016 IBM Corp.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *	http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.
+ * See the License for the specific language governing permissions and
+ * imitations under the License.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
@@ -7,11 +23,12 @@
 
 #include "xscom.h"
 
-static void print_usage(void)
+static void print_usage(int code)
 {
 	printf("usage: getscom [-c|--chip chip-id] addr\n");
 	printf("       getscom -l|--list-chips\n");
 	printf("       getscom -v|--version\n");
+	exit(code);
 }
 
 static void print_chip_info(uint32_t chip_id)
@@ -57,17 +74,13 @@ static void print_chip_info(uint32_t chip_id)
 	
 }
 
-#define VERSION_STR _str(VERSION)
-#define _str(s) __str(s)
-#define __str(s) #s
+extern const char version[];
 
 int main(int argc, char *argv[])
 {
 	uint64_t val, addr = -1ull;
 	uint32_t def_chip, chip_id = 0xffffffff;
-	bool show_help = false;
 	bool list_chips = false;
-	bool show_version = false;
 	bool no_work = false;
 	int rc;
 
@@ -91,14 +104,14 @@ int main(int argc, char *argv[])
 			chip_id = strtoul(optarg, NULL, 0);
 			break;
 		case 'h':
-			show_help = true;
+			print_usage(0);
 			break;
 		case 'l':
 			list_chips = true;
 			break;
 		case 'v':
-			show_version = true;
-			break;
+			printf("xscom utils version %s\n", version);
+			exit(0);
 		default:
 			exit(1);
 		}
@@ -106,17 +119,11 @@ int main(int argc, char *argv[])
 	
 	if (addr == -1ull)
 		no_work = true;
-	if (no_work && !list_chips && !show_version && !show_help) {
+	if (no_work && !list_chips) {
 		fprintf(stderr, "Invalid or missing address\n");
-		print_usage();
-		exit(1);
+		print_usage(1);
 	}
-	if (show_version)
-		printf("xscom utils version %s\n", VERSION_STR);
-	if (show_help)
-		print_usage();
-	if (no_work && !list_chips)
-		return 0;
+
 	def_chip = xscom_init();
 	if (def_chip == 0xffffffff) {
 		fprintf(stderr, "No valid XSCOM chip found\n");
@@ -137,7 +144,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr,"Error %d reading XSCOM\n", rc);
 		exit(1);
 	}
-	printf("%" PRIx64 "\n", val);
+	printf("%016" PRIx64 "\n", val);
 	return 0;
 }
 

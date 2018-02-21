@@ -77,9 +77,36 @@
 
 #define P8_PIR2THREADID(pir) ((pir) & 0x7)
 
+/*
+ * P9 GCID
+ * -------
+ *
+ * Global chip ID is a 7 bit number:
+ *
+ *        NodeID      ChipID
+ * |               |           |
+ * |___|___|___|___|___|___|___|
+ *
+ * Bit 56 is unused according to the manual by we add it to the coreid here,
+ * thus we have a 6-bit core number.
+ *
+ * Note: XIVE Only supports 4-bit chip numbers ...
+ */
+#define P9_PIR2GCID(pir) (((pir) >> 8) & 0x7f)
+
+#define P9_PIR2COREID(pir) (((pir) >> 2) & 0x3f)
+
+#define P9_PIR2THREADID(pir) ((pir) & 0x3)
+
+/* P9 specific ones mostly used by XIVE */
+#define P9_PIR2LOCALCPU(pir) ((pir) & 0xff)
+#define P9_PIRFROMLOCALCPU(chip, cpu)	(((chip) << 8) | (cpu))
+
+
 struct dt_node;
 struct centaur_chip;
 struct mfsi;
+struct xive;
 
 /* Chip type */
 enum proc_chip_type {
@@ -89,6 +116,8 @@ enum proc_chip_type {
 	PROC_CHIP_P8_MURANO,
 	PROC_CHIP_P8_VENICE,
 	PROC_CHIP_P8_NAPLES,
+	PROC_CHIP_P9_NIMBUS,
+	PROC_CHIP_P9_CUMULUS,
 };
 
 /* Simulator quirks */
@@ -98,8 +127,8 @@ enum proc_chip_quirks {
 	QUIRK_NO_F000F		= 0x00000004,
 	QUIRK_NO_PBA		= 0x00000008,
 	QUIRK_NO_OCC_IRQ       	= 0x00000010,
-	QUIRK_DISABLE_NAP	= 0x00000020,
-	QUIRK_SIMICS		= 0x00000040,
+	QUIRK_SIMICS		= 0x00000020,
+	QUIRK_SLOW_SIM		= 0x00000040,
 } proc_chip_quirks;
 
 static inline bool chip_quirk(unsigned int q)
@@ -141,6 +170,7 @@ struct proc_chip {
 
 	/* Used by hw/lpc.c */
 	uint32_t		lpc_xbase;
+	void			*lpc_mbase;
 	struct lock		lpc_lock;
 	uint8_t			lpc_fw_idsel;
 	uint8_t			lpc_fw_rdsz;
@@ -160,7 +190,7 @@ struct proc_chip {
 
 	/* Must hold capi_lock to change */
 	u8			capp_phb3_attached_mask;
-	bool			capp_ucode_loaded;
+	u8			capp_ucode_loaded;
 
 	/* Used by hw/centaur.c */
 	struct centaur_chip	*centaurs;
@@ -173,6 +203,9 @@ struct proc_chip {
 
 	/* Used by hw/fsi-master.c */
 	struct mfsi		*fsi_masters;
+
+	/* Used by hw/xive.c */
+	struct xive		*xive;
 };
 
 extern uint32_t pir_to_chip_id(uint32_t pir);

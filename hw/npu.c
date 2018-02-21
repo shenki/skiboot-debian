@@ -18,6 +18,7 @@
 #include <timebase.h>
 #include <pci.h>
 #include <pci-cfg.h>
+#include <pci-slot.h>
 #include <interrupts.h>
 #include <opal.h>
 #include <opal-api.h>
@@ -25,11 +26,12 @@
 #include <device.h>
 #include <ccan/str/str.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/build_assert/build_assert.h>
 #include <affinity.h>
 #include <npu-regs.h>
 #include <npu.h>
-#include <lock.h>
 #include <xscom.h>
+#include <string.h>
 
 /*
  * Terminology:
@@ -195,20 +197,6 @@ static uint64_t npu_link_scom_base(struct dt_node *dn, uint32_t scom_base,
 static uint64_t get_bar_size(uint64_t bar)
 {
 	return (1 << GETFIELD(NX_MMIO_BAR_SIZE, bar)) * 0x10000;
-}
-
-static void npu_lock(struct phb *phb)
-{
-	struct npu *p = phb_to_npu(phb);
-
-	lock(&p->lock);
-}
-
-static void npu_unlock(struct phb *phb)
-{
-	struct npu *p = phb_to_npu(phb);
-
-	unlock(&p->lock);
 }
 
 /* Update the changes of the device BAR to link BARs */
@@ -517,25 +505,27 @@ static int __npu_dev_bind_pci_dev(struct phb *phb __unused,
 {
 	struct npu_dev *dev = data;
 	struct dt_node *pci_dt_node;
-	uint32_t npu_npcq_phandle;
+	char *pcislot;
 
 	/* Ignore non-nvidia PCI devices */
 	if ((pd->vdid & 0xffff) != 0x10de)
 		return 0;
 
-	/* Find the PCI devices pbcq */
-	for (pci_dt_node = pd->dn->parent;
-	     pci_dt_node && !dt_find_property(pci_dt_node, "ibm,pbcq");
+	/* Find the PCI device's slot location */
+	for (pci_dt_node = pd->dn;
+	     pci_dt_node && !dt_find_property(pci_dt_node, "ibm,slot-label");
 	     pci_dt_node = pci_dt_node->parent);
 
 	if (!pci_dt_node)
 		return 0;
 
-	npu_npcq_phandle = dt_prop_get_u32(dev->dt_node, "ibm,npu-pbcq");
+	pcislot = (char *)dt_prop_get(pci_dt_node, "ibm,slot-label");
 
-	if (dt_prop_get_u32(pci_dt_node, "ibm,pbcq") == npu_npcq_phandle &&
-	    (pd->vdid & 0xffff) == 0x10de)
-			return 1;
+	prlog(PR_DEBUG, "NPU: comparing GPU %s and NPU %s\n",
+	      pcislot, dev->slot_label);
+
+	if (streq(pcislot, dev->slot_label))
+		return 1;
 
 	return 0;
 }
@@ -556,7 +546,7 @@ static void npu_dev_bind_pci_dev(struct npu_dev *dev)
 		if (!phb)
 			continue;
 
-		dev->pd = pci_walk_dev(phb, __npu_dev_bind_pci_dev, dev);
+		dev->pd = pci_walk_dev(phb, NULL, __npu_dev_bind_pci_dev, dev);
 		if (dev->pd) {
 			dev->phb = phb;
 			/* Found the device, set the bit in config space */
@@ -566,7 +556,7 @@ static void npu_dev_bind_pci_dev(struct npu_dev *dev)
 		}
 	}
 
-	prlog(PR_ERR, "%s: NPU device %04x:00:%02x.0 not binding to PCI device\n",
+	prlog(PR_INFO, "%s: No PCI device for NPU device %04x:00:%02x.0 to bind to. If you expect a GPU to be there, this is a problem.\n",
 	      __func__, dev->npu->phb.opal_id, dev->index);
 }
 
@@ -600,7 +590,9 @@ static void npu_append_pci_phandle(struct dt_node *dn, u32 phandle)
 	unlock(&pci_npu_phandle_lock);
 }
 
-static void npu_dn_fixup(struct phb *phb, struct pci_device *pd)
+static int npu_dn_fixup(struct phb *phb,
+			struct pci_device *pd,
+			void *data __unused)
 {
 	struct npu *p = phb_to_npu(phb);
 	struct npu_dev *dev;
@@ -609,7 +601,10 @@ static void npu_dn_fixup(struct phb *phb, struct pci_device *pd)
 	assert(dev);
 
 	if (dev->phb || dev->pd)
-		return;
+		return 0;
+
+	/* NPU devices require a slot location to associate with GPUs */
+	dev->slot_label = dt_prop_get(pd->dn, "ibm,slot-label");
 
 	/* Bind the emulated PCI device with the real one, which can't
 	 * be done until the PCI devices are populated. Once the real
@@ -625,6 +620,13 @@ static void npu_dn_fixup(struct phb *phb, struct pci_device *pd)
 
 		dt_add_property_cells(pd->dn, "ibm,gpu", dev->pd->dn->phandle);
 	}
+
+	return 0;
+}
+
+static void npu_phb_final_fixup(struct phb *phb)
+{
+	pci_walk_dev(phb, NULL, npu_dn_fixup, NULL);
 }
 
 static void npu_ioda_init(struct npu *p)
@@ -688,19 +690,22 @@ static int npu_isn_valid(struct npu *p, uint32_t isn)
 	if (p->chip_id != p8_irq_to_chip(isn) || p->index != 0 ||
 	    NPU_IRQ_NUM(isn) < NPU_LSI_IRQ_MIN ||
 	    NPU_IRQ_NUM(isn) > NPU_LSI_IRQ_MAX) {
-		NPUERR(p, "isn 0x%x not valid for this NPU\n", isn);
+		/**
+		 * @fwts-label NPUisnInvalid
+		 * @fwts-advice NVLink not functional
+		 */
+		prlog(PR_ERR, "NPU%d: isn 0x%x not valid for this NPU\n",
+		      p->phb.opal_id, isn);
 		return false;
 	}
 
 	return true;
 }
 
-static int64_t npu_lsi_get_xive(void *data,
-				    uint32_t isn,
-				    uint16_t *server,
-				    uint8_t *prio)
+static int64_t npu_lsi_get_xive(struct irq_source *is, uint32_t isn,
+				uint16_t *server, uint8_t *prio)
 {
-	struct npu *p = data;
+	struct npu *p = is->data;
 	uint32_t irq = NPU_IRQ_NUM(isn);
 	uint64_t lxive;
 
@@ -719,12 +724,10 @@ static int64_t npu_lsi_get_xive(void *data,
 	return OPAL_SUCCESS;
 }
 
-static int64_t npu_lsi_set_xive(void *data,
-				    uint32_t isn,
-				    uint16_t server,
-				    uint8_t prio)
+static int64_t npu_lsi_set_xive(struct irq_source *is, uint32_t isn,
+				uint16_t server, uint8_t prio)
 {
-	struct npu *p = data;
+	struct npu *p = is->data;
 	uint32_t irq = NPU_IRQ_NUM(isn);
 	uint64_t lxive;
 
@@ -749,9 +752,9 @@ static int64_t npu_lsi_set_xive(void *data,
 	return OPAL_SUCCESS;
 }
 
-static void npu_err_interrupt(void *data, uint32_t isn)
+static void npu_err_interrupt(struct irq_source *is, uint32_t isn)
 {
-	struct npu *p = data;
+	struct npu *p = is->data;
 	uint32_t irq = NPU_IRQ_NUM(isn);
 
 	if (!npu_isn_valid(p, isn))
@@ -796,7 +799,8 @@ static void npu_hw_init(struct npu *p)
 {
 	/* 3 MMIO setup for AT */
 	out_be64(p->at_regs + NPU_LSI_SOURCE_ID,
-		 SETFIELD(NPU_LSI_SRC_ID_BASE, 0ul, 0x7f));
+		 SETFIELD(NPU_LSI_SRC_ID_BASE, 0ul, NPU_LSI_IRQ_MIN >> 4));
+	BUILD_ASSERT((NPU_LSI_IRQ_MIN & 0x07F0) == NPU_LSI_IRQ_MIN);
 	out_be64(p->at_regs + NPU_INTREP_TIMER, 0x0ul);
 	npu_ioda_reset(&p->phb, false);
 }
@@ -978,33 +982,62 @@ static int64_t npu_set_pe(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
-static int64_t npu_link_state(struct phb *phb __unused)
+static int64_t npu_get_link_state(struct pci_slot *slot __unused, uint8_t *val)
 {
 	/* As we're emulating all PCI stuff, the link bandwidth
 	 * isn't big deal anyway.
 	 */
-	return OPAL_SHPC_LINK_UP_x1;
+	*val = OPAL_SHPC_LINK_UP_x1;
+	return OPAL_SUCCESS;
 }
 
-static int64_t npu_power_state(struct phb *phb __unused)
+static int64_t npu_get_power_state(struct pci_slot *slot __unused, uint8_t *val)
 {
-	return OPAL_SHPC_POWER_ON;
+	*val = PCI_SLOT_POWER_ON;
+	return OPAL_SUCCESS;
 }
 
-static int64_t npu_hreset(struct phb *phb __unused)
+static int64_t npu_hreset(struct pci_slot *slot __unused)
 {
 	prlog(PR_DEBUG, "NPU: driver should call reset procedure here\n");
 
 	return OPAL_SUCCESS;
 }
 
-static int64_t npu_freset(struct phb *phb __unused)
+static int64_t npu_freset(struct pci_slot *slot __unused)
 {
 	/* FIXME: PHB fundamental reset, which need to be
 	 * figured out later. It's used by EEH recovery
 	 * upon fenced AT.
 	 */
 	return OPAL_SUCCESS;
+}
+
+static struct pci_slot *npu_slot_create(struct phb *phb)
+{
+	struct pci_slot *slot;
+
+	slot = pci_slot_alloc(phb, NULL);
+	if (!slot)
+		return slot;
+
+	/* Elementary functions */
+	slot->ops.get_presence_state  = NULL;
+	slot->ops.get_link_state      = npu_get_link_state;
+	slot->ops.get_power_state     = npu_get_power_state;
+	slot->ops.get_attention_state = NULL;
+	slot->ops.get_latch_state     = NULL;
+	slot->ops.set_power_state     = NULL;
+	slot->ops.set_attention_state = NULL;
+
+	slot->ops.prepare_link_change = NULL;
+	slot->ops.poll_link           = NULL;
+	slot->ops.hreset              = npu_hreset;
+	slot->ops.freset              = npu_freset;
+	slot->ops.pfreset             = NULL;
+	slot->ops.creset              = NULL;
+
+	return slot;
 }
 
 static int64_t npu_freeze_status(struct phb *phb,
@@ -1059,6 +1092,17 @@ static int64_t npu_eeh_next_error(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
+/* For use in error injection and handling. */
+void npu_set_fence_state(struct npu *p, bool fence) {
+	p->fenced = fence;
+
+	if (fence)
+		prlog(PR_ERR, "NPU: Chip %x is fenced, reboot required.\n",
+		      p->chip_id);
+	else
+		prlog(PR_WARNING, "NPU: un-fencing is dangerous and should \
+		      only be used for development purposes.");
+}
 
 /* Sets the NPU to trigger an error when a DMA occurs */
 static int64_t npu_err_inject(struct phb *phb, uint32_t pe_num,
@@ -1092,9 +1136,12 @@ static int64_t npu_err_inject(struct phb *phb, uint32_t pe_num,
 		return OPAL_PARAMETER;
 	} else if (type == 1) {
 		/* Emulate fence mode. */
-		p->fenced = true;
+		npu_set_fence_state(p, true);
 	} else {
-		/* Cause a freeze with an invalid MMIO write. */
+		/* Cause a freeze with an invalid MMIO read.  If the BAR is not
+		 * enabled, this will checkstop the machine.
+		 */
+		npu_dev_bar_update(p->chip_id, &dev->bar, true);
 		in_be64((void *)dev->bar.base);
 	}
 
@@ -1102,8 +1149,6 @@ static int64_t npu_err_inject(struct phb *phb, uint32_t pe_num,
 }
 
 static const struct phb_ops npu_ops = {
-	.lock			= npu_lock,
-	.unlock			= npu_unlock,
 	.cfg_read8		= npu_dev_cfg_read8,
 	.cfg_read16		= npu_dev_cfg_read16,
 	.cfg_read32		= npu_dev_cfg_read32,
@@ -1111,9 +1156,9 @@ static const struct phb_ops npu_ops = {
 	.cfg_write16		= npu_dev_cfg_write16,
 	.cfg_write32		= npu_dev_cfg_write32,
 	.choose_bus		= NULL,
+	.get_reserved_pe_number	= NULL,
 	.device_init		= NULL,
-	.device_node_fixup	= npu_dn_fixup,
-	.presence_detect	= NULL,
+	.phb_final_fixup	= npu_phb_final_fixup,
 	.ioda_reset		= npu_ioda_reset,
 	.papr_errinjct_reset	= NULL,
 	.pci_reinit		= NULL,
@@ -1128,14 +1173,6 @@ static const struct phb_ops npu_ops = {
 	.get_msi_64		= NULL,
 	.set_pe			= npu_set_pe,
 	.set_peltv		= NULL,
-	.link_state		= npu_link_state,
-	.power_state		= npu_power_state,
-	.slot_power_off		= NULL,
-	.slot_power_on		= NULL,
-	.hot_reset		= npu_hreset,
-	.fundamental_reset	= npu_freset,
-	.complete_reset		= NULL,
-	.poll			= NULL,
 	.eeh_freeze_status	= npu_freeze_status,
 	.eeh_freeze_clear	= NULL,
 	.eeh_freeze_set		= NULL,
@@ -1148,7 +1185,8 @@ static const struct phb_ops npu_ops = {
 };
 
 static void assign_mmio_bars(uint32_t gcid, uint32_t xscom,
-			     struct dt_node *npu_dn, uint64_t mm_win[2])
+			     struct dt_node *npu_dn, uint64_t mm_win[2],
+			     uint64_t at_bar[2])
 {
 	uint64_t mem_start, mem_end;
 	struct npu_dev_bar bar;
@@ -1203,6 +1241,8 @@ static void assign_mmio_bars(uint32_t gcid, uint32_t xscom,
 	bar.xscom = npu_link_scom_base(npu_dn, xscom, 1) + NX_MMIO_BAR_1;
 	bar.base += bar.size;
 	bar.size = NX_MMIO_AT_SIZE;
+	at_bar[0] = bar.base;
+	at_bar[1] = NX_MMIO_AT_SIZE;
 	npu_dev_bar_update(gcid, &bar, true);
 
 	/* Now we configure all the DLTL BARs. These are the ones
@@ -1236,8 +1276,8 @@ static void npu_probe_phb(struct dt_node *dn)
 {
 	struct dt_node *np;
 	uint32_t gcid, index, phb_index, xscom;
-	uint64_t at_bar[2], mm_win[2], val;
-	uint32_t links = 0;
+	uint64_t at_bar[2], mm_win[2];
+	uint32_t links;
 	char *path;
 
 	/* Retrieve chip id */
@@ -1245,9 +1285,7 @@ static void npu_probe_phb(struct dt_node *dn)
 	gcid = dt_get_chip_id(dn);
 	index = dt_prop_get_u32(dn, "ibm,npu-index");
 	phb_index = dt_prop_get_u32(dn, "ibm,phb-index");
-	dt_for_each_compatible(dn, np, "ibm,npu-link")
-		links++;
-
+	links = dt_prop_get_u32(dn, "ibm,npu-links");
 	prlog(PR_INFO, "Chip %d Found NPU%d (%d links) at %s\n",
 	      gcid, index, links, path);
 	free(path);
@@ -1256,28 +1294,13 @@ static void npu_probe_phb(struct dt_node *dn)
 	xscom = dt_get_address(dn, 0, NULL);
 	prlog(PR_INFO, "   XSCOM Base:  %08x\n", xscom);
 
-	assign_mmio_bars(gcid, xscom, dn, mm_win);
-
-	/* Retrieve AT BAR */
-	xscom_read(gcid, npu_link_scom_base(dn, xscom, 1) + NX_MMIO_BAR_1,
-		   &val);
-	if (!(val & NX_MMIO_BAR_ENABLE)) {
-		prlog(PR_ERR, "   AT BAR disabled!\n");
-		return;
-	}
-
-	at_bar[0] = GETFIELD(NX_MMIO_BAR_BASE, val) << 12;
-	at_bar[1] = get_bar_size(val);
+	assign_mmio_bars(gcid, xscom, dn, mm_win, at_bar);
 	prlog(PR_INFO, "   AT BAR:      %016llx (%lldKB)\n",
 	      at_bar[0], at_bar[1] / 0x400);
 
 	/* Create PCI root device node */
 	np = dt_new_addr(dt_root, "pciex", at_bar[0]);
-	if (!np) {
-		prlog(PR_ERR, "%s: Cannot create PHB device node\n",
-		      __func__);
-		return;
-	}
+	assert(np);
 
 	dt_add_property_strings(np, "compatible",
 				"ibm,power8-npu-pciex", "ibm,ioda2-npu-phb");
@@ -1496,7 +1519,7 @@ static void npu_dev_create_cfg(struct npu_dev *dev)
 	/* 0x10 - BARs, always 64-bits non-prefetchable
 	 *
 	 * Each emulated device represents one link and therefore
-	 * there is one BAR for the assocaited DLTL region.
+	 * there is one BAR for the associated DLTL region.
 	 */
 
 	/* Low 32-bits */
@@ -1571,34 +1594,19 @@ static void npu_dev_create_cfg(struct npu_dev *dev)
 		NPU_DEV_CFG_INIT_RO(dev, PCI_CFG_INT_LINE, 4, 0x00000200);
 }
 
-static uint32_t npu_allocate_bdfn(struct npu *p, uint32_t pbcq)
+static uint32_t npu_allocate_bdfn(struct npu *p, uint32_t group)
 {
 	int i;
-	int dev = -1;
-	int bdfn = -1;
+	int bdfn = (group << 3);
 
-	/* Find the highest function number alloacted to emulated PCI
-	 * devices associated with this GPU. */
-	for(i = 0; i < p->total_devices; i++) {
-		int dev_bdfn = p->devices[i].bdfn;
-		dev = MAX(dev, dev_bdfn & 0xf8);
-
-		if (dt_prop_get_u32(p->devices[i].dt_node,
-				    "ibm,npu-pbcq") == pbcq)
-			bdfn = MAX(bdfn, dev_bdfn);
+	for (i = 0; i < p->total_devices; i++) {
+		if (p->devices[i].bdfn == bdfn) {
+			bdfn++;
+			break;
+		}
 	}
 
-	if (bdfn >= 0)
-		/* Device has already been allocated for this GPU so
-		 * assign the emulated PCI device the next
-		 * function. */
-		return bdfn + 1;
-	else if (dev >= 0)
-		/* Otherwise allocate a new device and allocate
-		 * function 0. */
-		return dev + (1 << 3);
-	else
-		return 0;
+	return bdfn;
 }
 
 static void npu_create_devices(struct dt_node *dn, struct npu *p)
@@ -1606,14 +1614,20 @@ static void npu_create_devices(struct dt_node *dn, struct npu *p)
 	struct npu_dev *dev;
 	struct dt_node *npu_dn, *link;
 	uint32_t npu_phandle, index = 0;
-	uint64_t buid;
+	uint64_t buid_reg;
 	uint64_t lsisrcid;
+	uint64_t buid;
 
-	lsisrcid = GETFIELD(NPU_LSI_SRC_ID_BASE,
-			    in_be64(p->at_regs + NPU_LSI_SOURCE_ID));
-	buid = SETFIELD(NP_BUID_BASE, 0ull,
-			(p8_chip_irq_block_base(p->chip_id, P8_IRQ_BLOCK_MISC) | lsisrcid));
-	buid |= NP_BUID_ENABLE;
+
+	/* The bits in the LSI ID Base register are always compared and
+	 * can be set to 0 in the buid base and mask fields.  The
+	 * buid (bus unit id) is the full irq minus the last 4 bits. */
+	lsisrcid = GETFIELD(NPU_LSI_SRC_ID_BASE, NPU_LSI_SRC_ID_BASE);
+	buid = p8_chip_irq_block_base(p->chip_id, P8_IRQ_BLOCK_MISC) >> 4;
+
+	buid_reg = SETFIELD(NP_IRQ_LEVELS, NP_BUID_ENABLE, ~0);
+	buid_reg = SETFIELD(NP_BUID_MASK, buid_reg, ~lsisrcid);
+	buid_reg = SETFIELD(NP_BUID_BASE, buid_reg, (buid & ~lsisrcid));
 
 	/* Get the npu node which has the links which we expand here
 	 * into pci like devices attached to our emulated phb. */
@@ -1626,7 +1640,7 @@ static void npu_create_devices(struct dt_node *dn, struct npu *p)
 	p->phb.scan_map = 0;
 	dt_for_each_compatible(npu_dn, link, "ibm,npu-link") {
 		struct npu_dev_bar *bar;
-		uint32_t pbcq;
+		uint32_t group_id;
 		uint64_t val;
 		uint32_t j;
 
@@ -1641,8 +1655,8 @@ static void npu_create_devices(struct dt_node *dn, struct npu *p)
 		/* We don't support MMIO PHY access yet */
 		dev->pl_base = NULL;
 
-		pbcq = dt_prop_get_u32(link, "ibm,npu-pbcq");
-		dev->bdfn = npu_allocate_bdfn(p, pbcq);
+		group_id = dt_prop_get_u32(link, "ibm,npu-group-id");
+		dev->bdfn = npu_allocate_bdfn(p, group_id);
 
 		/* This must be done after calling
 		 * npu_allocate_bdfn() */
@@ -1653,7 +1667,7 @@ static void npu_create_devices(struct dt_node *dn, struct npu *p)
 		dev->lane_mask = dt_prop_get_u32(link, "ibm,npu-lane-mask");
 
 		/* Setup BUID/ISRN */
-		xscom_write(p->chip_id, dev->xscom + NX_NP_BUID, buid);
+		xscom_write(p->chip_id, dev->xscom + NX_NP_BUID, buid_reg);
 
 		/* Setup emulated config space */
 		for (j = 0; j < NPU_DEV_CFG_MAX; j++)
@@ -1691,11 +1705,19 @@ static void npu_add_phb_properties(struct npu *p)
 	uint32_t icsp = get_ics_phandle();
 	uint64_t tkill, mm_base, mm_size;
 	uint32_t base_lsi = p->base_lsi;
-	uint32_t map[] = { 0x0, 0x0, 0x0, 0x1, icsp, base_lsi,
-			   0x0, 0x0, 0x0, 0x2, icsp, base_lsi + 1,
-			   0x800, 0x0, 0x0, 0x1, icsp, base_lsi + 2,
-			   0x800, 0x0, 0x0, 0x2, icsp, base_lsi + 3 };
+	uint32_t map[] = {
+		/* Dev 0 INT#A (used by fn0) */
+		0x0000, 0x0, 0x0, 0x1, icsp, base_lsi + NPU_LSI_INT_DL0, 1,
+		/* Dev 0 INT#B (used by fn1) */
+		0x0000, 0x0, 0x0, 0x2, icsp, base_lsi + NPU_LSI_INT_DL1, 1,
+		/* Dev 1 INT#A (used by fn0) */
+		0x0800, 0x0, 0x0, 0x1, icsp, base_lsi + NPU_LSI_INT_DL2, 1,
+		/* Dev 1 INT#B (used by fn1) */
+		0x0800, 0x0, 0x0, 0x2, icsp, base_lsi + NPU_LSI_INT_DL3, 1,
+	};
+	/* Mask is bus, device and INT# */
 	uint32_t mask[] = {0xf800, 0x0, 0x0, 0x7};
+	char slotbuf[32];
 
 	/* Add various properties that HB doesn't have to
 	 * add, some of them simply because they result from
@@ -1710,21 +1732,8 @@ static void npu_add_phb_properties(struct npu *p)
 	dt_add_property_cells(np, "clock-frequency", 0x200, 0);
         dt_add_property_cells(np, "interrupt-parent", icsp);
 
-        /* DLPL Interrupts */
-        p->phb.lstate.int_size = 1;
-        p->phb.lstate.int_val[0][0] = p->base_lsi + NPU_LSI_INT_DL0;
-        p->phb.lstate.int_val[1][0] = p->base_lsi + NPU_LSI_INT_DL1;
-        p->phb.lstate.int_val[2][0] = p->base_lsi + NPU_LSI_INT_DL2;
-        p->phb.lstate.int_val[3][0] = p->base_lsi + NPU_LSI_INT_DL3;
-        p->phb.lstate.int_parent[0] = icsp;
-        p->phb.lstate.int_parent[1] = icsp;
-        p->phb.lstate.int_parent[2] = icsp;
-        p->phb.lstate.int_parent[3] = icsp;
-
-	/* Due to the way the emulated PCI devices are structured in
-	 * the device tree the core PCI layer doesn't do this for
-	 * us. Besides the swizzling wouldn't suit our needs even if it
-	 * did. */
+        /* DLPL Interrupts, we don't use the standard swizzle */
+	p->phb.lstate.int_size = 0;
 	dt_add_property(np, "interrupt-map", map, sizeof(map));
 	dt_add_property(np, "interrupt-map-mask", mask, sizeof(mask));
 
@@ -1750,12 +1759,20 @@ static void npu_add_phb_properties(struct npu *p)
 			      hi32(mm_base), lo32(mm_base),
 			      hi32(mm_base), lo32(mm_base),
 			      hi32(mm_size), lo32(mm_size));
+
+	/* Set the slot location on the NPU PHB.  This PHB can contain
+	 * devices that correlate with multiple physical slots, so
+	 * present the chip ID instead.
+	 */
+	snprintf(slotbuf, sizeof(slotbuf), "NPU Chip %d", p->chip_id);
+	dt_add_property_string(np, "ibm,io-base-loc-code", slotbuf);
 }
 
 static void npu_create_phb(struct dt_node *dn)
 {
 	const struct dt_property *prop;
 	struct npu *p;
+	struct pci_slot *slot;
 	uint32_t links;
 	void *pmem;
 
@@ -1800,6 +1817,18 @@ static void npu_create_phb(struct dt_node *dn)
 	/* Populate extra properties */
 	npu_add_phb_properties(p);
 
+	/* Create PHB slot */
+	slot = npu_slot_create(&p->phb);
+	if (!slot)
+	{
+		/**
+		 * @fwts-label NPUCannotCreatePHBSlot
+		 * @fwts-advice Firmware probably ran out of memory creating
+		 * NPU slot. NVLink functionality could be broken.
+		 */
+		prlog(PR_ERR, "NPU: Cannot create PHB slot\n");
+	}
+
 	/* Register PHB */
 	pci_register_phb(&p->phb, OPAL_DYNAMIC_PHB_ID);
 
@@ -1825,3 +1854,4 @@ void probe_npu(void)
 	dt_for_each_compatible(dt_root, np, "ibm,power8-npu-pciex")
 		npu_create_phb(np);
 }
+

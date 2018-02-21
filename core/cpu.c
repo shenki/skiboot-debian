@@ -47,6 +47,8 @@ unsigned int cpu_max_pir;
 struct cpu_thread *boot_cpu;
 static struct lock reinit_lock = LOCK_UNLOCKED;
 static bool hile_supported;
+static unsigned long hid0_hile;
+static unsigned long hid0_attn;
 
 unsigned long cpu_secondary_start __force_data = 0;
 
@@ -86,6 +88,11 @@ struct cpu_job *__cpu_queue_job(struct cpu_thread *cpu,
 				bool no_return)
 {
 	struct cpu_job *job;
+
+#ifdef DEBUG_SERIALIZE_CPU_JOBS
+	if (cpu == NULL)
+		cpu = this_cpu();
+#endif
 
 	if (cpu && !cpu_is_available(cpu)) {
 		prerror("CPU: Tried to queue job on unavailable CPU 0x%04x\n",
@@ -399,6 +406,37 @@ static void init_cpu_thread(struct cpu_thread *t,
 	assert(pir == container_of(t, struct cpu_stack, cpu) - cpu_stacks);
 }
 
+static void enable_attn(void)
+{
+	unsigned long hid0;
+
+	hid0 = mfspr(SPR_HID0);
+	hid0 |= hid0_attn;
+	set_hid0(hid0);
+}
+
+static void disable_attn(void)
+{
+	unsigned long hid0;
+
+	hid0 = mfspr(SPR_HID0);
+	hid0 &= ~hid0_attn;
+	set_hid0(hid0);
+}
+
+extern void __trigger_attn(void);
+void trigger_attn(void)
+{
+	enable_attn();
+	__trigger_attn();
+}
+
+void init_hid(void)
+{
+	/* attn is enabled even when HV=0, so make sure it's off */
+	disable_attn();
+}
+
 void pre_init_boot_cpu(void)
 {
 	struct cpu_thread *cpu = this_cpu();
@@ -423,10 +461,20 @@ void init_boot_cpu(void)
 	case PVR_TYPE_P8:
 		proc_gen = proc_gen_p8;
 		hile_supported = PVR_VERS_MAJ(mfspr(SPR_PVR)) >= 2;
+		hid0_hile = SPR_HID0_POWER8_HILE;
+		hid0_attn = SPR_HID0_POWER8_ENABLE_ATTN;
 		break;
 	case PVR_TYPE_P8NVL:
 		proc_gen = proc_gen_p8;
 		hile_supported = true;
+		hid0_hile = SPR_HID0_POWER8_HILE;
+		hid0_attn = SPR_HID0_POWER8_ENABLE_ATTN;
+		break;
+	case PVR_TYPE_P9:
+		proc_gen = proc_gen_p9;
+		hile_supported = true;
+		hid0_hile = SPR_HID0_POWER9_HILE;
+		hid0_attn = SPR_HID0_POWER9_ENABLE_ATTN;
 		break;
 	default:
 		proc_gen = proc_gen_unknown;
@@ -444,6 +492,12 @@ void init_boot_cpu(void)
 		cpu_thread_count = 8;
 		cpu_max_pir = SPR_PIR_P8_MASK;
 		prlog(PR_INFO, "CPU: P8 generation processor"
+		      "(max %d threads/core)\n", cpu_thread_count);
+		break;
+	case proc_gen_p9:
+		cpu_thread_count = 4;
+		cpu_max_pir = SPR_PIR_P9_MASK;
+		prlog(PR_INFO, "CPU: P9 generation processor"
 		      "(max %d threads/core)\n", cpu_thread_count);
 		break;
 	default:
@@ -465,14 +519,60 @@ void init_boot_cpu(void)
 	init_cpu_thread(boot_cpu, cpu_state_active, pir);
 	init_boot_tracebuf(boot_cpu);
 	assert(this_cpu() == boot_cpu);
+	init_hid();
 
 	list_head_init(&global_job_queue);
+}
+
+static void enable_large_dec(bool on)
+{
+	u64 lpcr = mfspr(SPR_LPCR);
+
+	if (on)
+		lpcr |= SPR_LPCR_P9_LD;
+	else
+		lpcr &= ~SPR_LPCR_P9_LD;
+
+	mtspr(SPR_LPCR, lpcr);
+}
+
+#define HIGH_BIT (1ull << 63)
+
+static int find_dec_bits(void)
+{
+	int bits = 65; /* we always decrement once */
+	u64 mask = ~0ull;
+
+	if (proc_gen < proc_gen_p9)
+		return 32;
+
+	/* The ISA doesn't specify the width of the decrementer register so we
+	 * need to discover it. When in large mode (LPCR.LD = 1) reads from the
+	 * DEC SPR are sign extended to 64 bits and writes are truncated to the
+	 * physical register width. We can use this behaviour to detect the
+	 * width by starting from an all 1s value and left shifting until we
+	 * read a value from the DEC with it's high bit cleared.
+	 */
+
+	enable_large_dec(true);
+
+	do {
+		bits--;
+		mask = mask >> 1;
+		mtspr(SPR_DEC, mask);
+	} while (mfspr(SPR_DEC) & HIGH_BIT);
+
+	enable_large_dec(false);
+
+	prlog(PR_DEBUG, "CPU: decrementer bits %d\n", bits);
+	return bits;
 }
 
 void init_all_cpus(void)
 {
 	struct dt_node *cpus, *cpu;
 	unsigned int thread, new_max_pir = 0;
+	int dec_bits = find_dec_bits();
 
 	cpus = dt_find_by_path(dt_root, "/cpus");
 	assert(cpus);
@@ -526,6 +626,9 @@ void init_all_cpus(void)
 
 		/* Add associativity properties */
 		add_core_associativity(t);
+
+		/* Add the decrementer width property */
+		dt_add_property_cells(cpu, "ibm,dec-bits", dec_bits);
 
 		/* Adjust max PIR */
 		if (new_max_pir < (pir + cpu_thread_count - 1))
@@ -623,6 +726,11 @@ static int64_t opal_start_cpu_thread(uint64_t server_no, uint64_t start_address)
 		prerror("OPAL: CPU not active in OPAL !\n");
 		return OPAL_WRONG_STATE;
 	}
+	if (cpu->in_reinit) {
+		unlock(&reinit_lock);
+		prerror("OPAL: CPU being reinitialized !\n");
+		return OPAL_WRONG_STATE;
+	}
 	job = __cpu_queue_job(cpu, "start_thread",
 			      opal_start_thread_job, (void *)start_address,
 			      true);
@@ -681,9 +789,9 @@ static void cpu_change_hile(void *hilep)
 
 	hid0 = mfspr(SPR_HID0);
 	if (hile)
-		hid0 |= SPR_HID0_HILE;
+		hid0 |= hid0_hile;
 	else
-		hid0 &= ~SPR_HID0_HILE;
+		hid0 &= ~hid0_hile;
 	prlog(PR_DEBUG, "CPU: [%08x] HID0 set to 0x%016lx\n",
 	      this_cpu()->pir, hid0);
 	set_hid0(hid0);
@@ -716,36 +824,39 @@ static int64_t opal_reinit_cpus(uint64_t flags)
 	int64_t rc = OPAL_SUCCESS;
 	int i;
 
-	prerror("OPAL: Trying a CPU re-init with flags: 0x%llx\n", flags);
+	prlog(PR_INFO, "OPAL: Trying a CPU re-init with flags: 0x%llx\n", flags);
 
+ again:
 	lock(&reinit_lock);
 
 	for (cpu = first_cpu(); cpu; cpu = next_cpu(cpu)) {
-		if (cpu == this_cpu())
+		if (cpu == this_cpu() || cpu->in_reinit)
 			continue;
 		if (cpu->state == cpu_state_os) {
+			unlock(&reinit_lock);
 			/*
 			 * That might be a race with return CPU during kexec
 			 * where we are still, wait a bit and try again
 			 */
 			for (i = 0; (i < 1000) &&
 				     (cpu->state == cpu_state_os); i++) {
-				unlock(&reinit_lock);
 				time_wait_ms(1);
-				lock(&reinit_lock);
 			}
 			if (cpu->state == cpu_state_os) {
 				prerror("OPAL: CPU 0x%x not in OPAL !\n", cpu->pir);
-				rc = OPAL_WRONG_STATE;
-				goto bail;
+				return OPAL_WRONG_STATE;
 			}
+			goto again;
 		}
+		cpu->in_reinit = true;
 	}
 	/*
 	 * Now we need to mark ourselves "active" or we'll be skipped
 	 * by the various "for_each_active_..." calls done by slw_reinit()
 	 */
 	this_cpu()->state = cpu_state_active;
+	this_cpu()->in_reinit = true;
+	unlock(&reinit_lock);
 
 	/*
 	 * If the flags affect endianness and we are on P8 DD2 or later, then
@@ -768,14 +879,18 @@ static int64_t opal_reinit_cpus(uint64_t flags)
 	}
 
 	/* Any flags left ? */
-	if (flags != 0)
+	if (flags != 0 && proc_gen == proc_gen_p8)
 		rc = slw_reinit(flags);
+	else if (flags != 0)
+		rc = OPAL_UNSUPPORTED;
 
 	/* And undo the above */
+	lock(&reinit_lock);
 	this_cpu()->state = cpu_state_os;
-
-bail:
+	for (cpu = first_cpu(); cpu; cpu = next_cpu(cpu))
+		cpu->in_reinit = false;
 	unlock(&reinit_lock);
+
 	return rc;
 }
 opal_call(OPAL_REINIT_CPUS, opal_reinit_cpus, 1);

@@ -217,8 +217,8 @@ static void ipmi_init_esel_record(void)
 static void ipmi_update_sel_record(uint8_t event_severity, uint16_t esel_record_id)
 {
 	sel_record.record_type = SEL_REC_TYPE_SYS_EVENT;
-	sel_record.event_data2 = esel_record_id & 0xff;
-	sel_record.event_data3 = (esel_record_id >> 8) & 0xff;
+	sel_record.event_data2 = (esel_record_id >> 8) & 0xff;
+	sel_record.event_data3 = esel_record_id & 0xff;
 
 	switch (event_severity) {
 	case OPAL_ERROR_PANIC:
@@ -468,6 +468,12 @@ static void sel_pnor(uint8_t access)
 		occ_pnor_set_owner(PNOR_OWNER_HOST);
 		break;
 	default:
+		/**
+		 * @fwts-label InvalidPNORAccessRequest
+		 * @fwts-advice In negotiating PNOR access with BMC, we
+		 * got an odd/invalid request from the BMC. Likely a bug
+		 * in OPAL/BMC interaction.
+		 */
 		prlog(PR_ERR, "invalid PNOR access requested: %02x\n",
 		      access);
 	}
@@ -517,6 +523,10 @@ static void sel_occ_reset(uint8_t sensor)
 
 	rc = occ_sensor_id_to_chip(sensor, &chip);
 	if (rc) {
+		/**
+		 * @fwts-label: SELUnknownOCCReset
+		 * @fwts-advice: Likely bug in what sent us the OCC reset.
+		 */
 		prlog(PR_ERR, "SEL message to reset an unknown OCC "
 				"(sensor ID 0x%02x)\n", sensor);
 		return;

@@ -31,6 +31,10 @@ export SKIBOOT_ZIMAGE=`pwd`/test/hello_world/hello_kernel/hello_kernel
 OLD_ULIMIT_C=`ulimit -c`
 ulimit -c 0
 
+t=$(mktemp) || exit 1
+
+trap "rm -f -- '$t'" EXIT
+
 ( cd external/mambo; 
 cat <<EOF | expect
 set timeout 30
@@ -38,12 +42,21 @@ spawn $MAMBO_PATH/$MAMBO_BINARY -n -f ../../test/hello_world/run_hello_world.tcl
 expect {
 timeout { send_user "\nTimeout waiting for hello world\n"; exit 1 }
 eof { send_user "\nUnexpected EOF\n;" exit 1 }
-"ATTN"
+"Execution stopped: Sim Support exit requested stop"
 }
 wait
 exit 0
 EOF
-)
+) 2>&1 > $t
+
+r=$?
+if [ $r != 0 ]; then
+    cat $t
+    exit $r
+fi
+
 ulimit -c $OLD_ULIMIT_C
-echo
+
+rm -f -- "$t"
+trap - EXIT
 exit 0;

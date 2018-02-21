@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define pr_fmt(fmt)	"LPC: " fmt
+
 #include <skiboot.h>
 #include <xscom.h>
 #include <io.h>
@@ -23,6 +25,7 @@
 #include <timebase.h>
 #include <errorlog.h>
 #include <opal-api.h>
+#include <platform.h>
 
 //#define DBG_IRQ(fmt...) prerror(fmt)
 #define DBG_IRQ(fmt...) do { } while(0)
@@ -33,6 +36,15 @@ DEFINE_LOG_ENTRY(OPAL_RC_LPC_READ, OPAL_PLATFORM_ERR_EVT, OPAL_LPC,
 
 DEFINE_LOG_ENTRY(OPAL_RC_LPC_WRITE, OPAL_PLATFORM_ERR_EVT, OPAL_LPC,
 		 OPAL_MISC_SUBSYSTEM, OPAL_PREDICTIVE_ERR_GENERAL,
+		 OPAL_NA);
+
+DEFINE_LOG_ENTRY(OPAL_RC_LPC_SYNC, OPAL_PLATFORM_ERR_EVT, OPAL_LPC,
+		 OPAL_MISC_SUBSYSTEM, OPAL_PREDICTIVE_ERR_GENERAL,
+		 OPAL_NA);
+
+/* Used exclusively in manufacturing mode */
+DEFINE_LOG_ENTRY(OPAL_RC_LPC_SYNC_PERF, OPAL_PLATFORM_ERR_EVT, OPAL_LPC,
+		 OPAL_MISC_SUBSYSTEM, OPAL_UNRECOVERABLE_ERR_DEGRADE_PERF,
 		 OPAL_NA);
 
 #define ECCB_CTL	0 /* b0020 -> b00200 */
@@ -104,6 +116,9 @@ DEFINE_LOG_ENTRY(OPAL_RC_LPC_WRITE, OPAL_PLATFORM_ERR_EVT, OPAL_LPC,
 	LPC_HC_IRQ_BM_TAR_ERR)
 #define LPC_HC_ERROR_ADDRESS	0x40
 
+
+#define	LPC_BUS_DEGRADED_PERF_THRESHOLD		5
+
 struct lpc_client_entry {
 	struct list_node node;
 	const struct lpc_client *clt;
@@ -123,12 +138,33 @@ static uint32_t lpc_fw_opb_base 	= 0xf0000000;
 static uint32_t lpc_reg_opb_base 	= 0xc0012000;
 static uint32_t opb_master_reg_base 	= 0xc0010000;
 
+static int64_t opb_mmio_write(struct proc_chip *chip, uint32_t addr, uint32_t data,
+			      uint32_t sz)
+{
+	switch (sz) {
+	case 1:
+		out_8(chip->lpc_mbase + addr, data);
+		return OPAL_SUCCESS;
+	case 2:
+		out_be16(chip->lpc_mbase + addr, data);
+		return OPAL_SUCCESS;
+	case 4:
+		out_be32(chip->lpc_mbase + addr, data);
+		return OPAL_SUCCESS;
+	}
+	prerror("LPC: Invalid data size %d\n", sz);
+	return OPAL_PARAMETER;
+}
+
 static int64_t opb_write(struct proc_chip *chip, uint32_t addr, uint32_t data,
 			 uint32_t sz)
 {
 	uint64_t ctl = ECCB_CTL_MAGIC, stat;
 	int64_t rc, tout;
 	uint64_t data_reg;
+
+	if (chip->lpc_mbase)
+		return opb_mmio_write(chip, addr, data, sz);
 
 	switch(sz) {
 	case 1:
@@ -141,7 +177,7 @@ static int64_t opb_write(struct proc_chip *chip, uint32_t addr, uint32_t data,
 		data_reg = ((uint64_t)data) << 32;
 		break;
 	default:
-		prerror("LPC: Invalid data size %d\n", sz);
+		prerror("Invalid data size %d\n", sz);
 		return OPAL_PARAMETER;
 	}
 
@@ -184,14 +220,35 @@ static int64_t opb_write(struct proc_chip *chip, uint32_t addr, uint32_t data,
 	return OPAL_HARDWARE;
 }
 
+static int64_t opb_mmio_read(struct proc_chip *chip, uint32_t addr, uint32_t *data,
+			     uint32_t sz)
+{
+	switch (sz) {
+	case 1:
+		*data = in_8(chip->lpc_mbase + addr);
+		return OPAL_SUCCESS;
+	case 2:
+		*data = in_be16(chip->lpc_mbase + addr);
+		return OPAL_SUCCESS;
+	case 4:
+		*data = in_be32(chip->lpc_mbase + addr);
+		return OPAL_SUCCESS;
+	}
+	prerror("LPC: Invalid data size %d\n", sz);
+	return OPAL_PARAMETER;
+}
+
 static int64_t opb_read(struct proc_chip *chip, uint32_t addr, uint32_t *data,
 		        uint32_t sz)
 {
 	uint64_t ctl = ECCB_CTL_MAGIC | ECCB_CTL_READ, stat;
 	int64_t rc, tout;
 
+	if (chip->lpc_mbase)
+		return opb_mmio_read(chip, addr, data, sz);
+
 	if (sz != 1 && sz != 2 && sz != 4) {
-		prerror("LPC: Invalid data size %d\n", sz);
+		prerror("Invalid data size %d\n", sz);
 		return OPAL_PARAMETER;
 	}
 
@@ -252,14 +309,14 @@ static int64_t lpc_set_fw_idsel(struct proc_chip *chip, uint8_t idsel)
 	rc = opb_read(chip, lpc_reg_opb_base + LPC_HC_FW_SEG_IDSEL,
 		      &val, 4);
 	if (rc) {
-		prerror("LPC: Failed to read HC_FW_SEG_IDSEL register !\n");
+		prerror("Failed to read HC_FW_SEG_IDSEL register !\n");
 		return rc;
 	}
 	val = (val & 0xfffffff0) | idsel;
 	rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_FW_SEG_IDSEL,
 		       val, 4);
 	if (rc) {
-		prerror("LPC: Failed to write HC_FW_SEG_IDSEL register !\n");
+		prerror("Failed to write HC_FW_SEG_IDSEL register !\n");
 		return rc;
 	}
 	chip->lpc_fw_idsel = idsel;
@@ -295,7 +352,7 @@ static int64_t lpc_set_fw_rdsz(struct proc_chip *chip, uint8_t rdsz)
 	rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_FW_RD_ACC_SIZE,
 		       val, 4);
 	if (rc) {
-		prerror("LPC: Failed to write LPC_HC_FW_RD_ACC_SIZE !\n");
+		prerror("Failed to write LPC_HC_FW_RD_ACC_SIZE !\n");
 		return rc;
 	}
 	chip->lpc_fw_rdsz = rdsz;
@@ -372,7 +429,7 @@ static int64_t __lpc_write(uint32_t chip_id, enum OpalLPCAddressType addr_type,
 	uint32_t opb_base;
 	int64_t rc;
 
-	if (!chip || !chip->lpc_xbase)
+	if (!chip || (!chip->lpc_xbase && !chip->lpc_mbase))
 		return OPAL_PARAMETER;
 
 	lock(&chip->lpc_lock);
@@ -431,7 +488,7 @@ static int64_t __lpc_read(uint32_t chip_id, enum OpalLPCAddressType addr_type,
 	uint32_t opb_base;
 	int64_t rc;
 
-	if (!chip || !chip->lpc_xbase)
+	if (!chip || (!chip->lpc_xbase && !chip->lpc_mbase))
 		return OPAL_PARAMETER;
 
 	lock(&chip->lpc_lock);
@@ -504,7 +561,7 @@ static void lpc_setup_serirq(struct proc_chip *chip)
 
 	rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_IRQMASK, mask, 4);
 	if (rc) {
-		prerror("LPC: Failed to update irq mask\n");
+		prerror("Failed to update irq mask\n");
 		return;
 	}
 	DBG_IRQ("LPC: IRQ mask set to 0x%08x\n", mask);
@@ -514,7 +571,7 @@ static void lpc_setup_serirq(struct proc_chip *chip)
 	rc = opb_write(chip, opb_master_reg_base + OPB_MASTER_LS_IRQ_MASK,
 		       OPB_MASTER_IRQ_LPC, 4);
 	if (rc)
-		prerror("LPC: Failed to enable IRQs in OPB\n");
+		prerror("Failed to enable IRQs in OPB\n");
 
 	/* Check whether we should enable serirq */
 	if (mask & LPC_HC_IRQ_SERIRQ_ALL) {
@@ -527,18 +584,18 @@ static void lpc_setup_serirq(struct proc_chip *chip)
 		DBG_IRQ("LPC: SerIRQ disabled\n");
 	}
 	if (rc)
-		prerror("LPC: Failed to configure SerIRQ\n");
+		prerror("Failed to configure SerIRQ\n");
 	{
 		u32 val;
 		rc = opb_read(chip, lpc_reg_opb_base + LPC_HC_IRQMASK, &val, 4);
 		if (rc)
-			prerror("LPC: failed to readback mask");
+			prerror("Failed to readback mask");
 		else
 			DBG_IRQ("LPC: MASK READBACK=%x\n", val);
 
 		rc = opb_read(chip, lpc_reg_opb_base + LPC_HC_IRQSER_CTRL, &val, 4);
 		if (rc)
-			prerror("LPC: failed to readback ctrl");
+			prerror("Failed to readback ctrl");
 		else
 			DBG_IRQ("LPC: CTRL READBACK=%x\n", val);
 	}
@@ -551,7 +608,7 @@ static void lpc_init_interrupts(struct proc_chip *chip)
 	/* First mask them all */
 	rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_IRQMASK, 0, 4);
 	if (rc) {
-		prerror("LPC: Failed to init interrutps\n");
+		prerror("Failed to init interrutps\n");
 		return;
 	}
 
@@ -564,7 +621,7 @@ static void lpc_init_interrupts(struct proc_chip *chip)
 		rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_IRQMASK,
 			       LPC_HC_IRQ_BASE_IRQS, 4);
 		if (rc) {
-			prerror("LPC: Failed to set interrupt mask\n");
+			prerror("Failed to set interrupt mask\n");
 			return;
 		}
 		opb_write(chip, lpc_reg_opb_base + LPC_HC_IRQSER_CTRL, 0, 4);
@@ -595,7 +652,7 @@ static void lpc_dispatch_reset(struct proc_chip *chip)
 	 * on/off rather than just reset
 	 */
 
-	prerror("LPC: Got LPC reset !\n");
+	prerror("Got LPC reset!\n");
 
 	/* Collect serirq enable bits */
 	list_for_each(&chip->lpc_clients, ent, node) {
@@ -614,7 +671,10 @@ static void lpc_dispatch_reset(struct proc_chip *chip)
 static void lpc_dispatch_err_irqs(struct proc_chip *chip, uint32_t irqs)
 {
 	int rc;
+	struct opal_err_info *info;
+	const char *sync_err = "Unknown LPC error";
 	uint32_t err_addr;
+	static int lpc_bus_err_count;
 
 	/* Write back to clear error interrupts, we clear SerIRQ later
 	 * as they are handled as level interrupts
@@ -622,30 +682,38 @@ static void lpc_dispatch_err_irqs(struct proc_chip *chip, uint32_t irqs)
 	rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_IRQSTAT,
 		       LPC_HC_IRQ_BASE_IRQS, 4);
 	if (rc)
-		prerror("LPC: Failed to clear IRQ error latches !\n");
-
+		prerror("Failed to clear IRQ error latches !\n");
 
 	if (irqs & LPC_HC_IRQ_LRESET)
 		lpc_dispatch_reset(chip);
 	if (irqs & LPC_HC_IRQ_SYNC_ABNORM_ERR)
-		prerror("LPC: Got SYNC abnormal error\n");
+		sync_err = "LPC: Got SYNC abnormal error.";
 	if (irqs & LPC_HC_IRQ_SYNC_NORESP_ERR)
-		prerror("LPC: Got SYNC no-response error\n");
+		sync_err = "LPC: Got SYNC no-response error.";
 	if (irqs & LPC_HC_IRQ_SYNC_NORM_ERR)
-		prerror("LPC: Got SYNC normal error\n");
+		sync_err = "LPC: Got SYNC normal error.";
 	if (irqs & LPC_HC_IRQ_SYNC_TIMEOUT_ERR)
-		prerror("LPC: Got SYNC timeout error\n");
+		sync_err = "LPC: Got SYNC timeout error.";
 	if (irqs & LPC_HC_IRQ_TARG_TAR_ERR)
-		prerror("LPC: Got abnormal TAR error\n");
+		sync_err = "LPC: Got abnormal TAR error.";
 	if (irqs & LPC_HC_IRQ_BM_TAR_ERR)
-		prerror("LPC: Got bus master TAR error\n");
+		sync_err = "LPC: Got bus master TAR error.";
 
 	rc = opb_read(chip, lpc_reg_opb_base + LPC_HC_ERROR_ADDRESS,
 		      &err_addr, 4);
-	if (rc)
-		prerror("LPC: Error reading error address register\n");
+
+	lpc_bus_err_count++;
+	if (manufacturing_mode && (lpc_bus_err_count > LPC_BUS_DEGRADED_PERF_THRESHOLD))
+		info = &e_info(OPAL_RC_LPC_SYNC_PERF);
 	else
-		prerror("LPC: Error address reg: 0x%08x\n", err_addr);
+		info = &e_info(OPAL_RC_LPC_SYNC);
+
+	if (rc)
+		log_simple_error(info, "%s Error address: Unknown\n",
+					sync_err);
+	else
+		log_simple_error(info, "%s Error address: 0x%08x\n",
+					sync_err, err_addr);
 }
 
 static void lpc_dispatch_ser_irqs(struct proc_chip *chip, uint32_t irqs,
@@ -678,7 +746,7 @@ static void lpc_dispatch_ser_irqs(struct proc_chip *chip, uint32_t irqs,
 	rc = opb_write(chip, lpc_reg_opb_base + LPC_HC_IRQSTAT,
 		       irqs, 4);
 	if (rc)
-		prerror("LPC: Failed to clear SerIRQ latches !\n");
+		prerror("Failed to clear SerIRQ latches !\n");
 }
 
 void lpc_interrupt(uint32_t chip_id)
@@ -688,7 +756,7 @@ void lpc_interrupt(uint32_t chip_id)
 	int rc;
 
 	/* No initialized LPC controller on that chip */
-	if (!chip->lpc_xbase)
+	if (!chip || (!chip->lpc_xbase && !chip->lpc_mbase))
 		return;
 
 	lock(&chip->lpc_lock);
@@ -697,7 +765,7 @@ void lpc_interrupt(uint32_t chip_id)
 	rc = opb_read(chip, opb_master_reg_base + OPB_MASTER_LS_IRQ_STAT,
 		      &opb_irqs, 4);
 	if (rc) {
-		prerror("LPC: Failed to read OPB IRQ state\n");
+		prerror("Failed to read OPB IRQ state\n");
 		goto bail;
 	}
 
@@ -712,7 +780,7 @@ void lpc_interrupt(uint32_t chip_id)
 	/* Handle the lpc interrupt source (errors etc...) */
 	rc = opb_read(chip, lpc_reg_opb_base + LPC_HC_IRQSTAT, &irqs, 4);
 	if (rc) {
-		prerror("LPC: Failed to read LPC IRQ state\n");
+		prerror("Failed to read LPC IRQ state\n");
 		goto bail;
 	}
 
@@ -743,38 +811,80 @@ void lpc_all_interrupts(uint32_t chip_id)
 	unlock(&chip->lpc_lock);
 }
 
+static void lpc_init_chip_p8(struct dt_node *xn)
+ {
+	uint32_t gcid = dt_get_chip_id(xn);
+	struct proc_chip *chip;
+
+	chip = get_chip(gcid);
+	assert(chip);
+
+	chip->lpc_xbase = dt_get_address(xn, 0, NULL);
+	chip->lpc_fw_idsel = 0xff;
+	chip->lpc_fw_rdsz = 0xff;
+	init_lock(&chip->lpc_lock);
+
+	if (lpc_default_chip_id < 0 ||
+	    dt_has_node_property(xn, "primary", NULL)) {
+		lpc_default_chip_id = chip->id;
+	}
+
+	prlog(PR_NOTICE, "Bus on chip %d, access via XSCOM, PCB_Addr=0x%x\n",
+	      chip->id, chip->lpc_xbase);
+
+	lpc_init_interrupts(chip);
+	dt_add_property(xn, "interrupt-controller", NULL, 0);
+	dt_add_property_cells(xn, "#interrupt-cells", 1);
+	assert(dt_prop_get_u32(xn, "#address-cells") == 2);
+}
+
+static void lpc_init_chip_p9(struct dt_node *opb_node)
+{
+	uint32_t gcid = dt_get_chip_id(opb_node);
+	struct proc_chip *chip;
+	u64 addr;
+
+	chip = get_chip(gcid);
+	assert(chip);
+
+	/* Grab OPB base address */
+	addr = dt_prop_get_cell(opb_node, "ranges", 1);
+	addr <<= 32;
+	addr |= dt_prop_get_cell(opb_node, "ranges", 2);
+
+	chip->lpc_mbase = (void *)addr;
+	chip->lpc_fw_idsel = 0xff;
+	chip->lpc_fw_rdsz = 0xff;
+	init_lock(&chip->lpc_lock);
+
+	if (lpc_default_chip_id < 0 ||
+	    dt_has_node_property(opb_node, "primary", NULL)) {
+		lpc_default_chip_id = chip->id;
+	}
+
+	prlog(PR_NOTICE, "Bus on chip %d, access via MMIO @%p\n",
+	       chip->id, chip->lpc_mbase);
+
+	// XXX TODO
+	//lpc_init_interrupts(chip);
+}
+
 void lpc_init(void)
 {
 	struct dt_node *xn;
 	bool has_lpc = false;
 
 	dt_for_each_compatible(dt_root, xn, "ibm,power8-lpc") {
-		uint32_t gcid = dt_get_chip_id(xn);
-		struct proc_chip *chip;
-
-		chip = get_chip(gcid);
-		assert(chip);
-
-		chip->lpc_xbase = dt_get_address(xn, 0, NULL);
-		chip->lpc_fw_idsel = 0xff;
-		chip->lpc_fw_rdsz = 0xff;
-		init_lock(&chip->lpc_lock);
-
-		if (lpc_default_chip_id < 0 ||
-		    dt_has_node_property(xn, "primary", NULL)) {
-			lpc_default_chip_id = chip->id;
-		}
-
-		printf("LPC: Bus on chip %d PCB_Addr=0x%x\n",
-		       chip->id, chip->lpc_xbase);
+		lpc_init_chip_p8(xn);
 		has_lpc = true;
-
-		lpc_init_interrupts(chip);
-		if (chip->type == PROC_CHIP_P8_NAPLES)
-			dt_add_property(xn, "interrupt-controller", NULL, 0);
+	}
+	dt_for_each_compatible(dt_root, xn, "ibm,power9-lpcm-opb") {
+		lpc_init_chip_p9(xn);
+		has_lpc = true;
 	}
 	if (lpc_default_chip_id >= 0)
-		printf("LPC: Default bus on chip %d\n", lpc_default_chip_id);
+		prlog(PR_NOTICE, "Default bus on chip %d\n",
+					lpc_default_chip_id);
 
 	if (has_lpc) {
 		opal_register(OPAL_LPC_WRITE, opal_lpc_write, 5);

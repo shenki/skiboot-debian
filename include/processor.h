@@ -39,6 +39,7 @@
 #define MSR_LE		PPC_BIT(63)	/* Little Endian */
 
 /* PIR */
+#define SPR_PIR_P9_MASK		0x07ff	/* Mask of implemented bits */
 #define SPR_PIR_P8_MASK		0x1fff	/* Mask of implemented bits */
 #define SPR_PIR_P7_MASK		0x03ff	/* Mask of implemented bits */
 
@@ -95,6 +96,7 @@
 #define SPR_LPCR_P8_PECE2	PPC_BIT(49)   /* Wake on external interrupts */
 #define SPR_LPCR_P8_PECE3	PPC_BIT(50)   /* Wake on decrementer */
 #define SPR_LPCR_P8_PECE4	PPC_BIT(51)   /* Wake on MCs, HMIs, etc... */
+#define SPR_LPCR_P9_LD		PPC_BIT(46)   /* Large decrementer mode bit */
 
 
 /* Bits in TFMR - control bits */
@@ -161,8 +163,10 @@
 /* Bits in HID0 */
 #define SPR_HID0_POWER8_4LPARMODE	PPC_BIT(2)
 #define SPR_HID0_POWER8_2LPARMODE	PPC_BIT(6)
-#define SPR_HID0_HILE			PPC_BIT(19)
-#define SPR_HID0_ENABLE_ATTN		PPC_BIT(31)
+#define SPR_HID0_POWER8_HILE		PPC_BIT(19)
+#define SPR_HID0_POWER9_HILE		PPC_BIT(4)
+#define SPR_HID0_POWER8_ENABLE_ATTN	PPC_BIT(31)
+#define SPR_HID0_POWER9_ENABLE_ATTN	PPC_BIT(3)
 
 /* PVR bits */
 #define SPR_PVR_TYPE			0xffff0000
@@ -179,6 +183,7 @@
 #define PVR_TYPE_P8E	0x004b /* Murano */
 #define PVR_TYPE_P8	0x004d /* Venice */
 #define PVR_TYPE_P8NVL	0x004c /* Naples */
+#define PVR_TYPE_P9	0x004e
 
 #ifdef __ASSEMBLY__
 
@@ -230,7 +235,8 @@ static inline void mtmsrd(unsigned long val, int l)
 	asm volatile("mtmsrd %0,%1" : : "r"(val), "i"(l) : "memory");
 }
 
-static inline unsigned long mfspr(unsigned int spr)
+static inline __attribute__((always_inline))
+unsigned long mfspr(const unsigned int spr)
 {
 	unsigned long val;
 
@@ -238,7 +244,8 @@ static inline unsigned long mfspr(unsigned int spr)
 	return val;
 }
 
-static inline void mtspr(unsigned int spr, unsigned long val)
+static inline __attribute__((always_inline))
+void mtspr(const unsigned int spr, unsigned long val)
 {
 	asm volatile("mtspr %0,%1" : : "i"(spr), "r"(val) : "memory");
 }

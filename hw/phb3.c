@@ -13,25 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/*
- * PHB3 support
- *
- */
-
-/*
- *
- * FIXME:
- *   More stuff for EEH support:
- *      - PBCQ error reporting interrupt
- *	- I2C-based power management (replacing SHPC)
- *	- Directly detect fenced PHB through one dedicated HW reg
- */
-
 #include <skiboot.h>
 #include <io.h>
 #include <timebase.h>
-#include <pci.h>
 #include <pci-cfg.h>
+#include <pci.h>
+#include <pci-slot.h>
 #include <vpd.h>
 #include <interrupts.h>
 #include <opal.h>
@@ -60,24 +47,6 @@ static void phb3_init_hw(struct phb3 *p, bool first_init);
 #define PHBERR(p, fmt, a...)	prlog(PR_ERR, "PHB#%04x: " fmt, \
 				      (p)->phb.opal_id, ## a)
 
-/*
- * Lock callbacks. Allows the OPAL API handlers to lock the
- * PHB around calls such as config space, EEH, etc...
- */
-static void phb3_lock(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-
-	lock(&p->lock);
-}
-
-static  void phb3_unlock(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-
-	unlock(&p->lock);
-}
-
 /* Helper to select an IODA table entry */
 static inline void phb3_ioda_sel(struct phb3 *p, uint32_t table,
 				 uint32_t addr, bool autoinc)
@@ -86,19 +55,6 @@ static inline void phb3_ioda_sel(struct phb3 *p, uint32_t table,
 		 (autoinc ? PHB_IODA_AD_AUTOINC : 0)	|
 		 SETFIELD(PHB_IODA_AD_TSEL, 0ul, table)	|
 		 SETFIELD(PHB_IODA_AD_TADR, 0ul, addr));
-}
-
-/* Helper to set the state machine timeout */
-static inline uint64_t phb3_set_sm_timeout(struct phb3 *p, uint64_t dur)
-{
-	uint64_t target, now = mftb();
-
-	target = now + dur;
-	if (target == 0)
-		target++;
-	p->delay_tgt_tb = target;
-
-	return dur;
 }
 
 /* Check if AIB is fenced via PBCQ NFIR */
@@ -313,6 +269,11 @@ static uint8_t phb3_choose_bus(struct phb *phb __unused,
 	return candidate;
 }
 
+static int64_t phb3_get_reserved_pe_number(struct phb *phb __unused)
+{
+	return PHB3_RESERVED_PE_NUM;
+}
+
 static void phb3_root_port_init(struct phb *phb, struct pci_device *dev,
 				int ecap, int aercap)
 {
@@ -505,7 +466,7 @@ static void phb3_check_device_quirks(struct phb *phb, struct pci_device *dev)
 		 * adjust some settings for performances
 		 */
 		xscom_read(p->chip_id, p->pe_xscom + 0x0b, &modectl);
-		if (vendor == 0x15b3 &&
+		if (vendor == 0x15b3 &&		/* Mellanox */
 		    (device == 0x1003 ||	/* Travis3-EN (CX3) */
 		     device == 0x1011 ||	/* HydePark (ConnectIB) */
 		     device == 0x1013))	{	/* GlacierPark (CX4) */
@@ -518,7 +479,8 @@ static void phb3_check_device_quirks(struct phb *phb, struct pci_device *dev)
 
 		xscom_write(p->chip_id, p->pe_xscom + 0x0b, modectl);
 	} else if (dev->primary_bus == 0) {
-		if (vendor == 0x1014 && device == 0x03dc) {
+		if (vendor == 0x1014 &&		/* IBM */
+		    device == 0x03dc) {		/* P8/P8E/P8NVL Root port */
 			uint32_t pref_hi, tmp;
 
 			pci_cfg_read32(phb, dev->bdfn,
@@ -538,7 +500,9 @@ static void phb3_check_device_quirks(struct phb *phb, struct pci_device *dev)
 	}
 }
 
-static void phb3_device_init(struct phb *phb, struct pci_device *dev)
+static int phb3_device_init(struct phb *phb,
+			    struct pci_device *dev,
+			    void *data __unused)
 {
 	int ecap = 0;
 	int aercap = 0;
@@ -570,12 +534,15 @@ static void phb3_device_init(struct phb *phb, struct pci_device *dev)
 		phb3_switch_port_init(phb, dev, ecap, aercap);
 	else
 		phb3_endpoint_init(phb, dev, ecap, aercap);
+
+	return 0;
 }
 
 static int64_t phb3_pci_reinit(struct phb *phb, uint64_t scope, uint64_t data)
 {
 	struct pci_device *pd;
 	uint16_t bdfn = data;
+	int ret;
 
 	if (scope != OPAL_REINIT_PCI_DEV)
 		return OPAL_PARAMETER;
@@ -584,40 +551,11 @@ static int64_t phb3_pci_reinit(struct phb *phb, uint64_t scope, uint64_t data)
 	if (!pd)
 		return OPAL_PARAMETER;
 
-	phb3_device_init(phb, pd);
-	return OPAL_SUCCESS;
-}
-
-static int64_t phb3_presence_detect(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-	uint64_t hp_override;
-
-	/* Test for PHB in error state ? */
-	if (p->state == PHB3_STATE_BROKEN)
+	ret = phb3_device_init(phb, pd, NULL);
+	if (ret)
 		return OPAL_HARDWARE;
 
-	/* XXX Check bifurcation stuff ? */
-
-	/* Read hotplug override */
-	hp_override = in_be64(p->regs + PHB_HOTPLUG_OVERRIDE);
-
-	PHBDBG(p, "hp_override: 0x%016llx\n", hp_override);
-
-	/*
-	 * On P8, the slot status isn't wired up properly, we have to
-	 * use the hotplug override A/B bits.
-	 */
-	if ((hp_override & PHB_HPOVR_PRESENCE_A) &&
-	    (hp_override & PHB_HPOVR_PRESENCE_B))
-		return OPAL_SHPC_DEV_NOT_PRESENT;
-
-	/*
-	 * Anything else, we assume device present, the link state
-	 * machine will perform an early bail out if no electrical
-	 * signaling is established after a second.
-	 */
-	return OPAL_SHPC_DEV_PRESENT;
+	return OPAL_SUCCESS;
 }
 
 /* Clear IODA cache tables */
@@ -1221,7 +1159,7 @@ static int64_t phb3_pci_msi_eoi(struct phb *phb,
 	 * To avoid this race, we increment the generation count in
 	 * the IVT when we clear P. When software writes the IVC with
 	 * P cleared but with gen=n, the IVC won't actually clear P
-	 * becuase gen doesn't match what it just cached from the IVT.
+	 * because gen doesn't match what it just cached from the IVT.
 	 * Hence we don't lose P being set.
 	 */
 
@@ -1664,12 +1602,10 @@ static void phb3_read_phb_status(struct phb3 *p,
 	}
 }
 
-static int64_t phb3_msi_get_xive(void *data,
-				 uint32_t isn,
-				 uint16_t *server,
-				 uint8_t *prio)
+static int64_t phb3_msi_get_xive(struct irq_source *is, uint32_t isn,
+				 uint16_t *server, uint8_t *prio)
 {
-	struct phb3 *p = data;
+	struct phb3 *p = is->data;
 	uint32_t chip, index, irq;
 	uint64_t ive;
 
@@ -1693,12 +1629,10 @@ static int64_t phb3_msi_get_xive(void *data,
 	return OPAL_SUCCESS;
 }
 
-static int64_t phb3_msi_set_xive(void *data,
-				 uint32_t isn,
-				 uint16_t server,
-				 uint8_t prio)
+static int64_t phb3_msi_set_xive(struct irq_source *is, uint32_t isn,
+				 uint16_t server, uint8_t prio)
 {
-	struct phb3 *p = data;
+	struct phb3 *p = is->data;
 	uint32_t chip, index;
 	uint64_t *cache, ive_num, data64, m_server, m_prio, ivc;
 	uint32_t *ive;
@@ -1778,12 +1712,10 @@ static int64_t phb3_msi_set_xive(void *data,
 	return OPAL_SUCCESS;
 }
 
-static int64_t phb3_lsi_get_xive(void *data,
-				 uint32_t isn,
-				 uint16_t *server,
-				 uint8_t *prio)
+static int64_t phb3_lsi_get_xive(struct irq_source *is, uint32_t isn,
+				 uint16_t *server, uint8_t *prio)
 {
-	struct phb3 *p = data;
+	struct phb3 *p = is->data;
 	uint32_t chip, index, irq;
 	uint64_t lxive;
 
@@ -1804,12 +1736,10 @@ static int64_t phb3_lsi_get_xive(void *data,
 	return OPAL_SUCCESS;
 }
 
-static int64_t phb3_lsi_set_xive(void *data,
-				 uint32_t isn,
-				 uint16_t server,
-				 uint8_t prio)
+static int64_t phb3_lsi_set_xive(struct irq_source *is, uint32_t isn,
+				 uint16_t server, uint8_t prio)
 {
-	struct phb3 *p = data;
+	struct phb3 *p = is->data;
 	uint32_t chip, index, irq, entry;
 	uint64_t lxive;
 
@@ -1847,9 +1777,9 @@ static int64_t phb3_lsi_set_xive(void *data,
 	return OPAL_SUCCESS;
 }
 
-static void phb3_err_interrupt(void *data, uint32_t isn)
+static void phb3_err_interrupt(struct irq_source *is, uint32_t isn)
 {
-	struct phb3 *p = data;
+	struct phb3 *p = is->data;
 
 	PHBDBG(p, "Got interrupt 0x%08x\n", isn);
 
@@ -1998,139 +1928,145 @@ static int64_t phb3_set_peltv(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
-static int64_t phb3_link_state(struct phb *phb)
+static void phb3_prepare_link_change(struct pci_slot *slot,
+				     bool is_up)
 {
-	struct phb3 *p = phb_to_phb3(phb);
-	uint64_t reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
-	uint16_t lstat;
-	int64_t rc;
+	struct phb3 *p = phb_to_phb3(slot->phb);
+	uint32_t reg32;
 
-	/* XXX Test for PHB in error state ? */
+	p->has_link = is_up;
+	if (!is_up) {
+		/* Mask PCIE port interrupts */
+		out_be64(p->regs + UTL_PCIE_PORT_IRQ_EN,
+			 0xad42800000000000);
 
-	/* Link is up, let's find the actual speed */
-	if (!(reg & PHB_PCIE_DLP_TC_DL_LINKACT))
-		return OPAL_SHPC_LINK_DOWN;
+		/* Mask AER receiver error */
+		phb3_pcicfg_read32(&p->phb, 0,
+				   p->aercap + PCIECAP_AER_CE_MASK, &reg32);
+		reg32 |= PCIECAP_AER_CE_RECVR_ERR;
+		phb3_pcicfg_write32(&p->phb, 0,
+				    p->aercap + PCIECAP_AER_CE_MASK, reg32);
 
-	rc = phb3_pcicfg_read16(&p->phb, 0, p->ecap + PCICAP_EXP_LSTAT,
-				&lstat);
-	if (rc < 0) {
-		/* Shouldn't happen */
-		PHBERR(p, "Failed to read link status\n");
-		return OPAL_HARDWARE;
+		/* Block PCI-CFG access */
+		p->flags |= PHB3_CFG_BLOCKED;
+	} else {
+		/* Clear AER receiver error status */
+		phb3_pcicfg_write32(&p->phb, 0,
+				    p->aercap + PCIECAP_AER_CE_STATUS,
+				    PCIECAP_AER_CE_RECVR_ERR);
+
+		/* Unmask receiver error status in AER */
+		phb3_pcicfg_read32(&p->phb, 0,
+				   p->aercap + PCIECAP_AER_CE_MASK, &reg32);
+		reg32 &= ~PCIECAP_AER_CE_RECVR_ERR;
+		phb3_pcicfg_write32(&p->phb, 0,
+				    p->aercap + PCIECAP_AER_CE_MASK, reg32);
+
+		/* Clear spurrious errors and enable PCIE port interrupts */
+		out_be64(p->regs + UTL_PCIE_PORT_STATUS,
+			 0xffdfffffffffffff);
+		out_be64(p->regs + UTL_PCIE_PORT_IRQ_EN,
+			 0xad52800000000000);
+
+		/* Don't block PCI-CFG */
+		p->flags &= ~PHB3_CFG_BLOCKED;
+
+		/*
+		 * We might lose the bus numbers during the reset operation
+		 * and we need to restore them. Otherwise, some adapters (e.g.
+		 * IPR) can't be probed properly by the kernel. We don't need
+		 * to restore bus numbers for every kind of reset, however,
+		 * it's not harmful to always restore the bus numbers, which
+		 * simplifies the logic.
+		 */
+		pci_restore_bridge_buses(slot->phb, slot->pd);
+		if (slot->phb->ops->device_init)
+			pci_walk_dev(slot->phb, slot->pd,
+				     slot->phb->ops->device_init, NULL);
 	}
-	if (!(lstat & PCICAP_EXP_LSTAT_DLLL_ACT))
-		return OPAL_SHPC_LINK_DOWN;
-
-	return GETFIELD(PCICAP_EXP_LSTAT_WIDTH, lstat);
 }
 
-static int64_t phb3_power_state(struct phb __unused *phb)
+static int64_t phb3_get_presence_state(struct pci_slot *slot, uint8_t *val)
 {
-	/* XXX Test for PHB in error state ? */
-
-	/* XXX TODO - External power control ? */
-
-	return OPAL_SHPC_POWER_ON;
-}
-
-static int64_t phb3_slot_power_off(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
+	struct phb3 *p = phb_to_phb3(slot->phb);
+	uint64_t hp_override;
 
 	if (p->state == PHB3_STATE_BROKEN)
 		return OPAL_HARDWARE;
-	if (p->state != PHB3_STATE_FUNCTIONAL)
-		return OPAL_BUSY;
-
-	/* XXX TODO - External power control ? */
-
-	return OPAL_SUCCESS;
-}
-
-static int64_t phb3_slot_power_on(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-
-	if (p->state == PHB3_STATE_BROKEN)
-		return OPAL_HARDWARE;
-	if (p->state != PHB3_STATE_FUNCTIONAL)
-		return OPAL_BUSY;
-
-	/* XXX TODO - External power control ? */
-
-	return OPAL_SUCCESS;
-}
-
-static void phb3_setup_for_link_down(struct phb3 *p)
-{
-	uint32_t reg32;
-
-	/* Mark link down */
-	p->has_link = false;
-
-	/* Mask PCIE port interrupts */
-	out_be64(p->regs + UTL_PCIE_PORT_IRQ_EN, 0xad42800000000000);
-
-	/* Mask AER receiver error */
-	phb3_pcicfg_read32(&p->phb, 0, p->aercap + PCIECAP_AER_CE_MASK, &reg32);
-	reg32 |= PCIECAP_AER_CE_RECVR_ERR;
-	phb3_pcicfg_write32(&p->phb, 0, p->aercap + PCIECAP_AER_CE_MASK, reg32);
-}
-
-static void phb3_setup_for_link_up(struct phb3 *p)
-{
-	uint32_t reg32;
-	
-	/* Clear AER receiver error status */
-	phb3_pcicfg_write32(&p->phb, 0, p->aercap + PCIECAP_AER_CE_STATUS,
-			    PCIECAP_AER_CE_RECVR_ERR);
-	/* Unmask receiver error status in AER */
-	phb3_pcicfg_read32(&p->phb, 0, p->aercap + PCIECAP_AER_CE_MASK, &reg32);
-	reg32 &= ~PCIECAP_AER_CE_RECVR_ERR;
-	phb3_pcicfg_write32(&p->phb, 0, p->aercap + PCIECAP_AER_CE_MASK, reg32);
-
-	/* Clear spurrious errors and enable PCIE port interrupts */
-	out_be64(p->regs + UTL_PCIE_PORT_STATUS, 0xffdfffffffffffff);
-	out_be64(p->regs + UTL_PCIE_PORT_IRQ_EN, 0xad52800000000000);
-
-	/* Mark link up */
-	p->has_link = true;
-
-	/* Don't block PCI-CFG */
-	p->flags &= ~PHB3_CFG_BLOCKED;
 
 	/*
-	 * For complete reset, we might be required to restore
-	 * bus numbers for PCI bridges.
+	 * On P8, the slot status isn't wired up properly, we have
+	 * to use the hotplug override A/B bits.
 	 */
-	if (p->flags & PHB3_RESTORE_BUS_NUM) {
-		p->flags &= ~PHB3_RESTORE_BUS_NUM;
-		pci_restore_bridge_buses(&p->phb);
-	}
+	hp_override = in_be64(p->regs + PHB_HOTPLUG_OVERRIDE);
+	if ((hp_override & PHB_HPOVR_PRESENCE_A) &&
+	    (hp_override & PHB_HPOVR_PRESENCE_B))
+		*val = OPAL_PCI_SLOT_EMPTY;
+	else
+		*val = OPAL_PCI_SLOT_PRESENT;
+
+	return OPAL_SUCCESS;
 }
 
-static int64_t phb3_retry_state(struct phb3 *p)
+static int64_t phb3_get_link_state(struct pci_slot *slot, uint8_t *val)
 {
-	if (p->retry_state <= PHB3_STATE_FUNCTIONAL)
+	struct phb3 *p = phb_to_phb3(slot->phb);
+	uint64_t reg;
+	uint16_t state;
+	int64_t rc;
+
+	/* Link is up, let's find the actual speed */
+	reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
+	if (!(reg & PHB_PCIE_DLP_TC_DL_LINKACT)) {
+		*val = 0;
+		return OPAL_SUCCESS;
+	}
+
+	rc = phb3_pcicfg_read16(&p->phb, 0,
+				p->ecap + PCICAP_EXP_LSTAT, &state);
+	if (rc != OPAL_SUCCESS) {
+		PHBERR(p, "%s: Error %lld getting link state\n", __func__, rc);
+		return OPAL_HARDWARE;
+	}
+
+	if (state & PCICAP_EXP_LSTAT_DLLL_ACT)
+		*val = ((state & PCICAP_EXP_LSTAT_WIDTH) >> 4);
+	else
+		*val = 0;
+
+	return OPAL_SUCCESS;
+}
+
+static int64_t phb3_retry_state(struct pci_slot *slot)
+{
+	struct phb3 *p = phb_to_phb3(slot->phb);
+
+	if (slot->retry_state == PCI_SLOT_STATE_NORMAL)
 		return OPAL_WRONG_STATE;
 
-	p->delay_tgt_tb = 0;
-	p->state = p->retry_state;
-	return p->phb.ops->poll(&p->phb);
+	PHBDBG(p, "Retry state %08x\n", slot->retry_state);
+	slot->delay_tgt_tb = 0;
+	pci_slot_set_state(slot, slot->retry_state);
+	slot->retry_state = PCI_SLOT_STATE_NORMAL;
+	return slot->ops.poll(slot);
 }
 
-static int64_t phb3_sm_link_poll(struct phb3 *p)
+static int64_t phb3_poll_link(struct pci_slot *slot)
 {
-	int64_t rc;
+	struct phb3 *p = phb_to_phb3(slot->phb);
 	uint64_t reg;
+	int64_t rc;
 
-	/* This is the state machine to wait for the link to come
-	 * up. Currently we just wait until we timeout, eventually
-	 * we want to add retries and fallback to Gen1.
-	 */
-	switch(p->state) {
-	case PHB3_STATE_WAIT_LINK_ELECTRICAL:
-		/* Wait for the link electrical connection to be
+	switch (slot->state) {
+	case PHB3_SLOT_NORMAL:
+	case PHB3_SLOT_LINK_START:
+		PHBDBG(p, "LINK: Start polling\n");
+		slot->retries = PHB3_LINK_ELECTRICAL_RETRIES;
+		pci_slot_set_state(slot, PHB3_SLOT_LINK_WAIT_ELECTRICAL);
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+	case PHB3_SLOT_LINK_WAIT_ELECTRICAL:
+		/*
+		 * Wait for the link electrical connection to be
 		 * established (shorter timeout). This allows us to
 		 * workaround spurrious presence detect on some machines
 		 * without waiting 10s each time
@@ -2142,94 +2078,88 @@ static int64_t phb3_sm_link_poll(struct phb3 *p)
 		reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
 		if (reg & (PHB_PCIE_DLP_INBAND_PRESENCE |
 			   PHB_PCIE_DLP_TC_DL_LINKACT)) {
-			PHBDBG(p, "Electrical link detected...\n");
-			p->state = PHB3_STATE_WAIT_LINK;
-			p->retries = PHB3_LINK_WAIT_RETRIES;
-		} else if (p->retries-- == 0) {
-			PHBDBG(p, "Timeout waiting for electrical link\n");
-			PHBDBG(p, "DLP train control: 0x%016llx\n", reg);
-			rc = phb3_retry_state(p);
+			PHBDBG(p, "LINK: Electrical link detected\n");
+			pci_slot_set_state(slot, PHB3_SLOT_LINK_WAIT);
+			slot->retries = PHB3_LINK_WAIT_RETRIES;
+			return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+		}
+
+		if (slot->retries-- == 0) {
+			PHBDBG(p, "LINK: Timeout waiting for electrical link\n");
+			PHBDBG(p, "LINK: DLP train control: 0x%016llx\n", reg);
+			rc = phb3_retry_state(slot);
 			if (rc >= OPAL_SUCCESS)
 				return rc;
 
-			/* No link, we still mark the PHB as functional */
-			p->state = PHB3_STATE_FUNCTIONAL;
+			pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
 			return OPAL_SUCCESS;
 		}
-		return phb3_set_sm_timeout(p, msecs_to_tb(100));
-	case PHB3_STATE_WAIT_LINK:
-		/* XXX I used the PHB_PCIE_LINK_MANAGEMENT register here but
-		 *     simics doesn't seem to give me anything, so I've switched
-		 *     to PCIE_DLP_TRAIN_CTL which appears more reliable
-		 */
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+	case PHB3_SLOT_LINK_WAIT:
 		reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
 		if (reg & PHB_PCIE_DLP_TC_DL_LINKACT) {
-			/* Setup PHB for link up */
-			phb3_setup_for_link_up(p);
-			PHBDBG(p, "Link is up!\n");
-			p->state = PHB3_STATE_FUNCTIONAL;
+			PHBDBG(p, "LINK: Link is up\n");
+			if (slot->ops.prepare_link_change)
+				slot->ops.prepare_link_change(slot, true);
+			pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
 			return OPAL_SUCCESS;
 		}
-		if (p->retries-- == 0) {
-			PHBDBG(p, "Timeout waiting for link up\n");
-			PHBDBG(p, "DLP train control: 0x%016llx\n", reg);
-			rc = phb3_retry_state(p);
+
+		if (slot->retries-- == 0) {
+			PHBDBG(p, "LINK: Timeout waiting for link up\n");
+			PHBDBG(p, "LINK: DLP train control: 0x%016llx\n", reg);
+			rc = phb3_retry_state(slot);
 			if (rc >= OPAL_SUCCESS)
 				return rc;
 
-			/* No link, we still mark the PHB as functional */
-			p->state = PHB3_STATE_FUNCTIONAL;
+			pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
 			return OPAL_SUCCESS;
 		}
-		return phb3_set_sm_timeout(p, msecs_to_tb(100));
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
 	default:
-		/* How did we get here ? */
-		assert(false);
+		PHBERR(p, "LINK: Unexpected slot state %08x\n",
+		       slot->state);
 	}
+
+	pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
 	return OPAL_HARDWARE;
 }
 
-static int64_t phb3_start_link_poll(struct phb3 *p)
+static int64_t phb3_hreset(struct pci_slot *slot)
 {
-	/*
-	 * Wait for link up to 10s. However, we give up after
-	 * only two seconds if the electrical connection isn't
-	 * stablished according to the DLP link control register
-	 */
-	p->retries = PHB3_LINK_ELECTRICAL_RETRIES;
-	p->state = PHB3_STATE_WAIT_LINK_ELECTRICAL;
-	return phb3_set_sm_timeout(p, msecs_to_tb(100));
-}
-
-static int64_t phb3_sm_hot_reset(struct phb3 *p)
-{
+	struct phb3 *p = phb_to_phb3(slot->phb);
 	uint16_t brctl;
+	uint8_t presence = 1;
 
-	switch (p->state) {
-	case PHB3_STATE_FUNCTIONAL:
-		/* We need do nothing with available slot */
-		if (phb3_presence_detect(&p->phb) != OPAL_SHPC_DEV_PRESENT) {
-			PHBDBG(p, "Slot hreset: no device\n");
-			return OPAL_CLOSED;
+	switch (slot->state) {
+	case PHB3_SLOT_NORMAL:
+		PHBDBG(p, "HRESET: Starts\n");
+		if (slot->ops.get_presence_state)
+			slot->ops.get_presence_state(slot, &presence);
+		if (!presence) {
+			PHBDBG(p, "HRESET: No device\n");
+			return OPAL_SUCCESS;
 		}
 
-		/* Prepare for link going down */
-		phb3_setup_for_link_down(p);
+		PHBDBG(p, "HRESET: Prepare for link down\n");
+		if (slot->ops.prepare_link_change)
+			slot->ops.prepare_link_change(slot, false);
+		/* fall through */
+	case PHB3_SLOT_HRESET_START:
+		PHBDBG(p, "HRESET: Assert\n");
 
-		/* Turn on hot reset */
 		phb3_pcicfg_read16(&p->phb, 0, PCI_CFG_BRCTL, &brctl);
 		brctl |= PCI_CFG_BRCTL_SECONDARY_RESET;
 		phb3_pcicfg_write16(&p->phb, 0, PCI_CFG_BRCTL, brctl);
-		PHBDBG(p, "Slot hreset: assert reset\n");
+		pci_slot_set_state(slot, PHB3_SLOT_HRESET_DELAY);
 
-		p->state = PHB3_STATE_HRESET_DELAY;
-		return phb3_set_sm_timeout(p, secs_to_tb(1));
-	case PHB3_STATE_HRESET_DELAY:
-		/* Turn off hot reset */
+		return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+	case PHB3_SLOT_HRESET_DELAY:
+		PHBDBG(p, "HRESET: Deassert\n");
+
 		phb3_pcicfg_read16(&p->phb, 0, PCI_CFG_BRCTL, &brctl);
 		brctl &= ~PCI_CFG_BRCTL_SECONDARY_RESET;
 		phb3_pcicfg_write16(&p->phb, 0, PCI_CFG_BRCTL, brctl);
-		PHBDBG(p, "Slot hreset: deassert reset\n");
 
 		/*
 		 * Due to some oddball adapters bouncing the link
@@ -2238,116 +2168,77 @@ static int64_t phb3_sm_hot_reset(struct phb3 *p)
 		 * we can get a spurrious link down interrupt which
 		 * causes us to EEH immediately.
 		 */
-		p->state = PHB3_STATE_HRESET_DELAY2;
-		return phb3_set_sm_timeout(p, secs_to_tb(1));
-	case PHB3_STATE_HRESET_DELAY2:
-		return phb3_start_link_poll(p);
+		pci_slot_set_state(slot, PHB3_SLOT_HRESET_DELAY2);
+		return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+	case PHB3_SLOT_HRESET_DELAY2:
+		pci_slot_set_state(slot, PHB3_SLOT_LINK_START);
+		return slot->ops.poll_link(slot);
 	default:
-		PHBDBG(p, "Slot hreset: wrong state %d\n", p->state);
-		break;
+		PHBERR(p, "Unexpected slot state %08x\n", slot->state);
 	}
 
-	p->state = PHB3_STATE_FUNCTIONAL;
+	pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
 	return OPAL_HARDWARE;
 }
 
-static int64_t phb3_hot_reset(struct phb *phb)
+static int64_t phb3_pfreset(struct pci_slot *slot)
 {
-	struct phb3 *p = phb_to_phb3(phb);
-
-	if (p->state != PHB3_STATE_FUNCTIONAL) {
-		PHBDBG(p, "phb3_hot_reset: wrong state %d\n",
-		       p->state);
-		return OPAL_HARDWARE;
-	}
-
-	p->flags |= PHB3_CFG_BLOCKED;
-	return phb3_sm_hot_reset(p);
-}
-
-static int64_t phb3_sm_fundamental_reset(struct phb3 *p)
-{
+	struct phb3 *p = phb_to_phb3(slot->phb);
+	uint8_t presence = 1;
 	uint64_t reg;
 
+	switch(slot->state) {
+	case PHB3_SLOT_NORMAL:
+		PHBDBG(p, "PFRESET: Starts\n");
 
-	/*
-	 * Check if there's something connected. We do that here
-	 * instead of the switch case below because we want to do
-	 * that before we test the skip_perst
-	 */
-	if (p->state == PHB3_STATE_FUNCTIONAL &&
-	    phb3_presence_detect(&p->phb) != OPAL_SHPC_DEV_PRESENT) {
-		PHBDBG(p, "Slot freset: no device\n");
-		return OPAL_CLOSED;
-	}
-
-	/* Handle boot time skipping of reset */
-	if (p->skip_perst && p->state == PHB3_STATE_FUNCTIONAL) {
-		PHBDBG(p, "Cold boot, skipping PERST assertion\n");
-		p->state = PHB3_STATE_FRESET_ASSERT_DELAY;
-		/* PERST skipping happens only once */
-		p->skip_perst = false;
-	}
-
-	switch(p->state) {
-	case PHB3_STATE_FUNCTIONAL:
-		/* Prepare for link going down */
-		phb3_setup_for_link_down(p);
-		/* Fall-through */
-	case PHB3_STATE_FRESET_START:
-		if (p->state == PHB3_STATE_FRESET_START) {
-			PHBDBG(p, "Slot freset: Retrying\n");
-			p->retry_state = 0;
+		/* Nothing to do without adapter connected */
+		if (slot->ops.get_presence_state)
+			slot->ops.get_presence_state(slot, &presence);
+		if (!presence) {
+			PHBDBG(p, "PFRESET: No device\n");
+			return OPAL_SUCCESS;
 		}
 
-		/* Assert PERST */
-		reg = in_be64(p->regs + PHB_RESET);
-		reg &= ~0x2000000000000000ul;
-		out_be64(p->regs + PHB_RESET, reg);
-		PHBDBG(p, "Slot freset: Asserting PERST\n");
+		PHBDBG(p, "PFRESET: Prepare for link down\n");
+		slot->retry_state = PHB3_SLOT_PFRESET_START;
+		if (slot->ops.prepare_link_change)
+			slot->ops.prepare_link_change(slot, false);
+		/* fall through */
+	case PHB3_SLOT_PFRESET_START:
+		if (!p->skip_perst) {
+			PHBDBG(p, "PFRESET: Assert\n");
+			reg = in_be64(p->regs + PHB_RESET);
+			reg &= ~0x2000000000000000ul;
+			out_be64(p->regs + PHB_RESET, reg);
+			pci_slot_set_state(slot,
+				PHB3_SLOT_PFRESET_ASSERT_DELAY);
+			return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+		}
 
-		/* XXX Check delay for PERST... doing 1s for now */
-		p->state = PHB3_STATE_FRESET_ASSERT_DELAY;
-		return phb3_set_sm_timeout(p, secs_to_tb(1));
-
-	case PHB3_STATE_FRESET_ASSERT_DELAY:
-		/* Deassert PERST */
+		/* To skip the assert during boot time */
+		PHBDBG(p, "PFRESET: Assert skipped\n");
+		pci_slot_set_state(slot, PHB3_SLOT_PFRESET_ASSERT_DELAY);
+		p->skip_perst = false;
+		/* fall through */
+	case PHB3_SLOT_PFRESET_ASSERT_DELAY:
+		PHBDBG(p, "PFRESET: Deassert\n");
 		reg = in_be64(p->regs + PHB_RESET);
 		reg |= 0x2000000000000000ul;
 		out_be64(p->regs + PHB_RESET, reg);
-		PHBDBG(p, "Slot freset: Deasserting PERST\n");
+		pci_slot_set_state(slot,
+			PHB3_SLOT_PFRESET_DEASSERT_DELAY);
 
-		p->state = PHB3_STATE_FRESET_DEASSERT_DELAY;
-		/* CAPP fpga requires 1s to flash before polling link */
-		return phb3_set_sm_timeout(p, secs_to_tb(1));
-
-	case PHB3_STATE_FRESET_DEASSERT_DELAY:
-		/* Switch to generic link poll state machine */
-		return phb3_start_link_poll(p);
-
+		/* CAPP FPGA requires 1s to flash before polling link */
+		return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+	case PHB3_SLOT_PFRESET_DEASSERT_DELAY:
+		pci_slot_set_state(slot, PHB3_SLOT_HRESET_START);
+		return slot->ops.hreset(slot);
 	default:
-		PHBDBG(p, "Slot freset: wrong state %d\n",
-		       p->state);
-		break;
+		PHBERR(p, "Unexpected slot state %08x\n", slot->state);
 	}
 
-	p->state = PHB3_STATE_FUNCTIONAL;
+	pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
 	return OPAL_HARDWARE;
-}
-
-static int64_t phb3_fundamental_reset(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-
-	if (p->state != PHB3_STATE_FUNCTIONAL) {
-		PHBDBG(p, "phb3_fundamental_reset: wrong state %d\n", p->state);
-		return OPAL_HARDWARE;
-	}
-
-	/* Allow to retry fundamental reset */
-	p->retry_state = PHB3_STATE_FRESET_START;
-	p->flags |= PHB3_CFG_BLOCKED;
-	return phb3_sm_fundamental_reset(p);
 }
 
 struct lock capi_lock = LOCK_UNLOCKED;
@@ -2359,6 +2250,9 @@ static struct {
 } capp_ucode_info = { 0, NULL, 0, false };
 
 #define CAPP_UCODE_MAX_SIZE 0x20000
+
+#define CAPP_UCODE_LOADED(chip, p) \
+	 ((chip)->capp_ucode_loaded & (1 << (p)->index))
 
 static int64_t capp_lid_download(void)
 {
@@ -2392,11 +2286,15 @@ static int64_t capp_load_ucode(struct phb3 *p)
 	struct capp_ucode_data *data;
 	struct capp_lid_hdr *lid;
 	uint64_t rc, val, addr;
-	uint32_t chunk_count, offset;
+	uint32_t chunk_count, offset, reg_offset;
 	int i;
 
-	if (chip->capp_ucode_loaded)
+	if (CAPP_UCODE_LOADED(chip, p))
 		return OPAL_SUCCESS;
+
+	/* Return if PHB not attached to a CAPP unit */
+	if (p->index > PHB3_CAPP_MAX_PHB_INDEX(p))
+		return OPAL_HARDWARE;
 
 	rc = capp_lid_download();
 	if (rc)
@@ -2422,9 +2320,10 @@ static int64_t capp_load_ucode(struct phb3 *p)
 	if ((be64_to_cpu(ucode->eyecatcher) != 0x43415050554C4944) ||
 	    (ucode->version != 1)) {
 		PHBERR(p, "CAPP: ucode header invalid\n");
-		    return OPAL_HARDWARE;
+		return OPAL_HARDWARE;
 	}
 
+	reg_offset = PHB3_CAPP_REG_OFFSET(p);
 	offset = 0;
 	while (offset < be64_to_cpu(ucode->data_size)) {
 		data = (struct capp_ucode_data *)
@@ -2440,22 +2339,26 @@ static int64_t capp_load_ucode(struct phb3 *p)
 
 		switch (data->hdr.reg) {
 		case apc_master_cresp:
-			xscom_write(p->chip_id, CAPP_APC_MASTER_ARRAY_ADDR_REG,
+			xscom_write(p->chip_id,
+				    CAPP_APC_MASTER_ARRAY_ADDR_REG + reg_offset,
 				    0);
 			addr = CAPP_APC_MASTER_ARRAY_WRITE_REG;
 			break;
 		case apc_master_uop_table:
-			xscom_write(p->chip_id, CAPP_APC_MASTER_ARRAY_ADDR_REG,
+			xscom_write(p->chip_id,
+				    CAPP_APC_MASTER_ARRAY_ADDR_REG + reg_offset,
 				    0x180ULL << 52);
 			addr = CAPP_APC_MASTER_ARRAY_WRITE_REG;
 			break;
 		case snp_ttype:
-			xscom_write(p->chip_id, CAPP_SNP_ARRAY_ADDR_REG,
+			xscom_write(p->chip_id,
+				    CAPP_SNP_ARRAY_ADDR_REG + reg_offset,
 				    0x5000ULL << 48);
 			addr = CAPP_SNP_ARRAY_WRITE_REG;
 			break;
 		case snp_uop_table:
-			xscom_write(p->chip_id, CAPP_SNP_ARRAY_ADDR_REG,
+			xscom_write(p->chip_id,
+				    CAPP_SNP_ARRAY_ADDR_REG + reg_offset,
 				    0x4000ULL << 48);
 			addr = CAPP_SNP_ARRAY_WRITE_REG;
 			break;
@@ -2465,49 +2368,44 @@ static int64_t capp_load_ucode(struct phb3 *p)
 
 		for (i = 0; i < chunk_count; i++) {
 			val = be64_to_cpu(data->data[i]);
-			xscom_write(p->chip_id, addr, val);
+			xscom_write(p->chip_id, addr + reg_offset, val);
 		}
 	}
 
-	chip->capp_ucode_loaded = true;
+	chip->capp_ucode_loaded |= (1 << p->index);
 	return OPAL_SUCCESS;
 }
 
 static void do_capp_recovery_scoms(struct phb3 *p)
 {
 	uint64_t reg;
+	uint32_t offset;
+
 	PHBDBG(p, "Doing CAPP recovery scoms\n");
 
-	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG, 0); /* disable snoops */
+	offset = PHB3_CAPP_REG_OFFSET(p);
+	/* disable snoops */
+	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0);
 	capp_load_ucode(p);
-	xscom_write(p->chip_id, CAPP_ERR_RPT_CLR, 0); /* clear err rpt reg*/
-	xscom_write(p->chip_id, CAPP_FIR, 0); /* clear capp fir */
+	/* clear err rpt reg*/
+	xscom_write(p->chip_id, CAPP_ERR_RPT_CLR + offset, 0);
+	/* clear capp fir */
+	xscom_write(p->chip_id, CAPP_FIR + offset, 0);
 
-	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL, &reg);
+	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
 	reg &= ~(PPC_BIT(0) | PPC_BIT(1));
-	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL, reg);
+	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, reg);
 }
 
-/*
- * The OS is expected to do fundamental reset after complete
- * reset to make sure the PHB could be recovered from the
- * fenced state. However, the OS needn't do that explicitly
- * since fundamental reset will be done automatically while
- * powering on the PHB.
- *
- *
- * Usually, we need power off/on the PHB. That includes the
- * fundamental reset. However, we don't know how to control
- * the power stuff yet. So skip that and do fundamental reset
- * directly after reinitialization the hardware.
- */
-static int64_t phb3_sm_complete_reset(struct phb3 *p)
+static int64_t phb3_creset(struct pci_slot *slot)
 {
+	struct phb3 *p = phb_to_phb3(slot->phb);
 	uint64_t cqsts, val;
 
-	switch (p->state) {
-	case PHB3_STATE_FENCED:
-	case PHB3_STATE_FUNCTIONAL:
+	switch (slot->state) {
+	case PHB3_SLOT_NORMAL:
+	case PHB3_SLOT_CRESET_START:
+		PHBDBG(p, "CRESET: Starts\n");
 
 		/* do steps 3-5 of capp recovery procedure */
 		if (p->flags & PHB3_CAPP_RECOVERY)
@@ -2536,114 +2434,92 @@ static int64_t phb3_sm_complete_reset(struct phb3 *p)
 		xscom_read(p->chip_id, p->spci_xscom + 1, &val);/* HW275117 */
 		xscom_write(p->chip_id, p->pci_xscom + 0xa,
 			    0x8000000000000000);
-		p->state = PHB3_STATE_CRESET_WAIT_CQ;
-		p->retries = 500;
-		return phb3_set_sm_timeout(p, msecs_to_tb(10));
-	case PHB3_STATE_CRESET_WAIT_CQ:
+		pci_slot_set_state(slot, PHB3_SLOT_CRESET_WAIT_CQ);
+		slot->retries = 500;
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(10));
+	case PHB3_SLOT_CRESET_WAIT_CQ:
 		xscom_read(p->chip_id, p->pe_xscom + 0x1c, &val);
 		xscom_read(p->chip_id, p->pe_xscom + 0x1d, &val);
 		xscom_read(p->chip_id, p->pe_xscom + 0x1e, &val);
 		xscom_read(p->chip_id, p->pe_xscom + 0xf, &cqsts);
 		if (!(cqsts & 0xC000000000000000)) {
+			PHBDBG(p, "CRESET: No pending transactions\n");
 			xscom_write(p->chip_id, p->pe_xscom + 0x1, ~p->nfir_cache);
 
-			p->state = PHB3_STATE_CRESET_REINIT;
-			return phb3_set_sm_timeout(p, msecs_to_tb(100));
+			pci_slot_set_state(slot, PHB3_SLOT_CRESET_REINIT);
+			return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
 		}
 
-		if (p->retries-- == 0) {
+		if (slot->retries-- == 0) {
 			PHBERR(p, "Timeout waiting for pending transaction\n");
 			goto error;
 		}
-		return phb3_set_sm_timeout(p, msecs_to_tb(10));
-	case PHB3_STATE_CRESET_REINIT:
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(10));
+	case PHB3_SLOT_CRESET_REINIT:
+		PHBDBG(p, "CRESET: Reinitialization\n");
+
+		/*
+		 * Clear AIB fenced state. Otherwise, we can't access the
+		 * PCI config space of root complex when reinitializing
+		 * the PHB.
+		 */
 		p->flags &= ~PHB3_AIB_FENCED;
 		p->flags &= ~PHB3_CAPP_RECOVERY;
 		phb3_init_hw(p, false);
 
-		p->state = PHB3_STATE_CRESET_FRESET;
-		return phb3_set_sm_timeout(p, msecs_to_tb(100));
-	case PHB3_STATE_CRESET_FRESET:
-		p->state = PHB3_STATE_FUNCTIONAL;
-		p->flags |= PHB3_CFG_BLOCKED;
-		return phb3_sm_fundamental_reset(p);
+		pci_slot_set_state(slot, PHB3_SLOT_CRESET_FRESET);
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+	case PHB3_SLOT_CRESET_FRESET:
+		pci_slot_set_state(slot, PHB3_SLOT_NORMAL);
+		return slot->ops.freset(slot);
 	default:
-		assert(false);
+		PHBERR(p, "CRESET: Unexpected slot state %08x\n",
+		       slot->state);
 	}
 
 	/* Mark the PHB as dead and expect it to be removed */
 error:
 	p->state = PHB3_STATE_BROKEN;
-	return OPAL_PARAMETER;
-}
-
-static int64_t phb3_complete_reset(struct phb *phb, uint8_t assert)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-
-	if ((assert == OPAL_ASSERT_RESET &&
-	    p->state != PHB3_STATE_FUNCTIONAL &&
-	    p->state != PHB3_STATE_FENCED) ||
-	    (assert == OPAL_DEASSERT_RESET &&
-	    p->state != PHB3_STATE_FUNCTIONAL)) {
-		PHBERR(p, "phb3_creset: wrong state %d\n",
-		       p->state);
-		return OPAL_HARDWARE;
-	}
-
-	/* Block PCI-CFG access */
-	p->flags |= PHB3_CFG_BLOCKED;
-
-	if (assert == OPAL_ASSERT_RESET) {
-		PHBINF(p, "Starting PHB reset sequence\n");
-		return phb3_sm_complete_reset(p);
-	} else {
-		/* Restore bus numbers for bridges */
-		p->flags |= PHB3_RESTORE_BUS_NUM;
-
-		return phb3_sm_hot_reset(p);
-	}
-}
-
-static int64_t phb3_poll(struct phb *phb)
-{
-	struct phb3 *p = phb_to_phb3(phb);
-	uint64_t now = mftb();
-
-	if (p->state == PHB3_STATE_FUNCTIONAL)
-		return OPAL_SUCCESS;
-
-	/* Check timer */
-	if (p->delay_tgt_tb &&
-	    tb_compare(now, p->delay_tgt_tb) == TB_ABEFOREB)
-		return p->delay_tgt_tb - now;
-
-	/* Expired (or not armed), clear it */
-	p->delay_tgt_tb = 0;
-
-	/* Dispatch to the right state machine */
-	switch(p->state) {
-	case PHB3_STATE_HRESET_DELAY:
-	case PHB3_STATE_HRESET_DELAY2:
-		return phb3_sm_hot_reset(p);
-	case PHB3_STATE_FRESET_START:
-	case PHB3_STATE_FRESET_ASSERT_DELAY:
-	case PHB3_STATE_FRESET_DEASSERT_DELAY:
-		return phb3_sm_fundamental_reset(p);
-	case PHB3_STATE_CRESET_WAIT_CQ:
-	case PHB3_STATE_CRESET_REINIT:
-	case PHB3_STATE_CRESET_FRESET:
-		return phb3_sm_complete_reset(p);
-	case PHB3_STATE_WAIT_LINK_ELECTRICAL:
-	case PHB3_STATE_WAIT_LINK:
-		return phb3_sm_link_poll(p);
-	default:
-		PHBDBG(p, "phb3_poll: wrong state %d\n", p->state);
-		break;
-	}
-
-	/* Unknown state, could be a HW error */
 	return OPAL_HARDWARE;
+}
+
+/*
+ * Initialize root complex slot, which is mainly used to
+ * do fundamental reset before PCI enumeration in PCI core.
+ * When probing root complex and building its real slot,
+ * the operations will be copied over.
+ */
+static struct pci_slot *phb3_slot_create(struct phb *phb)
+{
+	struct pci_slot *slot;
+
+	slot = pci_slot_alloc(phb, NULL);
+	if (!slot)
+		return slot;
+
+	/* Elementary functions */
+	slot->ops.get_presence_state  = phb3_get_presence_state;
+	slot->ops.get_link_state      = phb3_get_link_state;
+	slot->ops.get_power_state     = NULL;
+	slot->ops.get_attention_state = NULL;
+	slot->ops.get_latch_state     = NULL;
+	slot->ops.set_power_state     = NULL;
+	slot->ops.set_attention_state = NULL;
+
+	/*
+	 * For PHB slots, we have to split the fundamental reset
+	 * into 2 steps. We might not have the first step which
+	 * is to power off/on the slot, or it's controlled by
+	 * individual platforms.
+	 */
+	slot->ops.prepare_link_change	= phb3_prepare_link_change;
+	slot->ops.poll_link		= phb3_poll_link;
+	slot->ops.hreset		= phb3_hreset;
+	slot->ops.freset		= phb3_pfreset;
+	slot->ops.pfreset		= phb3_pfreset;
+	slot->ops.creset		= phb3_creset;
+
+	return slot;
 }
 
 static int64_t phb3_eeh_freeze_status(struct phb *phb, uint64_t pe_number,
@@ -3323,13 +3199,33 @@ static int64_t phb3_get_diag_data(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
-static void phb3_init_capp_regs(struct phb3 *p)
+static void phb3_init_capp_regs(struct phb3 *p, bool dma_mode)
 {
 	uint64_t reg;
+	uint32_t offset;
+	uint64_t read_buffers = 0;
 
-	xscom_read(p->chip_id, APC_MASTER_PB_CTRL, &reg);
+	offset = PHB3_CAPP_REG_OFFSET(p);
+	xscom_read(p->chip_id, APC_MASTER_PB_CTRL + offset, &reg);
+	reg &= ~PPC_BITMASK(10, 11);
 	reg |= PPC_BIT(3);
-	xscom_write(p->chip_id, APC_MASTER_PB_CTRL, reg);
+	if (dma_mode) {
+		/* In DMA mode, the CAPP only owns some of the PHB read buffers */
+		read_buffers = 0x1;
+
+		/*
+		 * HW301991 - XSL sends PTE updates with nodal scope instead of
+		 * group scope. The workaround is to force all commands to
+		 * unlimited scope by setting bit 4. This may have a slight
+		 * performance impact, but it would be negligible on the XSL.
+		 * To avoid the possibility it might impact other cards, key it
+		 * off DMA mode since the XSL based Mellanox CX4 is the only
+		 * card to use this mode in P8 timeframe:
+		 */
+		reg |= PPC_BIT(4);
+	}
+	reg |= read_buffers << PPC_BITLSHIFT(11);
+	xscom_write(p->chip_id, APC_MASTER_PB_CTRL + offset, reg);
 
 	/* Dynamically workout which PHB to connect to port 0 of the CAPP.
 	 * Here is the table from the CAPP workbook:
@@ -3348,95 +3244,60 @@ static void phb3_init_capp_regs(struct phb3 *p)
 	 *    PHB0 -> APC MASTER(bits 1:3) = 0b100
 	 *    PHB1 -> APC MASTER(bits 1:3) = 0b010
 	 *    PHB2 -> APC MASTER(bits 1:3) = 0b001
+	 *
+	 * Note: Naples has two CAPP units, statically mapped:
+	 *    CAPP0/PHB0 -> APC MASTER(bits 1:3) = 0b100
+	 *    CAPP1/PHB1 -> APC MASTER(bits 1:3) = 0b010
 	 */
 	reg = 0x4000000000000000ULL >> p->index;
 	reg |= 0x0070000000000000;
-	xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL,reg);
+	xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL + offset, reg);
 	PHBINF(p, "CAPP: port attached\n");
 
 	/* tlb and mmio */
-	xscom_write(p->chip_id, TRANSPORT_CONTROL, 	0x4028000104000000);
+	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x4028000104000000);
 
-	xscom_write(p->chip_id, CANNED_PRESP_MAP0, 	0);
-	xscom_write(p->chip_id, CANNED_PRESP_MAP1, 	0xFFFFFFFF00000000);
-	xscom_write(p->chip_id, CANNED_PRESP_MAP2, 	0);
+	xscom_write(p->chip_id, CANNED_PRESP_MAP0 + offset, 0);
+	xscom_write(p->chip_id, CANNED_PRESP_MAP1 + offset, 0xFFFFFFFF00000000);
+	xscom_write(p->chip_id, CANNED_PRESP_MAP2 + offset, 0);
 
 	/* error recovery */
-	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL,  	0);
+	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, 0);
 
-	xscom_write(p->chip_id, FLUSH_SUE_STATE_MAP,   	0x1DC20B6600000000);
-	xscom_write(p->chip_id, CAPP_EPOCH_TIMER_CTRL, 	0xC0000000FFF0FFE0);
-	xscom_write(p->chip_id, FLUSH_UOP_CONFIG1, 	0xB188280728000000);
-	xscom_write(p->chip_id, FLUSH_UOP_CONFIG2, 	0xB188400F00000000);
-	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG, 	0xA1F0000000000000);
+	xscom_write(p->chip_id, FLUSH_SUE_STATE_MAP + offset,
+		    0x1DC20B6600000000);
+	xscom_write(p->chip_id, CAPP_EPOCH_TIMER_CTRL + offset,
+		    0xC0000000FFF0FFE0);
+	xscom_write(p->chip_id,  FLUSH_UOP_CONFIG1 + offset,
+		    0xB188280728000000);
+	xscom_write(p->chip_id, FLUSH_UOP_CONFIG2 + offset, 0xB188400F00000000);
+
+	reg = 0xA1F0000000000000;
+	reg |= read_buffers << PPC_BITLSHIFT(39);
+	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, reg);
 }
 
 /* override some inits with CAPI defaults */
 static void phb3_init_capp_errors(struct phb3 *p)
 {
-	out_be64(p->regs + PHB_ERR_AIB_FENCE_ENABLE,       0xffffffdd0c80ffc0);
+	out_be64(p->regs + PHB_ERR_AIB_FENCE_ENABLE,       0xffffffdd8c80ffc0);
 	out_be64(p->regs + PHB_OUT_ERR_AIB_FENCE_ENABLE,   0x9cf3fe08f8dc700f);
 	out_be64(p->regs + PHB_INA_ERR_AIB_FENCE_ENABLE,   0xffff57fbff01ffde);
 	out_be64(p->regs + PHB_INB_ERR_AIB_FENCE_ENABLE,   0xfcffe0fbff7ff0ec);
+	out_be64(p->regs + PHB_LEM_ERROR_MASK,		   0x40018e2400022482);
 }
 
-static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
-				  uint64_t pe_number)
+#define PE_CAPP_EN 0x9013c03
+
+#define PE_REG_OFFSET(p) \
+	((PHB3_IS_NAPLES(p) && (p)->index) ? 0x40 : 0x0)
+
+static int64_t enable_capi_mode(struct phb3 *p, uint64_t pe_number, bool dma_mode)
 {
-	struct phb3 *p = phb_to_phb3(phb);
-	struct proc_chip *chip = get_chip(p->chip_id);
 	uint64_t reg;
 	int i;
-	u8 mask;
 
-	if (!chip->capp_ucode_loaded) {
-		PHBERR(p, "CAPP: ucode not loaded\n");
-		return OPAL_RESOURCE;
-	}
-
-	/*
-	 * Check if CAPP port is being used by any another PHB.
-	 * Check and set chip->capp_phb3_attached_mask atomically incase
-	 * two phb3_set_capi_mode() calls race.
-	 */
-	lock(&capi_lock);
-	mask = ~(1 << p->index);
-	if (chip->capp_phb3_attached_mask & mask) {
-		PHBERR(p, "CAPP: port already in use by another PHB:%x\n",
-			chip->capp_phb3_attached_mask);
-		unlock(&capi_lock);
-		return false;
-	}
-	chip->capp_phb3_attached_mask = 1 << p->index;
-	unlock(&capi_lock);
-
-	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL, &reg);
-	if ((reg & PPC_BIT(5))) {
-		PHBERR(p, "CAPP: recovery failed (%016llx)\n", reg);
-		return OPAL_HARDWARE;
-	} else if ((reg & PPC_BIT(0)) && (!(reg & PPC_BIT(1)))) {
-		PHBDBG(p, "CAPP: recovery in progress\n");
-		return OPAL_BUSY;
-	}
-
-	if (mode == OPAL_PHB_CAPI_MODE_PCIE)
-		return OPAL_UNSUPPORTED;
-
-	if (mode == OPAL_PHB_CAPI_MODE_SNOOP_OFF) {
-		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG, 	0x0000000000000000);
-		return OPAL_SUCCESS;
-	}
-
-	if (mode == OPAL_PHB_CAPI_MODE_SNOOP_ON) {
-		xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL,  	0x0000000000000000);
-		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG, 	0xA1F0000000000000);
-		return OPAL_SUCCESS;
-	}
-
-	if (mode != OPAL_PHB_CAPI_MODE_CAPI)
-		return OPAL_UNSUPPORTED;
-
-	xscom_read(p->chip_id, 0x9013c03, &reg);
+	xscom_read(p->chip_id, PE_CAPP_EN + PE_REG_OFFSET(p), &reg);
 	if (reg & PPC_BIT(0)) {
 		PHBDBG(p, "Already in CAPP mode\n");
 	}
@@ -3453,7 +3314,12 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 		return OPAL_HARDWARE;
 	}
 
-	xscom_write(p->chip_id, p->spci_xscom + 0x3, 0x8000000000000000ull);
+	/* pb aib capp enable */
+	reg = PPC_BIT(0); /* capp enable */
+	if (dma_mode)
+		reg |= PPC_BIT(1); /* capp dma mode */
+	xscom_write(p->chip_id, p->spci_xscom + 0x3, reg);
+
 	/* FIXME security timer bar
 	xscom_write(p->chip_id, p->spci_xscom + 0x4, 0x8000000000000000ull);
 	*/
@@ -3479,8 +3345,17 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 
 	/* aib tx cmd cred */
 	xscom_read(p->chip_id, p->pci_xscom + 0xd, &reg);
-	reg &= ~PPC_BITMASK(42,46);
-	reg |= PPC_BIT(47);
+	if (dma_mode) {
+		/*
+		 * In DMA mode, increase AIB credit value for ch 2 (DMA read)
+		 * for performance reasons
+		 */
+		reg &= ~PPC_BITMASK(42, 47);
+		reg |= PPC_BITMASK(43, 45);
+	} else {
+		reg &= ~PPC_BITMASK(42, 46);
+		reg |= PPC_BIT(47);
+	}
 	xscom_write(p->chip_id, p->pci_xscom + 0xd, reg);
 
 	xscom_write(p->chip_id, p->pci_xscom + 0xc, 0xff00000000000000ull);
@@ -3492,8 +3367,16 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 
 	/* set tve no translate mode allow mmio window */
 	memset(p->tve_cache, 0x0, sizeof(p->tve_cache));
-	/* Allow address range 0x0002000000000000: 0x0002FFFFFFFFFFF */
-	p->tve_cache[pe_number * 2] = 0x000000FFFFFF0a00ULL;
+	if (dma_mode) {
+		/*
+		 * CAPP DMA mode needs access to all of memory, set address
+		 * range to 0x0000000000000000: 0x0002FFFFFFFFFFF
+		 */
+		p->tve_cache[pe_number * 2] = 0x000000FFFFFF0200ULL;
+	} else {
+		/* Allow address range 0x0002000000000000: 0x0002FFFFFFFFFFF */
+		p->tve_cache[pe_number * 2] = 0x000000FFFFFF0a00ULL;
+	}
 
 	phb3_ioda_sel(p, IODA2_TBL_TVT, 0, true);
 	for (i = 0; i < ARRAY_SIZE(p->tve_cache); i++)
@@ -3520,14 +3403,95 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 
 	phb3_init_capp_errors(p);
 
-	phb3_init_capp_regs(p);
+	phb3_init_capp_regs(p, dma_mode);
 
-	if (!chiptod_capp_timebase_sync(p->chip_id)) {
+	if (!chiptod_capp_timebase_sync(p)) {
 		PHBERR(p, "CAPP: Failed to sync timebase\n");
 		return OPAL_HARDWARE;
 	}
 
 	return OPAL_SUCCESS;
+}
+
+static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
+				  uint64_t pe_number)
+{
+	struct phb3 *p = phb_to_phb3(phb);
+	struct proc_chip *chip = get_chip(p->chip_id);
+	uint64_t reg;
+	uint64_t read_buffers;
+	uint32_t offset;
+	u8 mask;
+
+	if (!CAPP_UCODE_LOADED(chip, p)) {
+		PHBERR(p, "CAPP: ucode not loaded\n");
+		return OPAL_RESOURCE;
+	}
+
+	lock(&capi_lock);
+	if (PHB3_IS_NAPLES(p)) {
+		/* Naples has two CAPP units, statically mapped. */
+		chip->capp_phb3_attached_mask |= 1 << p->index;
+	} else {
+		/*
+		* Check if CAPP port is being used by any another PHB.
+		* Check and set chip->capp_phb3_attached_mask atomically
+		* incase two phb3_set_capi_mode() calls race.
+		*/
+		mask = ~(1 << p->index);
+		if (chip->capp_phb3_attached_mask & mask) {
+			PHBERR(p,
+			       "CAPP: port already in use by another PHB:%x\n",
+			       chip->capp_phb3_attached_mask);
+			unlock(&capi_lock);
+			return false;
+		}
+		chip->capp_phb3_attached_mask = 1 << p->index;
+	}
+	unlock(&capi_lock);
+
+	offset = PHB3_CAPP_REG_OFFSET(p);
+	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
+	if ((reg & PPC_BIT(5))) {
+		PHBERR(p, "CAPP: recovery failed (%016llx)\n", reg);
+		return OPAL_HARDWARE;
+	} else if ((reg & PPC_BIT(0)) && (!(reg & PPC_BIT(1)))) {
+		PHBDBG(p, "CAPP: recovery in progress\n");
+		return OPAL_BUSY;
+	}
+
+	switch (mode) {
+	case OPAL_PHB_CAPI_MODE_PCIE:
+		return OPAL_UNSUPPORTED;
+
+	case OPAL_PHB_CAPI_MODE_CAPI:
+		return enable_capi_mode(p, pe_number, false);
+
+	case OPAL_PHB_CAPI_MODE_DMA:
+		return enable_capi_mode(p, pe_number, true);
+
+	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
+		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset,
+			    0x0000000000000000);
+		return OPAL_SUCCESS;
+
+	case OPAL_PHB_CAPI_MODE_SNOOP_ON:
+		xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset,
+			    0x0000000000000000);
+		/*
+		 * Make sure the PHB read buffers being snooped match those
+		 * being used so we don't need another mode to set SNOOP+DMA
+		 */
+		xscom_read(p->chip_id, APC_MASTER_PB_CTRL + offset, &reg);
+		read_buffers = (reg >> PPC_BITLSHIFT(11)) & 0x3;
+		reg = 0xA1F0000000000000;
+		reg |= read_buffers << PPC_BITLSHIFT(39);
+		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, reg);
+
+		return OPAL_SUCCESS;
+	}
+
+	return OPAL_UNSUPPORTED;
 }
 
 static int64_t phb3_set_capp_recovery(struct phb *phb)
@@ -3547,8 +3511,6 @@ static int64_t phb3_set_capp_recovery(struct phb *phb)
 }
 
 static const struct phb_ops phb3_ops = {
-	.lock			= phb3_lock,
-	.unlock			= phb3_unlock,
 	.cfg_read8		= phb3_pcicfg_read8,
 	.cfg_read16		= phb3_pcicfg_read16,
 	.cfg_read32		= phb3_pcicfg_read32,
@@ -3556,8 +3518,8 @@ static const struct phb_ops phb3_ops = {
 	.cfg_write16		= phb3_pcicfg_write16,
 	.cfg_write32		= phb3_pcicfg_write32,
 	.choose_bus		= phb3_choose_bus,
+	.get_reserved_pe_number	= phb3_get_reserved_pe_number,
 	.device_init		= phb3_device_init,
-	.presence_detect	= phb3_presence_detect,
 	.ioda_reset		= phb3_ioda_reset,
 	.papr_errinjct_reset	= phb3_papr_errinjct_reset,
 	.pci_reinit		= phb3_pci_reinit,
@@ -3572,14 +3534,6 @@ static const struct phb_ops phb3_ops = {
 	.get_msi_64		= phb3_get_msi_64,
 	.set_pe			= phb3_set_pe,
 	.set_peltv		= phb3_set_peltv,
-	.link_state		= phb3_link_state,
-	.power_state		= phb3_power_state,
-	.slot_power_off		= phb3_slot_power_off,
-	.slot_power_on		= phb3_slot_power_on,
-	.hot_reset		= phb3_hot_reset,
-	.fundamental_reset	= phb3_fundamental_reset,
-	.complete_reset		= phb3_complete_reset,
-	.poll			= phb3_poll,
 	.eeh_freeze_status	= phb3_eeh_freeze_status,
 	.eeh_freeze_clear	= phb3_eeh_freeze_clear,
 	.eeh_freeze_set		= phb3_eeh_freeze_set,
@@ -4154,7 +4108,7 @@ static void phb3_init_hw(struct phb3 *p, bool first_init)
 	out_be64(p->regs + PHB_OUT_ERR_IRQ_ENABLE, 0x600c42fc042080f0);
 	out_be64(p->regs + PHB_INA_ERR_IRQ_ENABLE, 0xc000a3a901826020);
 	out_be64(p->regs + PHB_INB_ERR_IRQ_ENABLE, 0x0000600000800070);
-	out_be64(p->regs + PHB_LEM_ERROR_MASK,	   0x42498e327f502eae);
+	out_be64(p->regs + PHB_LEM_ERROR_MASK,	   0x42498e367f502eae);
 
 	/*
 	 * Init_141 - Enable DMA address speculation
@@ -4296,11 +4250,15 @@ static void phb3_add_properties(struct phb3 *p)
 	 * PCI code based on the content of this structure:
 	 */
 	lsibase = p->base_lsi;
-	p->phb.lstate.int_size = 1;
+	p->phb.lstate.int_size = 2;
 	p->phb.lstate.int_val[0][0] = lsibase + PHB3_LSI_PCIE_INTA;
+	p->phb.lstate.int_val[0][1] = 1;
 	p->phb.lstate.int_val[1][0] = lsibase + PHB3_LSI_PCIE_INTB;
+	p->phb.lstate.int_val[1][1] = 1;
 	p->phb.lstate.int_val[2][0] = lsibase + PHB3_LSI_PCIE_INTC;
+	p->phb.lstate.int_val[2][1] = 1;
 	p->phb.lstate.int_val[3][0] = lsibase + PHB3_LSI_PCIE_INTD;
+	p->phb.lstate.int_val[3][1] = 1;
 	p->phb.lstate.int_parent[0] = icsp;
 	p->phb.lstate.int_parent[1] = icsp;
 	p->phb.lstate.int_parent[2] = icsp;
@@ -4369,6 +4327,7 @@ static void phb3_create(struct dt_node *np)
 {
 	const struct dt_property *prop;
 	struct phb3 *p = zalloc(sizeof(struct phb3));
+	struct pci_slot *slot;
 	size_t lane_eq_len;
 	struct dt_node *iplp;
 	struct proc_chip *chip;
@@ -4434,6 +4393,9 @@ static void phb3_create(struct dt_node *np)
 	else
 		opal_id = p->chip_id * 4 + p->index;
 	pci_register_phb(&p->phb, opal_id);
+	slot = phb3_slot_create(&p->phb);
+	if (!slot)
+		PHBERR(p, "Cannot create PHB slot\n");
 
 	/* Hello ! */
 	path = dt_get_path(np);
@@ -4773,3 +4735,4 @@ void probe_phb3(void)
 	dt_for_each_compatible(dt_root, np, "ibm,power8-pciex")
 		phb3_create(np);
 }
+

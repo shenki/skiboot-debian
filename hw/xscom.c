@@ -69,9 +69,11 @@ static inline void *xscom_addr(uint32_t gcid, uint32_t pcb_addr)
 
 	assert(chip);
 	addr  = chip->xscom_base;
-	addr |= ((uint64_t)pcb_addr << 4) & ~0xfful;
-	addr |= (pcb_addr << 3) & 0x78;
-
+	if (proc_gen <= proc_gen_p8) {
+		addr |= ((uint64_t)pcb_addr << 4) & ~0xfful;
+		addr |= (pcb_addr << 3) & 0x78;
+	} else
+		addr |= ((uint64_t)pcb_addr << 3);
 	return (void *)addr;
 }
 
@@ -133,11 +135,12 @@ static int64_t xscom_handle_error(uint64_t hmer, uint32_t gcid, uint32_t pcb_add
 	 * recovery procedures
 	 */
 	switch(stat) {
-	/*
-	 * XSCOM engine is blocked, need to retry. Reset XSCOM engine
-	 * after crossing retry threshold before retrying again.
-	 */
 	case 1:
+		/*
+		 * XSCOM engine is blocked, need to retry. Reset XSCOM
+		 * engine after crossing retry threshold before
+		 * retrying again.
+		 */
 		if (retries && !(retries  % XSCOM_BUSY_RESET_THRESHOLD)) {
 			prlog(PR_NOTICE, "XSCOM: Busy even after %d retries, "
 				"resetting XSCOM now. Total retries  = %lld\n",
@@ -166,10 +169,15 @@ static int64_t xscom_handle_error(uint64_t hmer, uint32_t gcid, uint32_t pcb_add
 				gcid, pcb_addr, stat);
 		return OPAL_BUSY;
 
-	/* CPU is asleep, reset XSCOM engine and return */
-	case 2:
+	case 2: /* CPU is asleep, reset XSCOM engine and return */
 		xscom_reset(gcid);
 		return OPAL_WRONG_STATE;
+	case 3: /* Partial good */
+	case 4: /* Invalid address / address error */
+	case 5: /* Clock error */
+	case 6: /* Parity error  */
+	case 7: /* Time out */
+		break;
 	}
 
 	/* XXX: Create error log entry ? */
@@ -293,7 +301,7 @@ static int xscom_indirect_read(uint32_t gcid, uint64_t pcb_addr, uint64_t *val)
 	uint64_t data;
 	int rc, retries;
 
-	if (proc_gen != proc_gen_p8) {
+	if (proc_gen < proc_gen_p8) {
 		*val = (uint64_t)-1;
 		return OPAL_UNSUPPORTED;
 	}
@@ -336,7 +344,7 @@ static int xscom_indirect_write(uint32_t gcid, uint64_t pcb_addr, uint64_t val)
 	uint64_t data;
 	int rc, retries;
 
-	if (proc_gen != proc_gen_p8)
+	if (proc_gen < proc_gen_p8)
 		return OPAL_UNSUPPORTED;
 
 	/* Write indirect address & data */
@@ -373,8 +381,13 @@ static uint32_t xscom_decode_chiplet(uint32_t partid, uint64_t *pcb_addr)
 	uint32_t gcid = (partid & 0x0fffffff) >> 4;
 	uint32_t core = partid & 0xf;
 
-	*pcb_addr |= P8_EX_PCB_SLAVE_BASE;
-	*pcb_addr |= core << 24;
+	if (proc_gen == proc_gen_p9) {
+		/* XXX Not supported */
+		*pcb_addr = 0;
+	} else {
+		*pcb_addr |= P8_EX_PCB_SLAVE_BASE;
+		*pcb_addr |= core << 24;
+	}
 
 	return gcid;
 }
@@ -396,8 +409,18 @@ int xscom_read(uint32_t partid, uint64_t pcb_addr, uint64_t *val)
 		return centaur_xscom_read(partid, pcb_addr, val);
 	case 4: /* EX chiplet */
 		gcid = xscom_decode_chiplet(partid, &pcb_addr);
+		if (pcb_addr == 0)
+			return OPAL_UNSUPPORTED;
 		break;
 	default:
+		/**
+		 * @fwts-label XSCOMReadInvalidPartID
+		 * @fwts-advice xscom_read was called with an invalid partid.
+		 * There's likely a bug somewhere in the stack that's causing
+		 * someone to try an xscom_read on something that isn't a
+		 * processor, Centaur or EX chiplet.
+		 */
+		prerror("%s: invalid XSCOM partid 0x%x\n", __func__, partid);
 		return OPAL_PARAMETER;
 	}
 
@@ -433,6 +456,14 @@ int xscom_write(uint32_t partid, uint64_t pcb_addr, uint64_t val)
 		gcid = xscom_decode_chiplet(partid, &pcb_addr);
 		break;
 	default:
+		/**
+		 * @fwts-label XSCOMWriteInvalidPartID
+		 * @fwts-advice xscom_write was called with an invalid partid.
+		 * There's likely a bug somewhere in the stack that's causing
+		 * someone to try an xscom_write on something that isn't a
+		 * processor, Centaur or EX chiplet.
+		 */
+		prerror("%s: invalid XSCOM partid 0x%x\n", __func__, partid);
 		return OPAL_PARAMETER;
 	}
 
@@ -467,11 +498,14 @@ int64_t xscom_read_cfam_chipid(uint32_t partid, uint32_t *chip_id)
 	int64_t rc = OPAL_SUCCESS;
 
 	/* Mambo chip model lacks the f000f register, just make
-	 * something up (Murano DD2.1)
+	 * something up
 	 */
-	if (chip_quirk(QUIRK_NO_F000F))
-		val = 0x221EF04980000000UL;
-	else
+	if (chip_quirk(QUIRK_NO_F000F)) {
+		if (proc_gen == proc_gen_p9)
+			val = 0x100D104980000000UL; /* P9 Nimbus DD1.0 */
+		else
+			val = 0x221EF04980000000UL; /* P8 Murano DD2.1 */
+	} else
 		rc = xscom_read(partid, 0xf000f, &val);
 
 	/* Extract CFAM id */
@@ -515,6 +549,14 @@ static void xscom_init_chip_info(struct proc_chip *chip)
 		chip->type = PROC_CHIP_P8_NAPLES;
 		assert(proc_gen == proc_gen_p8);
 		break;
+	case 0xd1:
+		chip->type = PROC_CHIP_P9_NIMBUS;
+		assert(proc_gen == proc_gen_p9);
+		break;
+	case 0xd4:
+		chip->type = PROC_CHIP_P9_CUMULUS;
+		assert(proc_gen == proc_gen_p9);
+		break;
 	default:
 		printf("CHIP: Unknown chip type 0x%02x !!!\n",
 		       (unsigned char)(val & 0xff));
@@ -551,7 +593,7 @@ void xscom_init(void)
 		struct proc_chip *chip;
 		const char *chip_name;
 		static const char *chip_names[] = {
-			"UNKNOWN", "P7", "P7+", "P8E", "P8", "P8NVL",
+			"UNKNOWN", "P7", "P7+", "P8E", "P8", "P8NVL", "P9N", "P9C"
 		};
 
 		chip = get_chip(gcid);

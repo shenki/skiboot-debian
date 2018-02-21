@@ -19,76 +19,8 @@
 
 #include <opal.h>
 #include <device.h>
+#include <lock.h>
 #include <ccan/list/list.h>
-
-/* PCI Slot Info: Wired Lane Values
- *
- * Values 0 to 6 match slot map 1005. In case of *any* change here
- * make sure to keep the lxvpd.c parsing code in sync *and* the
- * corresponding label strings in pci.c
- */
-#define PCI_SLOT_WIRED_LANES_UNKNOWN   0x00
-#define PCI_SLOT_WIRED_LANES_PCIE_X1   0x01
-#define PCI_SLOT_WIRED_LANES_PCIE_X2   0x02
-#define PCI_SLOT_WIRED_LANES_PCIE_X4   0x03
-#define PCI_SLOT_WIRED_LANES_PCIE_X8   0x04
-#define PCI_SLOT_WIRED_LANES_PCIE_X16  0x05
-#define PCI_SLOT_WIRED_LANES_PCIE_X32  0x06
-#define PCI_SLOT_WIRED_LANES_PCIX_32   0x07
-#define PCI_SLOT_WIRED_LANES_PCIX_64   0x08
-
-/* PCI Slot Info: Bus Clock Values */
-#define PCI_SLOT_BUS_CLK_RESERVED      0x00
-#define PCI_SLOT_BUS_CLK_GEN_1         0x01
-#define PCI_SLOT_BUS_CLK_GEN_2         0x02
-#define PCI_SLOT_BUS_CLK_GEN_3         0x03
-
-/* PCI Slot Info: Connector Type Values */
-#define PCI_SLOT_CONNECTOR_PCIE_EMBED  0x00
-#define PCI_SLOT_CONNECTOR_PCIE_X1     0x01
-#define PCI_SLOT_CONNECTOR_PCIE_X2     0x02
-#define PCI_SLOT_CONNECTOR_PCIE_X4     0x03
-#define PCI_SLOT_CONNECTOR_PCIE_X8     0x04
-#define PCI_SLOT_CONNECTOR_PCIE_X16    0x05
-#define PCI_SLOT_CONNECTOR_PCIE_NS     0x0E  /* Non-Standard */
-
-/* PCI Slot Info: Card Description Values */
-#define PCI_SLOT_DESC_NON_STANDARD     0x00 /* Embed/Non-Standard Connector */
-#define PCI_SLOT_DESC_PCIE_FH_FL       0x00 /* Full Height, Full Length */
-#define PCI_SLOT_DESC_PCIE_FH_HL       0x01 /* Full Height, Half Length */
-#define PCI_SLOT_DESC_PCIE_HH_FL       0x02 /* Half Height, Full Length */
-#define PCI_SLOT_DESC_PCIE_HH_HL       0x03 /* Half Height, Half Length */
-
-/* PCI Slot Info: Mechanicals Values */
-#define PCI_SLOT_MECH_NONE             0x00
-#define PCI_SLOT_MECH_RIGHT            0x01
-#define PCI_SLOT_MECH_LEFT             0x02
-#define PCI_SLOT_MECH_RIGHT_LEFT       0x03
-
-/* PCI Slot Info: Power LED Control Values */
-#define PCI_SLOT_PWR_LED_CTL_NONE      0x00 /* No Control        */
-#define PCI_SLOT_PWR_LED_CTL_FSP       0x01 /* FSP Controlled    */
-#define PCI_SLOT_PWR_LED_CTL_KERNEL    0x02 /* Kernel Controlled */
-
-/* PCI Slot Info: ATTN LED Control Values */
-#define PCI_SLOT_ATTN_LED_CTL_NONE     0x00 /* No Control        */
-#define PCI_SLOT_ATTN_LED_CTL_FSP      0x01 /* FSP Controlled    */
-#define PCI_SLOT_ATTN_LED_CTL_KERNEL   0x02 /* Kernel Controlled */
-
-/* PCI Slot Entry Information */
-struct pci_slot_info {
-	char       label[16];
-	bool       pluggable;
-	bool       power_ctl;
-	int        wired_lanes;
-	int        bus_clock;
-	int        connector_type;
-	int        card_desc;
-	int        card_mech;
-	int        pwr_led_ctl;
-	int        attn_led_ctl;
-	int	   slot_index;
-};
 
 struct pci_device;
 struct pci_cfg_reg_filter;
@@ -150,7 +82,7 @@ struct pci_device {
 	struct list_head	pcrf;
 
 	struct dt_node		*dn;
-	struct pci_slot_info    *slot_info;
+	struct pci_slot		*slot;
 	struct pci_device	*parent;
 	struct list_head	children;
 	struct list_node	link;
@@ -232,12 +164,6 @@ extern int last_phb_id;
 
 struct phb_ops {
 	/*
-	 * Locking. This is called around OPAL accesses
-	 */
-	void (*lock)(struct phb *phb);
-	void (*unlock)(struct phb *phb);
-
-	/*
 	 * Config space ops
 	 */
 	int64_t (*cfg_read8)(struct phb *phb, uint32_t bdfn,
@@ -259,19 +185,18 @@ struct phb_ops {
 	uint8_t (*choose_bus)(struct phb *phb, struct pci_device *bridge,
 			      uint8_t candidate, uint8_t *max_bus,
 			      bool *use_max);
+	int64_t (*get_reserved_pe_number)(struct phb *phb);
 
 	/*
 	 * Device init method is called after a device has been detected
 	 * and before probing further. It can alter things like scan_map
 	 * for bridge ports etc...
 	 */
-	void (*device_init)(struct phb *phb, struct pci_device *device);
+	int (*device_init)(struct phb *phb, struct pci_device *device,
+			   void *data);
 
-	/*
-	 * Device node fixup is called when the PCI device node is being
-	 * populated
-	 */
-	void (*device_node_fixup)(struct phb *phb, struct pci_device *pd);
+	/* PHB final fixup is called after PCI probing is completed */
+	void (*phb_final_fixup)(struct phb *phb);
 
 	/*
 	 * EEH methods
@@ -369,77 +294,10 @@ struct phb_ops {
 	 */
 	int64_t (*pci_msi_eoi)(struct phb *phb, uint32_t hwirq);
 
-	/*
-	 * Slot control
-	 */
-
-	/* presence_detect - Check for a present device
-	 *
-	 * Immediate return of:
-	 *
-	 * OPAL_SHPC_DEV_NOT_PRESENT = 0,
-	 * OPAL_SHPC_DEV_PRESENT = 1
-	 *
-	 * or a negative OPAL error code
-	 */
-	int64_t (*presence_detect)(struct phb *phb);
-
-	/* link_state - Check link state
-	 *
-	 * Immediate return of:
-	 *
-	 * OPAL_SHPC_LINK_DOWN = 0,
-	 * OPAL_SHPC_LINK_UP_x1 = 1,
-	 * OPAL_SHPC_LINK_UP_x2 = 2,
-	 * OPAL_SHPC_LINK_UP_x4 = 4,
-	 * OPAL_SHPC_LINK_UP_x8 = 8,
-	 * OPAL_SHPC_LINK_UP_x16 = 16,
-	 * OPAL_SHPC_LINK_UP_x32 = 32
-	 *
-	 * or a negative OPAL error code
-	 */
-	int64_t (*link_state)(struct phb *phb);
-
-	/* power_state - Check slot power state
-	 *
-	 * Immediate return of:
-	 *
-	 * OPAL_SLOT_POWER_OFF = 0,
-	 * OPAL_SLOT_POWER_ON = 1,
-	 *
-	 * or a negative OPAL error code
-	 */
-	int64_t (*power_state)(struct phb *phb);
-
-	/* slot_power_off - Start slot power off sequence
-	 *
-	 * Asynchronous function, returns a positive delay
-	 * or a negative error code
-	 */
-	int64_t (*slot_power_off)(struct phb *phb);
-
-	/* slot_power_on - Start slot power on sequence
-	 *
-	 * Asynchronous function, returns a positive delay
-	 * or a negative error code.
-	 */
-	int64_t (*slot_power_on)(struct phb *phb);
-
-	/* PHB power off and on after complete init */
-	int64_t (*complete_reset)(struct phb *phb, uint8_t assert);
-
-	/* hot_reset - Hot Reset sequence */
-	int64_t (*hot_reset)(struct phb *phb);
-
-	/* Fundamental reset */
-	int64_t (*fundamental_reset)(struct phb *phb);
-
-	/* poll - Poll and advance asynchronous operations
-	 *
-	 * Returns a positive delay, 0 for success or a
-	 * negative OPAL error code
-	 */
-	int64_t (*poll)(struct phb *phb);
+	/* TCE Kill abstraction */
+	int64_t (*tce_kill)(struct phb *phb, uint32_t kill_type,
+			    uint32_t pe_num, uint32_t tce_size,
+			    uint64_t dma_addr, uint32_t npages);
 
 	/* Put phb in capi mode or pcie mode */
 	int64_t (*set_capi_mode)(struct phb *phb, uint64_t mode, uint64_t pe_number);
@@ -454,6 +312,7 @@ enum phb_type {
 	phb_type_pcie_v1,
 	phb_type_pcie_v2,
 	phb_type_pcie_v3,
+	phb_type_pcie_v4,
 };
 
 struct phb {
@@ -461,13 +320,14 @@ struct phb {
 	int			opal_id;
 	uint32_t		scan_map;
 	enum phb_type		phb_type;
+	struct lock		lock;
 	struct list_head	devices;
 	const struct phb_ops	*ops;
 	struct pci_lsi_state	lstate;
 	uint32_t		mps;
 
 	/* PCI-X only slot info, for PCI-E this is in the RC bridge */
-	struct pci_slot_info    *slot_info;
+	struct pci_slot		*slot;
 
 	/* Base location code used to generate the children one */
 	const char		*base_loc_code;
@@ -475,6 +335,16 @@ struct phb {
 	/* Additional data the platform might need to attach */
 	void			*platform_data;
 };
+
+static inline void phb_lock(struct phb *phb)
+{
+	lock(&phb->lock);
+}
+
+static inline void phb_unlock(struct phb *phb)
+{
+	unlock(&phb->lock);
+}
 
 /* Config space ops wrappers */
 static inline int64_t pci_cfg_read8(struct phb *phb, uint32_t bdfn,
@@ -514,18 +384,27 @@ static inline int64_t pci_cfg_write32(struct phb *phb, uint32_t bdfn,
 }
 
 /* Utilities */
-
+extern void pci_remove_bus(struct phb *phb, struct list_head *list);
+extern uint8_t pci_scan_bus(struct phb *phb, uint8_t bus, uint8_t max_bus,
+			    struct list_head *list, struct pci_device *parent,
+			    bool scan_downstream);
+extern void pci_add_device_nodes(struct phb *phb,
+				 struct list_head *list,
+				 struct dt_node *parent_node,
+				 struct pci_lsi_state *lstate,
+				 uint8_t swizzle);
 extern int64_t pci_find_cap(struct phb *phb, uint16_t bdfn, uint8_t cap);
 extern int64_t pci_find_ecap(struct phb *phb, uint16_t bdfn, uint16_t cap,
 			     uint8_t *version);
 extern void pci_device_init(struct phb *phb, struct pci_device *pd);
 extern struct pci_device *pci_walk_dev(struct phb *phb,
+				       struct pci_device *pd,
 				       int (*cb)(struct phb *,
 						 struct pci_device *,
 						 void *),
 				       void *userdata);
 extern struct pci_device *pci_find_dev(struct phb *phb, uint16_t bdfn);
-extern void pci_restore_bridge_buses(struct phb *phb);
+extern void pci_restore_bridge_buses(struct phb *phb, struct pci_device *pd);
 extern struct pci_cfg_reg_filter *pci_find_cfg_reg_filter(struct pci_device *pd,
 					uint32_t start, uint32_t len);
 extern struct pci_cfg_reg_filter *pci_add_cfg_reg_filter(struct pci_device *pd,
@@ -537,7 +416,6 @@ extern struct pci_cfg_reg_filter *pci_add_cfg_reg_filter(struct pci_device *pd,
 extern int64_t pci_register_phb(struct phb *phb, int opal_id);
 extern int64_t pci_unregister_phb(struct phb *phb);
 extern struct phb *pci_get_phb(uint64_t phb_id);
-static inline void pci_put_phb(struct phb *phb __unused) { }
 
 static inline struct phb *__pci_next_phb_idx(uint64_t *phb_id) {
 	struct phb *phb = NULL;

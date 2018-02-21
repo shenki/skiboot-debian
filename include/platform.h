@@ -20,6 +20,7 @@
 /* Some fwd declarations for types used further down */
 struct phb;
 struct pci_device;
+struct pci_slot;
 struct errorlog;
 
 enum resource_id {
@@ -158,6 +159,10 @@ struct platform {
 	 */
 	int64_t		(*sensor_read)(uint32_t sensor_hndl, int token,
 				       uint32_t *sensor_data);
+	/*
+	 * Return the heartbeat time
+	 */
+	int		(*heartbeat_time)(void);
 
 	/*
 	 * OPAL terminate
@@ -169,6 +174,8 @@ extern struct platform __platforms_start;
 extern struct platform __platforms_end;
 
 extern struct platform	platform;
+
+extern bool manufacturing_mode;
 
 #define DECLARE_PLATFORM(name)\
 static const struct platform __used __section(".platforms") name ##_platform
