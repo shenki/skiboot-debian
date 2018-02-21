@@ -1,8 +1,10 @@
 usr/sbin/getscom
+usr/sbin/getsram
 usr/sbin/opal-gard
 usr/sbin/pflash
 usr/sbin/putscom
 usr/share/man/man1/opal-gard.1
 usr/share/man/man1/pflash.1
 usr/share/man/man1/getscom.1
+usr/share/man/man1/getsram.1
 usr/share/man/man1/putscom.1
