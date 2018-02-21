@@ -13,7 +13,7 @@ export DEB_LDFLAGS_MAINT_APPEND = -no-pie
 
 
 %:
-	dh $@ --with systemd
+	dh $@
 
 override_dh_auto_build:
 	OPAL_PRD_VERSION=opal-prd-$(DEB_VERSION_UPSTREAM) make V=1 -C external/opal-prd/
