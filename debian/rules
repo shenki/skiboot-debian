@@ -37,4 +37,5 @@ override_dh_auto_clean:
 
 override_dh_auto_test:
 	# We only run test for the directories we build utils from and where tests exists
-	make -C external/gard/ check
+	# gard tests : no support for FSP based build systems
+	[ -d /proc/device-tree/fsps ] || make -C external/gard/ check
