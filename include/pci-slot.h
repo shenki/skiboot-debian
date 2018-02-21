@@ -109,7 +109,7 @@ struct pci_slot_ops {
 	int64_t (*creset)(struct pci_slot *slot);
 	int64_t (*freset)(struct pci_slot *slot);
 	int64_t (*hreset)(struct pci_slot *slot);
-	int64_t (*poll)(struct pci_slot *slot);
+	int64_t (*run_sm)(struct pci_slot *slot);
 
 	/* Auxillary functions */
 	void (*add_properties)(struct pci_slot *slot, struct dt_node *np);
@@ -146,6 +146,9 @@ struct pci_slot_ops {
 struct pci_slot {
 	uint32_t		flags;
 #define PCI_SLOT_FLAG_BOOTUP		0x1
+#define PCI_SLOT_FLAG_FORCE_POWERON	0x2
+#define PCI_SLOT_FLAG_BROKEN_PDC	0x4
+#define PCI_SLOT_FLAG_ENFORCE		0x8
 
 	struct phb		*phb;
 	struct pci_device	*pd;
@@ -176,11 +179,14 @@ struct pci_slot {
 	 */
 	uint32_t		state;
 	uint32_t		retry_state;
+	uint16_t		pcie_cap;
 	uint32_t		link_cap;
 	uint32_t		slot_cap;
 	uint64_t		delay_tgt_tb;
 	uint64_t		retries;
+	uint64_t		link_retries;
 	struct pci_slot_ops	ops;
+	struct pci_slot		*peer_slot;
 	void			*data;
 };
 
@@ -247,7 +253,20 @@ extern struct pci_slot *pci_slot_alloc(struct phb *phb,
 				       struct pci_device *pd);
 extern struct pci_slot *pcie_slot_create(struct phb *phb,
 					 struct pci_device *pd);
+extern struct pci_slot *pcie_slot_create_dynamic(struct phb *phb,
+		struct pci_device *pd);
+
 extern void pci_slot_add_dt_properties(struct pci_slot *slot,
 				       struct dt_node *np);
 extern struct pci_slot *pci_slot_find(uint64_t id);
+
+extern void pci_slot_add_loc(struct pci_slot *slot,
+			struct dt_node *np, const char *label);
+
+/* DT based slot map */
+
+extern struct dt_node *dt_slots;
+extern struct dt_node *map_pci_dev_to_slot(struct phb *phb,
+		struct pci_device *pd);
+
 #endif /* __PCI_SLOT_H */

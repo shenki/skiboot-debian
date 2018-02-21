@@ -159,7 +159,7 @@
 #define P9_PSI_IRQ_SBE_I2C		11
 #define P9_PSI_IRQ_DIO			12
 #define P9_PSI_IRQ_PSU			13
-#define P9_PSI_NUM_IRQS			16
+#define P9_PSI_NUM_IRQS			14
 
 
 
@@ -245,6 +245,8 @@ struct psi {
 	unsigned int		chip_id;
 	unsigned int		interrupt;
 	bool			active;
+	bool			no_lpc_irqs;
+	struct dt_node		*node;
 };
 
 extern void psi_set_link_polling(bool active);

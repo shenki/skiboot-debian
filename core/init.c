@@ -45,10 +45,14 @@
 #include <sensor.h>
 #include <xive.h>
 #include <nvram.h>
-#include <libstb/stb.h>
-#include <libstb/container.h>
+#include <vas.h>
+#include <libstb/secureboot.h>
+#include <libstb/trustedboot.h>
+#include <phys-map.h>
+#include <imc.h>
 
 enum proc_gen proc_gen;
+unsigned int pcie_max_link_speed;
 
 static uint64_t kernel_entry;
 static size_t kernel_size;
@@ -67,8 +71,10 @@ struct debug_descriptor debug_descriptor = {
 	.state_flags	= 0,
 	.memcons_phys	= (uint64_t)&memcons,
 	.trace_mask	= 0, /* All traces disabled by default */
+	/* console log level:
+	 *   high 4 bits in memory, low 4 bits driver (e.g. uart). */
 #ifdef DEBUG
-	.console_log_levels = (PR_DEBUG << 4) | PR_DEBUG,
+	.console_log_levels = (PR_TRACE << 4) | PR_DEBUG,
 #else
 	.console_log_levels = (PR_DEBUG << 4) | PR_NOTICE,
 #endif
@@ -113,10 +119,11 @@ static bool try_load_elf64_le(struct elf_hdr *header)
 	kernel_32bit = false;
 
 	kernel_size = le64_to_cpu(kh->e_shoff) +
-		(le16_to_cpu(kh->e_shentsize) * le16_to_cpu(kh->e_shnum));
+		((uint32_t)le16_to_cpu(kh->e_shentsize) *
+		 (uint32_t)le16_to_cpu(kh->e_shnum));
 
-	printf("INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
-	       kernel_entry, kernel_size);
+	prlog(PR_DEBUG, "INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
+	      kernel_entry, kernel_size);
 
 	return true;
 }
@@ -190,7 +197,8 @@ static bool try_load_elf64(struct elf_hdr *header)
 	kernel_entry += load_base;
 	kernel_32bit = false;
 
-	kernel_size = kh->e_shoff + (kh->e_shentsize * kh->e_shnum);
+	kernel_size = kh->e_shoff +
+		((uint32_t)kh->e_shentsize * (uint32_t)kh->e_shnum);
 
 	printf("INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
 	       kernel_entry, kernel_size);
@@ -334,10 +342,9 @@ bool start_preload_kernel(void)
 
 static bool load_kernel(void)
 {
-	void* stb_container = NULL;
+	void *stb_container = NULL;
 	struct elf_hdr *kh;
 	int loaded;
-	bool do_stb = false;
 
 	prlog(PR_NOTICE, "INIT: Waiting for kernel...\n");
 
@@ -360,45 +367,44 @@ static bool load_kernel(void)
 			printf("Using built-in kernel\n");
 			memmove(KERNEL_LOAD_BASE, (void*)builtin_base,
 				kernel_size);
-			do_stb = true;
 		}
 	}
 
 	if (dt_has_node_property(dt_chosen, "kernel-base-address", NULL)) {
 		kernel_entry = dt_prop_get_u64(dt_chosen,
 					       "kernel-base-address");
-		printf("INIT: Kernel image at 0x%llx\n",kernel_entry);
+		prlog(PR_DEBUG, "INIT: Kernel image at 0x%llx\n", kernel_entry);
 		kh = (struct elf_hdr *)kernel_entry;
 		/*
 		 * If the kernel is at 0, restore it as it was overwritten
 		 * by our vectors.
 		 */
 		if (kernel_entry < 0x2000) {
-			cpu_set_pm_enable(false);
+			cpu_set_sreset_enable(false);
 			memcpy(NULL, old_vectors, 0x2000);
+			sync_icache();
 		}
-		do_stb = true;
-		stb_container = kh; /* probably incorrect */
 	} else {
 		if (!kernel_size) {
 			printf("INIT: Assuming kernel at %p\n",
 			       KERNEL_LOAD_BASE);
 			/* Hack for STB in Mambo, assume at least 4kb in mem */
 			kernel_size = SECURE_BOOT_HEADERS_SIZE;
-			do_stb = true;
 		}
-		kh = (struct elf_hdr *) (KERNEL_LOAD_BASE);
 		if (stb_is_container(KERNEL_LOAD_BASE, kernel_size)) {
-			stb_container = kh;
+			stb_container = KERNEL_LOAD_BASE;
 			kh = (struct elf_hdr *) (KERNEL_LOAD_BASE + SECURE_BOOT_HEADERS_SIZE);
-		}
+		} else
+			kh = (struct elf_hdr *) (KERNEL_LOAD_BASE);
+
 	}
 
-	printf("INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
-	       kernel_size);
+	prlog(PR_DEBUG,
+	      "INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
+	      kernel_size);
 
 	if (kh->ei_ident != ELF_IDENT) {
-		printf("INIT: ELF header not found. Assuming raw binary.\n");
+		prerror("INIT: ELF header not found. Assuming raw binary.\n");
 		return true;
 	}
 
@@ -409,23 +415,20 @@ static bool load_kernel(void)
 		if (!try_load_elf32(kh))
 			return false;
 	} else {
-		printf("INIT: Neither ELF32 not ELF64 ?\n");
+		prerror("INIT: Neither ELF32 not ELF64 ?\n");
 		return false;
 	}
 
-	if (do_stb)
-	{
-		sb_verify(RESOURCE_ID_KERNEL, stb_container,
-			  kernel_size + SECURE_BOOT_HEADERS_SIZE);
-		tb_measure(RESOURCE_ID_KERNEL, stb_container,
-			   kernel_size + SECURE_BOOT_HEADERS_SIZE);
+	if (chip_quirk(QUIRK_MAMBO_CALLOUTS)) {
+		secureboot_verify(RESOURCE_ID_KERNEL,
+				  stb_container,
+				  SECURE_BOOT_HEADERS_SIZE + kernel_size);
+		trustedboot_measure(RESOURCE_ID_KERNEL,
+				    stb_container,
+				    SECURE_BOOT_HEADERS_SIZE + kernel_size);
 	}
 
-	/*
-	 * Verify and measure the retrieved PNOR partition as part of the
-	 * secure boot and trusted boot requirements
-	 */
-	stb_final();
+	trustedboot_exit_boot_services();
 
 	return true;
 }
@@ -458,7 +461,7 @@ void *fdt;
 void __noreturn load_and_boot_kernel(bool is_reboot)
 {
 	const struct dt_property *memprop;
-	const char *cmdline;
+	const char *cmdline, *stdoutp;
 	uint64_t mem_top;
 
 	memprop = dt_find_property(dt_root, DT_PRIVATE "maxmem");
@@ -483,30 +486,40 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 
 	ipmi_set_fw_progress_sensor(IPMI_FW_OS_BOOT);
 
+	occ_pstates_init();
+
 	if (!is_reboot) {
 		/* We wait for the nvram read to complete here so we can
 		 * grab stuff from there such as the kernel arguments
 		 */
-		fsp_nvram_wait_open();
+		nvram_wait_for_load();
 
 		/* Wait for FW VPD data read to complete */
 		fsp_code_update_wait_vpd(true);
-	} else
+
+		/*
+		 * OCC takes few secs to boot.  Call this as late as
+		 * as possible to avoid delay.
+		 */
+		occ_sensors_init();
+
+	} else {
+		/* fdt will be rebuilt */
+		free(fdt);
+		fdt = NULL;
+
 		nvram_reinit();
+	}
 
 	fsp_console_select_stdout();
-
-	/*
-	 * OCC takes few secs to boot.  Call this as late as
-	 * as possible to avoid delay.
-	 */
-	occ_pstates_init();
 
 	/* Use nvram bootargs over device tree */
 	cmdline = nvram_query("bootargs");
 	if (cmdline) {
 		dt_check_del_prop(dt_chosen, "bootargs");
 		dt_add_property_string(dt_chosen, "bootargs", cmdline);
+		prlog(PR_DEBUG, "INIT: Command line from NVRAM: %s\n",
+		      cmdline);
 	}
 
 	op_display(OP_LOG, OP_MOD_INIT, 0x000B);
@@ -532,9 +545,15 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	mem_dump_free();
 
 	/* Take processours out of nap */
-	cpu_set_pm_enable(false);
+	cpu_set_sreset_enable(false);
+	cpu_set_ipi_enable(false);
 
-	printf("INIT: Starting kernel at 0x%llx, fdt at %p (size 0x%x)\n",
+	/* Dump the selected console */
+	stdoutp = dt_prop_get_def(dt_chosen, "linux,stdout-path", NULL);
+	prlog(PR_DEBUG, "INIT: stdout-path: %s\n", stdoutp ? stdoutp : "");
+
+
+	printf("INIT: Starting kernel at 0x%llx, fdt at %p %u bytes)\n",
 	       kernel_entry, fdt, fdt_totalsize(fdt));
 
 	debug_descriptor.state_flags |= OPAL_BOOT_COMPLETE;
@@ -607,11 +626,60 @@ static void dt_init_misc(void)
 	dt_fixups();
 }
 
-static void branch_null(void)
+static u8 console_get_level(const char *s)
 {
-	assert_fail("Branch to NULL !");
+	if (strcmp(s, "emerg") == 0)
+		return PR_EMERG;
+	if (strcmp(s, "alert") == 0)
+		return PR_ALERT;
+	if (strcmp(s, "crit") == 0)
+		return PR_CRIT;
+	if (strcmp(s, "err") == 0)
+		return PR_ERR;
+	if (strcmp(s, "warning") == 0)
+		return PR_WARNING;
+	if (strcmp(s, "notice") == 0)
+		return PR_NOTICE;
+	if (strcmp(s, "printf") == 0)
+		return PR_PRINTF;
+	if (strcmp(s, "info") == 0)
+		return PR_INFO;
+	if (strcmp(s, "debug") == 0)
+		return PR_DEBUG;
+	if (strcmp(s, "trace") == 0)
+		return PR_TRACE;
+	if (strcmp(s, "insane") == 0)
+		return PR_INSANE;
+	/* Assume it's a number instead */
+	return atoi(s);
 }
 
+static void console_log_level(void)
+{
+	const char *s;
+	u8 level;
+
+	/* console log level:
+	 *   high 4 bits in memory, low 4 bits driver (e.g. uart). */
+	s = nvram_query("log-level-driver");
+	if (s) {
+		level = console_get_level(s);
+		debug_descriptor.console_log_levels =
+			(debug_descriptor.console_log_levels & 0xf0 ) |
+			(level & 0x0f);
+		prlog(PR_NOTICE, "console: Setting driver log level to %i\n",
+		      level & 0x0f);
+	}
+	s = nvram_query("log-level-memory");
+	if (s) {
+		level = console_get_level(s);
+		debug_descriptor.console_log_levels =
+			(debug_descriptor.console_log_levels & 0x0f ) |
+			((level & 0x0f) << 4);
+		prlog(PR_NOTICE, "console: Setting memory log level to %i\n",
+		      level & 0x0f);
+	}
+}
 
 typedef void (*ctorcall_t)(void);
 
@@ -624,6 +692,13 @@ static void __nomcount do_ctors(void)
 		(*call)();
 }
 
+#ifndef PPC64_ELF_ABI_v2
+static void branch_null(void)
+{
+	assert_fail("Branch to NULL !");
+}
+
+
 static void setup_branch_null_catcher(void)
 {
        void (*bn)(void) = branch_null;
@@ -635,6 +710,11 @@ static void setup_branch_null_catcher(void)
         */
        memcpy(0, bn, 16);
 }
+#else
+static void setup_branch_null_catcher(void)
+{
+}
+#endif
 
 void setup_reset_vector(void)
 {
@@ -645,6 +725,8 @@ void setup_reset_vector(void)
 	dst = (uint32_t *)0x100;
 	while(src < &reset_patch_end)
 		*(dst++) = *(src++);
+	sync_icache();
+	cpu_set_sreset_enable(true);
 }
 
 void copy_exception_vectors(void)
@@ -687,6 +769,20 @@ static void per_thread_sanity_checks(void)
 	assert(cpu->state != cpu_state_no_cpu);
 }
 
+static void pci_nvram_init(void)
+{
+	const char *nvram_speed;
+
+	pcie_max_link_speed = 0;
+
+	nvram_speed = nvram_query("pcie-max-link-speed");
+	if (nvram_speed) {
+		pcie_max_link_speed = atoi(nvram_speed);
+		prlog(PR_NOTICE, "PHB: NVRAM set max link speed to GEN%i\n",
+		      pcie_max_link_speed);
+	}
+}
+
 /* Called from head.S, thus no prototype. */
 void main_cpu_entry(const void *fdt);
 
@@ -713,8 +809,23 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 */
 	clear_console();
 
+	/*
+	 * Some boot firmwares enter OPAL with MSR[ME]=1, as they presumably
+	 * handle machine checks until we take over. As we overwrite the
+	 * previous exception vectors with our own handlers, disable MSR[ME].
+	 * This could be done atomically by patching in a branch then patching
+	 * it out last, but that's a lot of effort.
+	 */
+	disable_machine_check();
+
 	/* Copy all vectors down to 0 */
 	copy_exception_vectors();
+
+	/*
+	 * Enable MSR[ME] bit so we can take MCEs. We don't currently
+	 * recover, but we print some useful information.
+	 */
+	enable_machine_check();
 
 	/* Setup a NULL catcher to catch accidental NULL ptr calls */
 	setup_branch_null_catcher();
@@ -722,8 +833,14 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* Call library constructors */
 	do_ctors();
 
-	printf("SkiBoot %s starting...\n", version);
-	printf("initial console log level: memory %d, driver %d\n",
+	prlog(PR_NOTICE, "OPAL %s%s starting...\n", version,
+#ifdef DEBUG
+	"-debug"
+#else
+	""
+#endif
+	);
+	prlog(PR_DEBUG, "initial console log level: memory %d, driver %d\n",
 	       (debug_descriptor.console_log_levels >> 4),
 	       (debug_descriptor.console_log_levels & 0x0f));
 	prlog(PR_TRACE, "You will not see this\n");
@@ -742,6 +859,9 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 * later on (FSP console code for example)
 	 */
 	opal_table_init();
+
+	/* Init the physical map table so we can start mapping things */
+	phys_map_init();
 
 	/*
 	 * If we are coming in with a flat device-tree, we expand it
@@ -762,6 +882,7 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	} else {
 		dt_expand(fdt);
 	}
+	dt_add_cpufeatures(dt_root);
 
 	/* Now that we have a full devicetree, verify that we aren't on fire. */
 	per_thread_sanity_checks();
@@ -780,14 +901,14 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 */
 	init_chips();
 
-	/* If we detect the mambo simulator, we can enable its special console
-	 * early on. Do that now.
-	 */
-	if (chip_quirk(QUIRK_MAMBO_CALLOUTS))
-		enable_mambo_console();
-
 	xscom_init();
 	mfsi_init();
+
+	/*
+	 * Direct controls facilities provides some controls over CPUs
+	 * using scoms.
+	 */
+	direct_controls_init();
 
 	/*
 	 * Put various bits & pieces in device-tree that might not
@@ -829,12 +950,16 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	/* Initialize the rest of the cpu thread structs */
 	init_all_cpus();
+	if (proc_gen == proc_gen_p9)
+		cpu_set_ipi_enable(true);
 
 	/* Allocate our split trace buffers now. Depends add_opal_node() */
 	init_trace_buffers();
 
 	/* On P7/P8, get the ICPs and make sure they are in a sane state */
 	init_interrupts();
+	if (proc_gen == proc_gen_p7 || proc_gen == proc_gen_p8)
+		cpu_set_ipi_enable(true);
 
 	/* On P9, initialize XIVE */
 	init_xive();
@@ -860,12 +985,14 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	setup_reset_vector();
 
 	/* We can now do NAP mode */
-	cpu_set_pm_enable(true);
+	cpu_set_sreset_enable(true);
 
 	/*
-	 * Synchronize time bases. Thi resets all the TB values to a small
-	 * value (so they appear to go backward at this point), and synchronize
-	 * all core timebases to the global ChipTOD network
+	 * Synchronize time bases. Prior to chiptod_init() the timebase
+	 * is free-running at a frequency based on the core clock rather
+	 * than being synchronised to the ChipTOD network. This means
+	 * that the timestamps in early boot might be a little off compared
+	 * to wall clock time.
 	 */
 	chiptod_init();
 
@@ -877,8 +1004,8 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
         /*
 	 * Initialize the opal messaging before platform.init as we are
-	 *  getting request to queue occ load opal message when host services
-	 *  got load occ request from FSP
+	 * getting request to queue occ load opal message when host services
+	 * got load occ request from FSP
 	 */
         opal_init_msg();
 
@@ -893,24 +1020,38 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* Read in NVRAM and set it up */
 	nvram_init();
 
-	/* Secure/Trusted Boot init. We look for /ibm,secureboot in DT */
-	stb_init();
+	/* Set the console level */
+	console_log_level();
 
-	/* Setup dummy console nodes if it's enabled */
-	if (dummy_console_enabled())
-		dummy_console_add_nodes();
+	/* Secure/Trusted Boot init. We look for /ibm,secureboot in DT */
+	secureboot_init();
+	trustedboot_init();
+
+        /* preload the IMC catalog dtb */
+        imc_catalog_preload();
+
+	/* Install the OPAL Console handlers */
+	init_opal_console();
 
 	/* Init SLW related stuff, including fastsleep */
 	slw_init();
 
 	op_display(OP_LOG, OP_MOD_INIT, 0x0002);
 
-	phb3_preload_vpd();
-	phb3_preload_capp_ucode();
+	pci_nvram_init();
+
+	preload_io_vpd();
+	preload_capp_ucode();
 	start_preload_kernel();
+
+	/* Virtual Accelerator Switchboard */
+	vas_init();
 
 	/* NX init */
 	nx_init();
+
+	/* Init In-Memory Collection related stuff (load the IMC dtb into memory) */
+	imc_init();
 
 	/* Probe IO hubs */
 	probe_p7ioc();
@@ -923,6 +1064,7 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	/* Probe NPUs */
 	probe_npu();
+	probe_npu2();
 
 	/* Initialize PCI */
 	pci_init_slots();
@@ -942,6 +1084,9 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 * regions after that
 	 */
 
+	/* Create the LPC bus interrupt-map on P9 */
+	lpc_finalize_interrupts();
+
 	/* Add the list of interrupts going to OPAL */
 	add_opal_interrupts();
 
@@ -951,7 +1096,17 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* ... and add remaining reservations to the DT */
 	mem_region_add_dt_reserved();
 
+	/*
+	 * Update /ibm,secureboot/ibm,cvc/memory-region to point to
+	 * /reserved-memory/secure-crypt-algo-code instead of
+	 * /ibm,hostboot/reserved-memory/secure-crypt-algo-code.
+	 */
+	cvc_update_reserved_memory_phandle();
+
 	prd_register_reserved_memory();
+
+	/* On P9, switch to radix mode by default */
+	cpu_set_radix_mode();
 
 	load_and_boot_kernel(false);
 }
@@ -963,17 +1118,15 @@ void __noreturn __secondary_cpu_entry(void)
 	/* Secondary CPU called in */
 	cpu_callin(cpu);
 
-	init_hid();
-
 	/* Some XIVE setup */
 	xive_cpu_callin(cpu);
 
 	/* Wait for work to do */
 	while(true) {
 		if (cpu_check_jobs(cpu))
-		    cpu_process_jobs();
+			cpu_process_jobs();
 		else
-		    cpu_idle(cpu_wake_on_job);
+			cpu_idle_job();
 	}
 }
 

@@ -87,7 +87,7 @@ enum spcn_attr {
 /* Parsed sensor attributes, passed through OPAL */
 struct opal_sensor_data {
 	uint64_t	async_token;	/* Asynchronous token */
-	uint32_t	*sensor_data;	/* Kernel pointer to copy data */
+	uint64_t	*sensor_data;	/* Kernel pointer to copy data */
 	enum spcn_attr	spcn_attr;	/* Modifier attribute */
 	uint16_t	rid;		/* Sensor RID */
 	uint8_t		frc;		/* Sensor resource class */
@@ -306,8 +306,9 @@ static int fsp_sensor_process_read(struct fsp_msg *resp_msg)
 
 static void queue_msg_for_delivery(int rc, struct opal_sensor_data *attr)
 {
-	prlog(PR_INSANE, "%s: rc:%d, data:%d\n",
+	prlog(PR_INSANE, "%s: rc:%d, data:%lld\n",
 	      __func__, rc, *(attr->sensor_data));
+	check_sensor_read(attr->async_token);
 	opal_queue_msg(OPAL_MSG_ASYNC_COMP, NULL, NULL,
 			attr->async_token, rc);
 	spcn_mod_data[attr->mod_index].entry_count = 0;
@@ -375,6 +376,9 @@ static int64_t fsp_sensor_send_read_request(struct opal_sensor_data *attr)
 	struct fsp_msg *msg;
 	uint32_t align;
 	uint32_t cmd_header;
+
+	if (fsp_in_rr())
+		return OPAL_BUSY;
 
 	prlog(PR_INSANE, "Get the data for modifier [%x]\n",
 	      spcn_mod_data[attr->mod_index].mod);
@@ -509,12 +513,15 @@ static int64_t parse_sensor_id(uint32_t handler, struct opal_sensor_data *attr)
 
 
 int64_t fsp_opal_read_sensor(uint32_t sensor_hndl, int token,
-		uint32_t *sensor_data)
+		uint64_t *sensor_data)
 {
 	struct opal_sensor_data *attr;
 	int64_t rc;
 
 	prlog(PR_INSANE, "fsp_opal_read_sensor [%08x]\n", sensor_hndl);
+
+	if (fsp_in_rr())
+		return OPAL_BUSY;
 
 	if (sensor_state == SENSOR_PERMANENT_ERROR) {
 		rc = OPAL_HARDWARE;
@@ -617,7 +624,7 @@ static struct dt_node *sensor_get_node(struct dt_node *sensors,
 }
 
 #define sensor_handler(header, attr_num) \
-	sensor_make_handler((header).frc, (header).rid, attr_num)
+	sensor_make_handler(SENSOR_FSP, (header).frc, (header).rid, attr_num)
 
 static int add_sensor_prs(struct dt_node *sensors, struct sensor_prs *prs)
 {

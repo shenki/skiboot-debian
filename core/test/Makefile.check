@@ -1,5 +1,7 @@
 # -*-Makefile-*-
-CORE_TEST := core/test/run-device \
+CORE_TEST := \
+	core/test/run-bitmap \
+	core/test/run-device \
 	core/test/run-flash-subpartition \
 	core/test/run-mem_region \
 	core/test/run-malloc \
@@ -16,7 +18,8 @@ CORE_TEST := core/test/run-device \
 	core/test/run-pool \
 	core/test/run-time-utils \
 	core/test/run-timebase \
-	core/test/run-timer
+	core/test/run-timer \
+	core/test/run-buddy
 
 HOSTCFLAGS+=-I . -I include
 

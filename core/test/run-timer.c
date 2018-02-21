@@ -7,10 +7,16 @@
 
 #define mftb()	(stamp)
 #define sync()
+#define smt_lowest()
+#define smt_medium()
 
 static uint64_t stamp, last;
 struct lock;
-static inline void lock(struct lock *l) { (void)l; }
+static inline void lock_caller(struct lock *l, const char *caller)
+{
+	(void)caller;
+	(void)l;
+}
 static inline void unlock(struct lock *l) { (void)l; }
 
 unsigned long tb_hz = 512000000;

@@ -10,6 +10,9 @@ ibm,opal
    ibm,opal/*
 
 
+Top level ibm,opal node
+-----------------------
+
 .. code-block:: dts
 
    ibm,opal {
@@ -22,7 +25,7 @@ ibm,opal
     * ibm,opal-v2 is *NOT* present on POWER9 and above.
     */
 
-		ibm,associativity-reference-points = <0x4 0x3>;
+		ibm,associativity-reference-points = <0x4 0x3, 0x2>;
 		ibm,heartbeat-ms = <0x7d0>;
 
    /* how often any OPAL call needs to be made to avoid a watchdog timer on BMC
@@ -46,3 +49,4 @@ ibm,opal
 		opal-msg-size = <0x48>;
 		opal-runtime-size = <0x0 0x9a00000>;
 		phandle = <0x10000003>;
+    };

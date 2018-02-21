@@ -76,7 +76,7 @@ static void pci_slot_prepare_link_change(struct pci_slot *slot, bool up)
 	}
 }
 
-static int64_t pci_slot_sm_poll(struct pci_slot *slot)
+static int64_t pci_slot_run_sm(struct pci_slot *slot)
 {
 	uint64_t now = mftb();
 	int64_t ret;
@@ -121,6 +121,9 @@ void pci_slot_add_dt_properties(struct pci_slot *slot,
 	dt_add_property_cells(np, "ibm,slot-pluggable", slot->pluggable);
 	dt_add_property_cells(np, "ibm,slot-surprise-pluggable",
 			      slot->surprise_pluggable);
+	if (pci_slot_has_flags(slot, PCI_SLOT_FLAG_BROKEN_PDC))
+		dt_add_property_cells(np, "ibm,slot-broken-pdc", 1);
+
 	dt_add_property_cells(np, "ibm,slot-power-ctl", slot->power_ctl);
 	dt_add_property_cells(np, "ibm,slot-power-led-ctlled",
 			      slot->power_led_ctl);
@@ -173,8 +176,9 @@ struct pci_slot *pci_slot_alloc(struct phb *phb,
 	slot->pd = pd;
 	pci_slot_set_state(slot, PCI_SLOT_STATE_NORMAL);
 	slot->power_state = PCI_SLOT_POWER_ON;
-	slot->ops.poll = pci_slot_sm_poll;
+	slot->ops.run_sm = pci_slot_run_sm;
 	slot->ops.prepare_link_change = pci_slot_prepare_link_change;
+	slot->peer_slot = NULL;
 	if (!pd) {
 		slot->id = PCI_PHB_SLOT_ID(phb);
 		phb->slot = slot;
@@ -208,4 +212,34 @@ struct pci_slot *pci_slot_find(uint64_t id)
 	pd = phb ? pci_find_dev(phb, bdfn) : NULL;
 	slot = pd ? pd->slot : NULL;
 	return slot;
+}
+
+void pci_slot_add_loc(struct pci_slot *slot,
+			struct dt_node *np, const char *label)
+{
+	char tmp[8], loc_code[LOC_CODE_SIZE];
+	struct pci_device *pd = slot->pd;
+	struct phb *phb = slot->phb;
+
+	if (!np)
+		return;
+
+	/* didn't get a real slot label? generate one! */
+	if (!label) {
+		snprintf(tmp, sizeof(tmp), "S%04x%02x", phb->opal_id,
+			pd->secondary_bus);
+		label = tmp;
+	}
+
+	/* Make a <PHB_LOC_CODE>-<LABEL> pair if we have a PHB loc code */
+	if (phb->base_loc_code) {
+		snprintf(loc_code, sizeof(loc_code), "%s-%s",
+			phb->base_loc_code, label);
+	} else {
+		strncpy(loc_code, label, sizeof(loc_code));
+	}
+
+	dt_add_property_string(np, "ibm,slot-label", label);
+	dt_add_property_nstr(np, "ibm,slot-location-code", loc_code,
+				sizeof(loc_code));
 }

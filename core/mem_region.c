@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2017 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,7 +54,9 @@ void mem_dump_allocs(void);
 struct lock mem_region_lock = LOCK_UNLOCKED;
 
 static struct list_head regions = LIST_HEAD_INIT(regions);
+static struct list_head early_reserves = LIST_HEAD_INIT(early_reserves);
 
+static bool mem_region_init_done = false;
 static bool mem_regions_finalised = false;
 
 unsigned long top_of_ram = SKIBOOT_BASE + SKIBOOT_SIZE;
@@ -289,23 +291,23 @@ void mem_dump_allocs(void)
 	struct alloc_hdr *hdr;
 
 	/* Second pass: populate property data */
-	printf("Memory regions:\n");
+	prlog(PR_INFO, "Memory regions:\n");
 	list_for_each(&regions, region, list) {
 		if (!(region->type == REGION_SKIBOOT_HEAP ||
 		      region->type == REGION_MEMORY))
 			continue;
-		printf("  0x%012llx..%012llx : %s\n",
+		prlog(PR_INFO, "  0x%012llx..%012llx : %s\n",
 		       (long long)region->start,
 		       (long long)(region->start + region->len - 1),
 		       region->name);
 		if (region->free_list.n.next == NULL) {
-			printf("    no allocs\n");
+			prlog(PR_INFO, "    no allocs\n");
 			continue;
 		}
 		for (hdr = region_start(region); hdr; hdr = next_hdr(region, hdr)) {
 			if (hdr->free)
 				continue;
-			printf("    0x%.8lx %s\n", hdr->num_longs * sizeof(long),
+			prlog(PR_INFO, "    0x%.8lx %s\n", hdr->num_longs * sizeof(long),
 			       hdr_location(hdr));
 		}
 	}
@@ -320,7 +322,7 @@ int64_t mem_dump_free(void)
 
 	total_free = 0;
 
-	printf("Free space in HEAP memory regions:\n");
+	prlog(PR_INFO, "Free space in HEAP memory regions:\n");
 	list_for_each(&regions, region, list) {
 		if (!(region->type == REGION_SKIBOOT_HEAP ||
 		      region->type == REGION_MEMORY))
@@ -336,12 +338,12 @@ int64_t mem_dump_free(void)
 
 			region_free+= hdr->num_longs * sizeof(long);
 		}
-		printf("Region %s free: %"PRIx64"\n",
+		prlog(PR_INFO, "Region %s free: %"PRIx64"\n",
 		       region->name, region_free);
 		total_free += region_free;
 	}
 
-	printf("Total free: %"PRIu64"\n", total_free);
+	prlog(PR_INFO, "Total free: %"PRIu64"\n", total_free);
 
 	return total_free;
 }
@@ -687,6 +689,14 @@ static bool overlaps(const struct mem_region *r1, const struct mem_region *r2)
 		&& r1->start < r2->start + r2->len);
 }
 
+static bool contains(const struct mem_region *r1, const struct mem_region *r2)
+{
+	u64 r1_end = r1->start + r1->len;
+	u64 r2_end = r2->start + r2->len;
+
+	return (r1->start <= r2->start && r2_end <= r1_end);
+}
+
 static struct mem_region *get_overlap(const struct mem_region *region)
 {
 	struct mem_region *i;
@@ -709,10 +719,29 @@ static bool add_region(struct mem_region *region)
 	}
 
 	/* First split any regions which intersect. */
-	list_for_each(&regions, r, list)
+	list_for_each(&regions, r, list) {
+		/*
+		 * The new region should be fully contained by an existing one.
+		 * If it's not then we have a problem where reservations
+		 * partially overlap which is probably broken.
+		 *
+		 * NB: There *might* be situations where this is legitimate,
+		 * but the region handling does not currently support this.
+		 */
+		if (overlaps(r, region) && !contains(r, region)) {
+			prerror("MEM: Partial overlap detected between regions:\n");
+			prerror("MEM: %s [0x%"PRIx64"-0x%"PRIx64"] (new)\n",
+				region->name, region->start,
+				region->start + region->len);
+			prerror("MEM: %s [0x%"PRIx64"-0x%"PRIx64"]\n",
+				r->name, r->start, r->start + r->len);
+			return false;
+		}
+
 		if (!maybe_split(r, region->start) ||
 		    !maybe_split(r, region->start + region->len))
 			return false;
+	}
 
 	/* Now we have only whole overlaps, if any. */
 	while ((r = get_overlap(region)) != NULL) {
@@ -727,17 +756,33 @@ static bool add_region(struct mem_region *region)
 	return true;
 }
 
-void mem_reserve_hw(const char *name, uint64_t start, uint64_t len)
+static void mem_reserve(enum mem_region_type type, const char *name,
+		uint64_t start, uint64_t len)
 {
 	struct mem_region *region;
-	bool added;
+	bool added = true;
 
 	lock(&mem_region_lock);
-	region = new_region(name, start, len, NULL, REGION_HW_RESERVED);
+	region = new_region(name, start, len, NULL, type);
 	assert(region);
-	added = add_region(region);
+
+	if (!mem_region_init_done)
+		list_add(&early_reserves, &region->list);
+	else
+		added = add_region(region);
+
 	assert(added);
 	unlock(&mem_region_lock);
+}
+
+void mem_reserve_fw(const char *name, uint64_t start, uint64_t len)
+{
+	mem_reserve(REGION_FW_RESERVED, name, start, len);
+}
+
+void mem_reserve_hwbuf(const char *name, uint64_t start, uint64_t len)
+{
+	mem_reserve(REGION_RESERVED, name, start, len);
 }
 
 static bool matches_chip_id(const __be32 ids[], size_t num, u32 chip_id)
@@ -821,6 +866,7 @@ bool mem_range_is_reserved(uint64_t start, uint64_t size)
 {
 	uint64_t end = start + size;
 	struct mem_region *region;
+	struct list_head *search;
 
 	/* We may have the range covered by a number of regions, which could
 	 * appear in any order. So, we look for a region that covers the
@@ -832,10 +878,16 @@ bool mem_range_is_reserved(uint64_t start, uint64_t size)
 	 * This has a worst-case of O(n^2), but n is well bounded by the
 	 * small number of reservations.
 	 */
+
+	if (!mem_region_init_done)
+		search = &early_reserves;
+	else
+		search = &regions;
+
 	for (;;) {
 		bool found = false;
 
-		list_for_each(&regions, region, list) {
+		list_for_each(search, region, list) {
 			if (!region_is_reserved(region))
 				continue;
 
@@ -874,7 +926,7 @@ static void mem_region_parse_reserved_properties(void)
 	const struct dt_property *names, *ranges;
 	struct mem_region *region;
 
-	prlog(PR_INFO, "MEM: parsing reserved memory from "
+	prlog(PR_DEBUG, "MEM: parsing reserved memory from "
 			"reserved-names/-ranges properties\n");
 
 	names = dt_find_property(dt_root, "reserved-names");
@@ -894,8 +946,11 @@ static void mem_region_parse_reserved_properties(void)
 			region = new_region(name,
 					dt_get_number(range, 2),
 					dt_get_number(range + 1, 2),
-					NULL, REGION_HW_RESERVED);
-			list_add(&regions, &region->list);
+					NULL, REGION_FW_RESERVED);
+			if (!add_region(region)) {
+				prerror("Couldn't add mem_region %s\n", name);
+				abort();
+			}
 		}
 	} else if (names || ranges) {
 		prerror("Invalid properties: reserved-names=%p "
@@ -920,6 +975,7 @@ static bool mem_region_parse_reserved_nodes(const char *path)
 	dt_for_each_child(parent, node) {
 		const struct dt_property *reg;
 		struct mem_region *region;
+		int type;
 
 		reg = dt_find_property(node, "reg");
 		if (!reg) {
@@ -930,11 +986,20 @@ static bool mem_region_parse_reserved_nodes(const char *path)
 			continue;
 		}
 
+		if (dt_has_node_property(node, "no-map", NULL))
+			type = REGION_RESERVED;
+		else
+			type = REGION_FW_RESERVED;
+
 		region = new_region(strdup(node->name),
 				dt_get_number(reg->prop, 2),
 				dt_get_number(reg->prop + sizeof(u64), 2),
-				node, REGION_HW_RESERVED);
-		list_add(&regions, &region->list);
+				node, type);
+		if (!add_region(region)) {
+			char *nodepath = dt_get_path(node);
+			prerror("node %s failed to add_region()\n", nodepath);
+			free(nodepath);
+		}
 	}
 
 	return true;
@@ -943,7 +1008,7 @@ static bool mem_region_parse_reserved_nodes(const char *path)
 /* Trawl through device tree, create memory regions from nodes. */
 void mem_region_init(void)
 {
-	struct mem_region *region;
+	struct mem_region *region, *next;
 	struct dt_node *i;
 	bool rc;
 
@@ -1003,6 +1068,15 @@ void mem_region_init(void)
 		abort();
 	}
 
+	/* Add reserved reanges from HDAT */
+	list_for_each_safe(&early_reserves, region, next, list) {
+		bool added;
+
+		list_del(&region->list);
+		added = add_region(region);
+		assert(added);
+	}
+
 	/* Add reserved ranges from the DT */
 	rc = mem_region_parse_reserved_nodes("/reserved-memory");
 	if (!rc)
@@ -1011,8 +1085,8 @@ void mem_region_init(void)
 	if (!rc)
 		mem_region_parse_reserved_properties();
 
+	mem_region_init_done = true;
 	unlock(&mem_region_lock);
-
 }
 
 static uint64_t allocated_length(const struct mem_region *r)
@@ -1046,7 +1120,7 @@ void mem_region_release_unused(void)
 	lock(&mem_region_lock);
 	assert(!mem_regions_finalised);
 
-	printf("Releasing unused memory:\n");
+	prlog(PR_INFO, "Releasing unused memory:\n");
 	list_for_each(&regions, r, list) {
 		uint64_t used_len;
 
@@ -1057,7 +1131,7 @@ void mem_region_release_unused(void)
 
 		used_len = allocated_length(r);
 
-		printf("    %s: %llu/%llu used\n",
+		prlog(PR_INFO, "    %s: %llu/%llu used\n",
 		       r->name, (long long)used_len, (long long)r->len);
 
 		/* We keep the skiboot heap. */
@@ -1101,7 +1175,7 @@ static void mem_region_add_dt_reserved_node(struct dt_node *parent,
 	 * update regions' device-tree nodes, and we want those updates to
 	 * apply to the nodes in /reserved-memory/.
 	 */
-	if (region->type == REGION_HW_RESERVED && region->node) {
+	if (region->type == REGION_FW_RESERVED && region->node) {
 		if (region->node->parent != parent)
 			region->node = dt_copy(region->node, parent);
 		return;
@@ -1119,6 +1193,14 @@ static void mem_region_add_dt_reserved_node(struct dt_node *parent,
 	region->node = dt_new_addr(parent, name, region->start);
 	assert(region->node);
 	dt_add_property_u64s(region->node, "reg", region->start, region->len);
+
+	/*
+	 * This memory is used by hardware and may need special handling. Ask
+	 * the host kernel not to map it by default.
+	 */
+	if (region->type == REGION_RESERVED)
+		dt_add_property(region->node, "no-map", NULL, 0);
+
 	free(name);
 }
 
@@ -1150,39 +1232,45 @@ void mem_region_add_dt_reserved(void)
 		dt_add_property(node, "ranges", NULL, 0);
 	}
 
-	/* First pass: calculate length of property data */
+	prlog(PR_INFO, "Reserved regions:\n");
+
+	/* First pass, create /reserved-memory/ nodes for each reservation,
+	 * and calculate the length for the /reserved-names and
+	 * /reserved-ranges properties */
 	list_for_each(&regions, region, list) {
 		if (!region_is_reservable(region))
 			continue;
-		names_len += strlen(region->name) + 1;
-		ranges_len += 2 * sizeof(uint64_t);
-	}
 
-	name = names = malloc(names_len);
-	range = ranges = malloc(ranges_len);
-
-	printf("Reserved regions:\n");
-	/* Second pass: populate property data */
-	list_for_each(&regions, region, list) {
-		if (!region_is_reservable(region))
-			continue;
-		len = strlen(region->name) + 1;
-		memcpy(name, region->name, len);
-		name += len;
-
-		printf("  0x%012llx..%012llx : %s\n",
+		prlog(PR_INFO, "  0x%012llx..%012llx : %s\n",
 		       (long long)region->start,
 		       (long long)(region->start + region->len - 1),
 		       region->name);
 
 		mem_region_add_dt_reserved_node(node, region);
 
+		/* calculate the size of the properties populated later */
+		names_len += strlen(region->node->name) + 1;
+		ranges_len += 2 * sizeof(uint64_t);
+	}
+
+	name = names = malloc(names_len);
+	range = ranges = malloc(ranges_len);
+
+	/* Second pass: populate the old-style reserved-names and
+	 * reserved-regions arrays based on the node data */
+	list_for_each(&regions, region, list) {
+		if (!region_is_reservable(region))
+			continue;
+
+		len = strlen(region->node->name) + 1;
+		memcpy(name, region->node->name, len);
+		name += len;
+
 		range[0] = cpu_to_fdt64(region->start);
 		range[1] = cpu_to_fdt64(region->len);
 		range += 2;
 	}
 	unlock(&mem_region_lock);
-
 
 	prop = dt_find_property(dt_root, "reserved-names");
 	if (prop)

@@ -29,6 +29,8 @@
 #include <affinity.h>
 #include <opal-msg.h>
 #include <timer.h>
+#include <elf-abi.h>
+#include <errorlog.h>
 
 /* Pending events to signal via opal_poll_events */
 uint64_t opal_pending_events;
@@ -50,16 +52,22 @@ static uint64_t opal_dynamic_events;
 extern uint32_t attn_trigger;
 extern uint32_t hir_trigger;
 
+/* We make this look like a Surveillance error, even though it really
+ * isn't one.
+ */
+DEFINE_LOG_ENTRY(OPAL_INJECTED_HIR, OPAL_MISC_ERR_EVT, OPAL_SURVEILLANCE,
+		OPAL_SURVEILLANCE_ERR, OPAL_PREDICTIVE_ERR_GENERAL,
+		OPAL_MISCELLANEOUS_INFO_ONLY);
+
 void opal_table_init(void)
 {
 	struct opal_table_entry *s = __opal_table_start;
 	struct opal_table_entry *e = __opal_table_end;
 
-	printf("OPAL table: %p .. %p, branch table: %p\n",
-	       s, e, opal_branch_table);
+	prlog(PR_DEBUG, "OPAL table: %p .. %p, branch table: %p\n",
+	      s, e, opal_branch_table);
 	while(s < e) {
-		uint64_t *func = s->func;
-		opal_branch_table[s->token] = *func;
+		opal_branch_table[s->token] = function_entry_address(s->func);
 		opal_num_args[s->token] = s->nargs;
 		s++;
 	}
@@ -84,19 +92,12 @@ long opal_bad_token(uint64_t token)
 	return OPAL_PARAMETER;
 }
 
-/* Called from head.S, thus no prototype */
-void opal_trace_entry(struct stack_frame *eframe);
-
-void opal_trace_entry(struct stack_frame *eframe)
+static void opal_trace_entry(struct stack_frame *eframe __unused)
 {
+#ifdef OPAL_TRACE_ENTRY
 	union trace t;
 	unsigned nargs, i;
 
-	if (this_cpu()->pir != mfspr(SPR_PIR)) {
-		printf("CPU MISMATCH ! PIR=%04lx cpu @%p -> pir=%04x\n",
-		       mfspr(SPR_PIR), this_cpu(), this_cpu()->pir);
-		abort();
-	}
 	if (eframe->gpr[0] > OPAL_LAST)
 		nargs = 0;
 	else
@@ -109,16 +110,243 @@ void opal_trace_entry(struct stack_frame *eframe)
 		t.opal.r3_to_11[i] = cpu_to_be64(eframe->gpr[3+i]);
 
 	trace_add(&t, TRACE_OPAL, offsetof(struct trace_opal, r3_to_11[nargs]));
+#endif
 }
+
+/*
+ * opal_quiesce_state is used as a lock. Don't use an actual lock to avoid
+ * lock busting.
+ */
+static uint32_t opal_quiesce_state;	/* 0 or QUIESCE_HOLD/QUIESCE_REJECT */
+static int32_t opal_quiesce_owner;	/* PIR */
+static int32_t opal_quiesce_target;	/* -1 or PIR */
+
+static int64_t opal_check_token(uint64_t token);
+
+/* Called from head.S, thus no prototype */
+int64_t opal_entry_check(struct stack_frame *eframe);
+
+int64_t opal_entry_check(struct stack_frame *eframe)
+{
+	struct cpu_thread *cpu = this_cpu();
+	uint64_t token = eframe->gpr[0];
+
+	if (cpu->pir != mfspr(SPR_PIR)) {
+		printf("CPU MISMATCH ! PIR=%04lx cpu @%p -> pir=%04x token=%llu\n",
+		       mfspr(SPR_PIR), cpu, cpu->pir, token);
+		abort();
+	}
+
+	opal_trace_entry(eframe);
+
+	if (!opal_check_token(token))
+		return opal_bad_token(token);
+
+	if (!opal_quiesce_state && cpu->in_opal_call) {
+		printf("CPU ATTEMPT TO RE-ENTER FIRMWARE! PIR=%04lx cpu @%p -> pir=%04x token=%llu\n",
+		       mfspr(SPR_PIR), cpu, cpu->pir, token);
+		return OPAL_BUSY;
+	}
+
+again:
+	cpu->in_opal_call++;
+	/*
+	 * Order the store in_opal_call vs load quiesce_opal_call.
+	 * This also provides an acquire barrier for opal entry vs
+	 * another thread quiescing opal. In this way, quiescing
+	 * can behave as mutual exclusion.
+	 */
+	sync();
+	if (cpu->quiesce_opal_call) {
+		cpu->in_opal_call--;
+		if (opal_quiesce_state == QUIESCE_REJECT)
+			return OPAL_BUSY;
+		smt_lowest();
+		while (cpu->quiesce_opal_call)
+			barrier();
+		smt_medium();
+		goto again;
+	}
+
+	return OPAL_SUCCESS;
+}
+
+int64_t opal_exit_check(int64_t retval, struct stack_frame *eframe);
+
+int64_t opal_exit_check(int64_t retval, struct stack_frame *eframe)
+{
+	struct cpu_thread *cpu = this_cpu();
+	uint64_t token = eframe->gpr[0];
+
+	if (!cpu->in_opal_call) {
+		printf("CPU UN-ACCOUNTED FIRMWARE ENTRY! PIR=%04lx cpu @%p -> pir=%04x token=%llu retval=%lld\n",
+		       mfspr(SPR_PIR), cpu, cpu->pir, token, retval);
+	} else {
+		if (!list_empty(&cpu->locks_held)) {
+			prlog(PR_ERR, "OPAL exiting with locks held, token=%llu retval=%lld\n",
+			      token, retval);
+			drop_my_locks(true);
+		}
+		sync(); /* release barrier vs quiescing */
+		cpu->in_opal_call--;
+	}
+	return retval;
+}
+
+int64_t opal_quiesce(uint32_t quiesce_type, int32_t cpu_target)
+{
+	struct cpu_thread *cpu = this_cpu();
+	struct cpu_thread *target = NULL;
+	struct cpu_thread *c;
+	uint64_t end;
+	bool stuck = false;
+
+	if (cpu_target >= 0) {
+		target = find_cpu_by_server(cpu_target);
+		if (!target)
+			return OPAL_PARAMETER;
+	} else if (cpu_target != -1) {
+		return OPAL_PARAMETER;
+	}
+
+	if (quiesce_type == QUIESCE_HOLD || quiesce_type == QUIESCE_REJECT) {
+		if (cmpxchg32(&opal_quiesce_state, 0, quiesce_type) != 0) {
+			if (opal_quiesce_owner != cpu->pir) {
+				/*
+				 * Nested is allowed for now just for
+				 * internal uses, so an error is returned
+				 * for OS callers, but no error message
+				 * printed if we are nested.
+				 */
+				printf("opal_quiesce already quiescing\n");
+			}
+			return OPAL_BUSY;
+		}
+		opal_quiesce_owner = cpu->pir;
+		opal_quiesce_target = cpu_target;
+	}
+
+	if (opal_quiesce_owner != cpu->pir) {
+		printf("opal_quiesce CPU does not own quiesce state (must call QUIESCE_HOLD or QUIESCE_REJECT)\n");
+		return OPAL_BUSY;
+	}
+
+	/* Okay now we own the quiesce state */
+
+	if (quiesce_type == QUIESCE_RESUME ||
+			quiesce_type == QUIESCE_RESUME_FAST_REBOOT) {
+		bust_locks = false;
+		sync(); /* release barrier vs opal entry */
+		if (target) {
+			target->quiesce_opal_call = false;
+		} else {
+			for_each_cpu(c) {
+				if (quiesce_type == QUIESCE_RESUME_FAST_REBOOT)
+					c->in_opal_call = 0;
+
+				if (c == cpu) {
+					assert(!c->quiesce_opal_call);
+					continue;
+				}
+				c->quiesce_opal_call = false;
+			}
+		}
+		sync();
+		opal_quiesce_state = 0;
+		return OPAL_SUCCESS;
+	}
+
+	if (quiesce_type == QUIESCE_LOCK_BREAK) {
+		if (opal_quiesce_target != -1) {
+			printf("opal_quiesce has not quiesced all CPUs (must target -1)\n");
+			return OPAL_BUSY;
+		}
+		bust_locks = true;
+		return OPAL_SUCCESS;
+	}
+
+	if (target) {
+		target->quiesce_opal_call = true;
+	} else {
+		for_each_cpu(c) {
+			if (c == cpu)
+				continue;
+			c->quiesce_opal_call = true;
+		}
+	}
+
+	sync(); /* Order stores to quiesce_opal_call vs loads of in_opal_call */
+
+	end = mftb() + msecs_to_tb(1000);
+
+	smt_lowest();
+	if (target) {
+		while (target->in_opal_call) {
+			if (tb_compare(mftb(), end) == TB_AAFTERB) {
+				printf("OPAL quiesce CPU:%04x stuck in OPAL\n", target->pir);
+				stuck = true;
+				break;
+			}
+			barrier();
+		}
+	} else {
+		for_each_cpu(c) {
+			if (c == cpu)
+				continue;
+			while (c->in_opal_call) {
+				if (tb_compare(mftb(), end) == TB_AAFTERB) {
+					printf("OPAL quiesce CPU:%04x stuck in OPAL\n", c->pir);
+					stuck = true;
+					break;
+				}
+				barrier();
+			}
+		}
+	}
+	smt_medium();
+	sync(); /* acquire barrier vs opal entry */
+
+	if (stuck) {
+		printf("OPAL quiesce could not kick all CPUs out of OPAL\n");
+		return OPAL_PARTIAL;
+	}
+
+	return OPAL_SUCCESS;
+}
+opal_call(OPAL_QUIESCE, opal_quiesce, 2);
 
 void __opal_register(uint64_t token, void *func, unsigned int nargs)
 {
-	uint64_t *opd = func;
-
 	assert(token <= OPAL_LAST);
 
-	opal_branch_table[token] = *opd;
+	opal_branch_table[token] = function_entry_address(func);
 	opal_num_args[token] = nargs;
+}
+
+/*
+ * add_opal_firmware_exports_node: adds properties to the device-tree which
+ * the OS will then change into sysfs nodes.
+ * The properties must be placed under /ibm,opal/firmware/exports.
+ * The new sysfs nodes are created under /opal/exports.
+ * To be correctly exported the properties must contain:
+ * 	name
+ * 	base memory location (u64)
+ * 	size 		     (u64)
+ */
+static void add_opal_firmware_exports_node(struct dt_node *node)
+{
+	struct dt_node *exports = dt_new(node, "exports");
+	uint64_t sym_start = (uint64_t)__sym_map_start;
+	uint64_t sym_size = (uint64_t)__sym_map_end - sym_start;
+
+	/*
+	 * These property names will be used by Linux as the user-visible file
+	 * name, so make them meaningful if possible. We use _ as the separator
+	 * here to remain consistent with existing file names in /sys/opal.
+	 */
+	dt_add_property_u64s(exports, "symbol_map", sym_start, sym_size);
+	dt_add_property_u64s(exports, "hdat_map", SPIRA_HEAP_BASE,
+				SPIRA_HEAP_SIZE);
 }
 
 static void add_opal_firmware_node(void)
@@ -126,12 +354,18 @@ static void add_opal_firmware_node(void)
 	struct dt_node *firmware = dt_new(opal_node, "firmware");
 	uint64_t sym_start = (uint64_t)__sym_map_start;
 	uint64_t sym_size = (uint64_t)__sym_map_end - sym_start;
+
 	dt_add_property_string(firmware, "compatible", "ibm,opal-firmware");
 	dt_add_property_string(firmware, "name", "firmware");
 	dt_add_property_string(firmware, "version", version);
-	dt_add_property_cells(firmware, "symbol-map",
-			      hi32(sym_start), lo32(sym_start),
-			      hi32(sym_size), lo32(sym_size));
+	/*
+	 * As previous OS versions use symbol-map located at
+	 * /ibm,opal/firmware we will keep a copy of symbol-map here
+	 * for backwards compatibility
+	 */
+	dt_add_property_u64s(firmware, "symbol-map", sym_start, sym_size);
+
+	add_opal_firmware_exports_node(firmware);
 }
 
 void add_opal_node(void)
@@ -153,11 +387,7 @@ void add_opal_node(void)
 	size = (CPU_STACKS_BASE +
 		(uint64_t)(cpu_max_pir + 1) * STACK_SIZE) - SKIBOOT_BASE;
 
-	if (!opal_node) {
-		opal_node = dt_new(dt_root, "ibm,opal");
-		assert(opal_node);
-	}
-
+	opal_node = dt_new_check(dt_root, "ibm,opal");
 	dt_add_property_cells(opal_node, "#address-cells", 0);
 	dt_add_property_cells(opal_node, "#size-cells", 0);
 
@@ -182,7 +412,6 @@ void add_opal_node(void)
 	add_opal_firmware_node();
 	add_associativity_ref_point();
 	memcons_add_properties();
-	add_cpu_idle_state_properties();
 }
 
 static struct lock evt_lock = LOCK_UNLOCKED;
@@ -332,7 +561,7 @@ void opal_run_pollers(void)
 	}
 	this_cpu()->in_poller = true;
 
-	if (this_cpu()->lock_depth && pollers_with_lock_warnings < 64) {
+	if (!list_empty(&this_cpu()->locks_held) && pollers_with_lock_warnings < 64) {
 		/**
 		 * @fwts-label OPALPollerWithLock
 		 * @fwts-advice opal_run_pollers() was called with a lock
@@ -340,6 +569,7 @@ void opal_run_pollers(void)
 		 * lucky/careful.
 		 */
 		prlog(PR_ERR, "Running pollers with lock held !\n");
+		dump_locks_list();
 		backtrace();
 		pollers_with_lock_warnings++;
 		if (pollers_with_lock_warnings == 64) {
@@ -382,7 +612,9 @@ static int64_t opal_poll_events(__be64 *outstanding_event_mask)
 
 	/* Test the host initiated reset */
 	if (hir_trigger == 0xdeadbeef) {
-		fsp_trigger_reset();
+		uint32_t plid = log_simple_error(&e_info(OPAL_INJECTED_HIR),
+			"SURV: Injected HIR, initiating FSP R/R\n");
+		fsp_trigger_reset(plid);
 		hir_trigger = 0;
 	}
 

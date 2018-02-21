@@ -26,6 +26,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <skiboot-valgrind.h>
+
 /* Don't include these: PPC-specific */
 #define __CPU_H
 #define __TIME_H
@@ -111,8 +113,9 @@ struct debug_descriptor debug_descriptor = {
 	.trace_mask = -1
 };
 
-void lock(struct lock *l)
+void lock_caller(struct lock *l, const char *caller)
 {
+	(void)caller;
 	assert(!l->lock_val);
 	l->lock_val = 1;
 }
@@ -130,7 +133,7 @@ static struct cpu_thread *this_cpu(void)
 }
 
 #include <sys/mman.h>
-#define PER_CHILD_TRACES (1024*1024)
+#define PER_CHILD_TRACES ((RUNNING_ON_VALGRIND) ? (1024*16) : (1024*1024))
 
 static void write_trace_entries(int id)
 {

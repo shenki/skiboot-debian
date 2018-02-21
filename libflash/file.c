@@ -15,6 +15,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 #include <mtd/mtd-abi.h>
 
 #include "libflash.h"
+#include "libflash/file.h"
 #include "blocklevel.h"
 
 struct file_data {
@@ -70,11 +72,12 @@ static int file_read(struct blocklevel_device *bl, uint64_t pos, void *buf, uint
 		return FLASH_ERR_PARM_ERROR;
 
 	while (count < len) {
-		rc = read(file_data->fd, buf, len);
+		rc = read(file_data->fd, buf, len - count);
 		/* errno should remain set */
 		if (rc == -1 || rc == 0)
 			return FLASH_ERR_BAD_READ;
 
+		buf += rc;
 		count += rc;
 	}
 
@@ -93,11 +96,12 @@ static int file_write(struct blocklevel_device *bl, uint64_t dst, const void *sr
 		return FLASH_ERR_PARM_ERROR;
 
 	while (count < len) {
-		rc = write(file_data->fd, src, len);
+		rc = write(file_data->fd, src, len - count);
 		/* errno should remain set */
 		if (rc == -1)
 			return FLASH_ERR_VERIFY_FAILURE;
 
+		src += rc;
 		count += rc;
 	}
 
@@ -121,7 +125,7 @@ static int file_erase(struct blocklevel_device *bl, uint64_t dst, uint64_t len)
 		rc = file_write(bl, dst + i, &d, len - i > sizeof(d) ? sizeof(d) : len - i);
 		if (rc)
 			return rc;
-		i += sizeof(d);
+		i += len - i > sizeof(d) ? sizeof(d) : len - i;
 	}
 
 	return 0;
@@ -130,14 +134,55 @@ static int file_erase(struct blocklevel_device *bl, uint64_t dst, uint64_t len)
 static int mtd_erase(struct blocklevel_device *bl, uint64_t dst, uint64_t len)
 {
 	struct file_data *file_data = container_of(bl, struct file_data, bl);
-	struct erase_info_user64 erase_info = {
-		.start = dst,
-		.length = len
-	};
+	int err;
 
-	if (ioctl(file_data->fd, MEMERASE64, &erase_info) == -1)
-		return FLASH_ERR_PARM_ERROR;
+	FL_DBG("%s: dst: 0x%" PRIx64 ", len: 0x%" PRIx64 "\n", __func__, dst, len);
 
+	/*
+	 * Some kernels that pflash supports do not know about the 64bit
+	 * version of the ioctl() therefore we'll just use the 32bit (which
+	 * should always be supported...) unless we MUST use the 64bit and
+	 * then lets just hope the kernel knows how to deal with it. If it
+	 * is unsupported the ioctl() will fail and we'll report that -
+	 * there is no other option.
+	 *
+	 * Furthermore, even very recent MTD layers and drivers aren't
+	 * particularly good at not blocking in the kernel. This creates
+	 * unexpected behaviour in userspace tools using these functions.
+	 * In the absence of significant work inside the kernel, we'll just
+	 * split stuff up here for convenience.
+	 * We can assume everything is aligned here.
+	 */
+	while (len) {
+		if (dst > UINT_MAX || len > UINT_MAX) {
+			struct erase_info_user64 erase_info = {
+				.start = dst,
+				.length = file_data->bl.erase_mask + 1
+			};
+
+			if (ioctl(file_data->fd, MEMERASE64, &erase_info) == -1) {
+				err = errno;
+				if (err == 25) /* Kernel doesn't do 64bit MTD erase ioctl() */
+					FL_DBG("Attempted a 64bit erase on a kernel which doesn't support it\n");
+				FL_ERR("%s: IOCTL to kernel failed! %s\n", __func__, strerror(err));
+				errno = err;
+				return FLASH_ERR_PARM_ERROR;
+			}
+		} else {
+			struct erase_info_user erase_info = {
+				.start = dst,
+				.length = file_data->bl.erase_mask + 1
+			};
+			if (ioctl(file_data->fd, MEMERASE, &erase_info) == -1) {
+				err = errno;
+				FL_ERR("%s: IOCTL to kernel failed! %s\n", __func__, strerror(err));
+				errno = err;
+				return FLASH_ERR_PARM_ERROR;
+			}
+		}
+		dst += file_data->bl.erase_mask + 1;
+		len -= file_data->bl.erase_mask + 1;
+	}
 	return 0;
 }
 

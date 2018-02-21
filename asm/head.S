@@ -28,6 +28,8 @@
 #define PPC_INST_SLEEP		.long 0x4c0003a4
 #define PPC_INST_RVWINKLE	.long 0x4c0003e4
 
+#define PPC_INST_STOP		.long 0x4c0002e4
+
 #define GET_STACK(stack_reg,pir_reg)				\
 	sldi	stack_reg,pir_reg,STACK_SHIFT;			\
 	addis	stack_reg,stack_reg,CPU_STACKS_OFFSET@ha;	\
@@ -107,6 +109,7 @@ hir_trigger:
 
 	/* Entry point set by the FSP */
 	.= 0x180
+hdat_entry:
 	li	%r27,0
 	b	boot_entry
 
@@ -197,8 +200,8 @@ _exception:
 	mflr	%r6
 	stw	%r3,STACK_CR(%r1)
 	stw	%r4,STACK_XER(%r1)
-	stw	%r5,STACK_CTR(%r1)
-	stw	%r5,STACK_LR(%r1)
+	std	%r5,STACK_CTR(%r1)
+	std	%r6,STACK_LR(%r1)
 	mfspr	%r3,SPR_SRR0
 	mfspr	%r4,SPR_SRR1
 	mfspr	%r5,SPR_HSRR0
@@ -207,6 +210,10 @@ _exception:
 	std	%r4,STACK_SRR1(%r1)
 	std	%r5,STACK_HSRR0(%r1)
 	std	%r6,STACK_HSRR1(%r1)
+	mfspr	%r3,SPR_DSISR
+	mfspr	%r4,SPR_DAR
+	stw	%r3,STACK_DSISR(%r1)
+	std	%r4,STACK_DAR(%r1)
 	mr	%r3,%r1
 	LOAD_IMM64(%r4, SKIBOOT_BASE)
 	LOAD_IMM32(%r5, exception_entry_foo - __head)
@@ -267,6 +274,7 @@ boot_entry:
 	cmpwi	cr0,%r3,PVR_TYPE_P9
 	beq 	1f
 	attn		/* Unsupported CPU type... what do we do ? */
+	b 	.	/* loop here, just in case attn is disabled */
 
 	/* P8 -> 8 threads */
 2:	li	%r26,7
@@ -385,6 +393,11 @@ boot_entry:
 	li	%r0,0
 	std	%r0,CPUTHREAD_STACK_BOT_MARK(%r13)
 #endif
+	/* Initialize the stack guard */
+	LOAD_IMM64(%r3,STACK_CHECK_GUARD_BASE);
+	xor	%r3,%r3,%r31
+	std	%r3,0(%r13)
+
 	/* Jump to C */
 	mr	%r3,%r27
 	bl	main_cpu_entry
@@ -397,7 +410,7 @@ secondary_wait:
 	 */
 	LOAD_IMM32(%r3, boot_flag - __head)
 	add	%r3,%r3,%r30
-1:	smt_very_low
+1:	smt_lowest
 	lwz	%r0,0(%r3)
 	cmpdi	%r0,0
 	beq	1b
@@ -415,7 +428,7 @@ secondary_wait:
 1:
 	/* Now wait for cpu_secondary_start to be set */
 	LOAD_ADDR_FROM_TOC(%r3, cpu_secondary_start)
-1:	smt_very_low
+1:	smt_lowest
 	ld	%r0,0(%r3)
 	cmpdi	%r0,0
 	beq	1b
@@ -440,7 +453,7 @@ secondary_wait:
 
 	/* Not found... what to do ? set some global error ? */
 secondary_not_found:
-	smt_very_low
+	smt_lowest
 	b	.
 
 call_relocate:
@@ -470,27 +483,36 @@ call_relocate:
        .long 0xa6037b7d; /* mtsrr1 r11                         */ \
        .long 0x2400004c  /* rfid                               */
 
-.global enter_pm_state
-enter_pm_state:
-	/* Before entering map or rvwinkle, we create a stack frame
-	 * and save our non-volatile registers.
-	 *
-	 * We also save these SPRs:
-	 *
-	 *  - HSPRG0	in GPR0 slot
-	 *  - HSPRG1	in GPR1 slot
-	 *
-	 *  - xxx TODO: HIDs
-	 *  - TODO: Mask MSR:ME during the process
-	 *
-	 * On entry, r3 indicates:
-	 *
-	 *    0 = nap
-	 *    1 = rvwinkle
-	 */
+.global enable_machine_check
+enable_machine_check:
 	mflr	%r0
-	std	%r0,16(%r1)
-	stdu	%r1,-STACK_FRAMESIZE(%r1)
+	bcl	20,31,$+4
+0:	mflr	%r3
+	addi	%r3,%r3,(1f - 0b)
+	mtspr	SPR_HSRR0,%r3
+	mfmsr	%r3
+	ori	%r3,%r3,MSR_ME
+	mtspr	SPR_HSRR1,%r3
+	hrfid
+1:	mtlr	%r0
+	blr
+
+.global disable_machine_check
+disable_machine_check:
+	mflr	%r0
+	bcl	20,31,$+4
+0:	mflr	%r3
+	addi	%r3,%r3,(1f - 0b)
+	mtspr	SPR_HSRR0,%r3
+	mfmsr	%r3
+	li	%r4,MSR_ME
+	andc	%r3,%r3,%r4
+	mtspr	SPR_HSRR1,%r3
+	hrfid
+1:	mtlr	%r0
+	blr
+
+pm_save_regs:
 	SAVE_GPR(2,%r1)
 	SAVE_GPR(14,%r1)
 	SAVE_GPR(15,%r1)
@@ -518,6 +540,31 @@ enter_pm_state:
 	stw	%r5,STACK_XER(%r1)
 	std	%r6,STACK_GPR0(%r1)
 	std	%r7,STACK_GPR1(%r1)
+	blr
+
+.global enter_p8_pm_state
+enter_p8_pm_state:
+	/* Before entering map or rvwinkle, we create a stack frame
+	 * and save our non-volatile registers.
+	 *
+	 * We also save these SPRs:
+	 *
+	 *  - HSPRG0	in GPR0 slot
+	 *  - HSPRG1	in GPR1 slot
+	 *
+	 *  - xxx TODO: HIDs
+	 *  - TODO: Mask MSR:ME during the process
+	 *
+	 * On entry, r3 indicates:
+	 *
+	 *    0 = nap
+	 *    1 = rvwinkle
+	 */
+	mflr	%r0
+	std	%r0,16(%r1)
+	stdu	%r1,-STACK_FRAMESIZE(%r1)
+
+	bl	pm_save_regs
 
 	/* Save stack pointer in struct cpu_thread */
 	std	%r1,CPUTHREAD_SAVE_R1(%r13)
@@ -540,6 +587,27 @@ enter_pm_state:
 	cmpd	cr0,%r0,%r0
 	bne	0b
 	PPC_INST_RVWINKLE
+	b	.
+
+.global enter_p9_pm_lite_state
+enter_p9_pm_lite_state:
+	mtspr	SPR_PSSCR,%r3
+	PPC_INST_STOP
+	blr
+
+.global enter_p9_pm_state
+enter_p9_pm_state:
+	mflr	%r0
+	std	%r0,16(%r1)
+	stdu	%r1,-STACK_FRAMESIZE(%r1)
+
+	bl	pm_save_regs
+
+	/* Save stack pointer in struct cpu_thread */
+	std	%r1,CPUTHREAD_SAVE_R1(%r13)
+
+	mtspr	SPR_PSSCR,%r3
+	PPC_INST_STOP
 	b	.
 
 /* This is a little piece of code that is copied down to
@@ -635,26 +703,12 @@ fast_reset_entry:
 	bl	fast_reboot_entry
 	b	.
 
-.global cleanup_tlb
-cleanup_tlb:
-	/* Clean the TLB */
-	li	%r3,512
-	mtctr	%r3
-	li	%r4,0xc00		/* IS field = 0b11 */
-	ptesync
-1:	tlbiel	%r4
-	addi	%r4,%r4,0x1000
-	bdnz	1b
-	ptesync
-	blr
-
 /* Functions to initialize replicated and shared SPRs to sane
  * values. This is called at boot and on soft-reset
  */
 .global init_shared_sprs
 init_shared_sprs:
 	li	%r0,0
-	mtspr	SPR_SDR1, %r0
 	mtspr	SPR_AMOR, %r0
 
 	mfspr	%r3,SPR_PVR
@@ -669,32 +723,31 @@ init_shared_sprs:
 	beq	3f
 	cmpwi	cr0,%r3,PVR_TYPE_P8NVL
 	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P9
+	beq	4f
 	/* Unsupported CPU type... what do we do ? */
 	b	9f
 
 1:	/* P7 */
+	mtspr	SPR_SDR1, %r0
 	/* TSCR: Value from pHyp */
 	LOAD_IMM32(%r3,0x880DE880)
 	mtspr	SPR_TSCR, %r3
 	b	9f
 
 2:	/* P7+ */
+	mtspr	SPR_SDR1, %r0
 	/* TSCR: Recommended value by HW folks */
 	LOAD_IMM32(%r3,0x88CDE880)
 	mtspr	SPR_TSCR, %r3
 	b	9f
 
 3:	/* P8E/P8 */
+	mtspr	SPR_SDR1, %r0
 	/* TSCR: Recommended value by HW folks */
 	LOAD_IMM32(%r3,0x8ACC6880)
 	mtspr	SPR_TSCR, %r3
-	mfspr	%r3,SPR_LPCR
-	rldicr	%r3,%r3,12,60
-	ori	%r3,%r3,4
-	rldicr	%r3,%r3,52,63
-	mtspr	SPR_LPCR,%r3
-	sync
-	isync
+
 	/* HID0: Clear bit 13 (enable core recovery)
 	 *       Clear bit 19 (HILE)
 	 */
@@ -723,16 +776,86 @@ init_shared_sprs:
 	/* RPR (per-LPAR but let's treat it as replicated for now) */
 	LOAD_IMM64(%r3,0x00000103070F1F3F)
 	mtspr	SPR_RPR,%r3
+	b	9f
+
+4:	/* P9 */
+	/* TSCR: Recommended value by HW folks */
+	LOAD_IMM32(%r3,0x80287880)
+	mtspr	SPR_TSCR, %r3
+	/* HID0: Clear bit 5 (enable core recovery)
+	 *       Clear bit 4 (HILE)
+	 */
+	mfspr	%r3,SPR_HID0
+	li	%r0,1
+	sldi	%r4,%r0,(63-5)
+	sldi	%r5,%r0,(63-4)
+	or	%r0,%r4,%r5,
+	andc	%r3,%r3,%r0
+	sync
+	mtspr	SPR_HID0,%r3
+	isync
+	/* HMEER: Enable HMIs for core recovery and TOD errors. */
+	LOAD_IMM64(%r0,SPR_HMEER_HMI_ENABLE_MASK)
+	mfspr	%r3,SPR_HMEER
+	or	%r3,%r3,%r0
+	sync
+	mtspr	SPR_HMEER,%r3
+	isync
+
+	LOAD_IMM64(%r3,0x00000103070F1F3F)
+	mtspr	SPR_RPR,%r3
 9:	blr
 
 .global init_replicated_sprs
 init_replicated_sprs:
-	/* LPCR: sane value */
-	LOAD_IMM64(%r3,0x0070000000000004)
-	mtspr	SPR_LPCR, %r3
+	mfspr	%r3,SPR_PVR
+	srdi	%r3,%r3,16
+	cmpwi	cr0,%r3,PVR_TYPE_P7
+	beq	1f
+	cmpwi	cr0,%r3,PVR_TYPE_P7P
+	beq	1f
+	cmpwi	cr0,%r3,PVR_TYPE_P8E
+	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P8
+	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P8NVL
+	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P9
+	beq	4f
+	/* Unsupported CPU type... what do we do ? */
+	b	9f
 
-	/* XXX TODO: Add more */
-	blr
+1:	/* P7, P7+ */
+	/* LPCR: sane value */
+	LOAD_IMM64(%r3,0x0040000000000004)
+	mtspr	SPR_LPCR, %r3
+	sync
+	isync
+	LOAD_IMM64(%r3,0x0)
+	mtspr	SPR_DSCR,%r3
+	b	9f
+
+3:	/* P8, P8E */
+	/* LPCR: sane value */
+	LOAD_IMM64(%r3,0x0040000000000000)
+	mtspr	SPR_LPCR, %r3
+	sync
+	isync
+	LOAD_IMM64(%r3,0x0)
+	mtspr	SPR_DSCR,%r3
+	b	9f
+
+4:	/* P9 */
+	/* LPCR: sane value */
+	LOAD_IMM64(%r3,0x0040000000000000)
+	mtspr	SPR_LPCR, %r3
+	sync
+	isync
+	/* DSCR: Stride-N Stream Enable */
+	LOAD_IMM64(%r3,0x0000000000000010)
+	mtspr	SPR_DSCR,%r3
+
+9:	blr
 
 	.global enter_nap
 enter_nap:
@@ -777,7 +900,9 @@ naca:
 	.byte	0			/* 0x01b5 : default state for SW attn */
 	.space	1
 	.byte	0x01			/* 0x01b7 : PCIA format */
-	.space	0xe48
+	.llong	hdat_entry		/* 0x01b8 : Primary thread entry */
+	.llong	hdat_entry		/* 0x01c0 : Secondary thread entry */
+	.space	0xe38
 
 	.balign	0x10
 hv_release_data:
@@ -843,8 +968,7 @@ opal_entry:
 	std	%r1,STACK_GPR1(%r12)
 	mr	%r1,%r12
 
-	/* May save arguments for tracing */
-#ifdef OPAL_TRACE_ENTRY
+	/* Save arguments because we call C */
 	std	%r3,STACK_GPR3(%r1)
 	std	%r4,STACK_GPR4(%r1)
 	std	%r5,STACK_GPR5(%r1)
@@ -853,7 +977,7 @@ opal_entry:
 	std	%r8,STACK_GPR8(%r1)
 	std	%r9,STACK_GPR9(%r1)
 	std	%r10,STACK_GPR10(%r1)
-#endif
+
 	/* Save Token (r0), LR and r13 */
 	mflr	%r12
 	std	%r0,STACK_GPR0(%r1)
@@ -874,15 +998,12 @@ opal_entry:
 	addis	%r2,%r2,(__toc_start - __head)@ha
 	addi	%r2,%r2,(__toc_start - __head)@l
 
-	/* Check for a reboot in progress */
-	LOAD_ADDR_FROM_TOC(%r12, reboot_in_progress)
-	lbz	%r12,0(%r12)
-	cmpwi	%r12,0
-	bne	3f
-
-#ifdef OPAL_TRACE_ENTRY
+	/* Check entry */
 	mr	%r3,%r1
-	bl	opal_trace_entry
+	bl	opal_entry_check
+	cmpdi	%r3,0
+	bne	1f
+
 	ld	%r0,STACK_GPR0(%r1)
 	ld	%r3,STACK_GPR3(%r1)
 	ld	%r4,STACK_GPR4(%r1)
@@ -892,37 +1013,27 @@ opal_entry:
 	ld	%r8,STACK_GPR8(%r1)
 	ld	%r9,STACK_GPR9(%r1)
 	ld	%r10,STACK_GPR10(%r1)
-#endif /* OPAL_TRACE_ENTRY */
 
 	/* Convert our token into a table entry and get the
 	 * function pointer. Also check the token.
+	 * For ELFv2 ABI, the local entry point is used so no need for r12.
 	 */
-	cmpldi	%r0,OPAL_LAST
-	bgt-	2f
 	sldi	%r0,%r0,3
 	LOAD_ADDR_FROM_TOC(%r12, opal_branch_table)
 	ldx	%r0,%r12,%r0
-	cmpldi	%r0,0
-	beq-	2f
 	mtctr	%r0
 
 	/* Jump ! */
 	bctrl
+
+	mr	%r4,%r1
+	bl	opal_exit_check
 
 1:	ld	%r12,STACK_LR(%r1)
 	mtlr	%r12
 	ld	%r13,STACK_GPR13(%r1)
 	ld	%r1,STACK_GPR1(%r1)
 	blr
-
-2:	/* Bad token */
-	ld	%r3,STACK_GPR0(%r1)
-	bl	opal_bad_token
-	b	1b
-
-3:	/* Reboot in progress, reject all calls */
-	li	%r3,OPAL_BUSY
-	b	1b
 
 .global start_kernel
 start_kernel:

@@ -1508,26 +1508,13 @@ static int p7ioc_device_init(struct phb *phb,
 			     struct pci_device *dev,
 			     void *data __unused)
 {
-	int ecap = 0;
-	int aercap = 0;
-
-	/* Figure out AER capability */
-	if (pci_has_cap(dev, PCI_CFG_CAP_ID_EXP, false)) {
-		ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
-
-		if (!pci_has_cap(dev, PCIECAP_ID_AER, true)) {
-			aercap = pci_find_ecap(phb, dev->bdfn,
-					       PCIECAP_ID_AER, NULL);
-			if (aercap > 0)
-				pci_set_cap(dev, PCIECAP_ID_AER, aercap, true);
-		} else {
-			aercap = pci_cap(dev, PCIECAP_ID_AER, true);
-		}
-	}
+	int ecap, aercap;
 
 	/* Common initialization for the device */
 	pci_device_init(phb, dev);
 
+        ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
+        aercap = pci_cap(dev, PCIECAP_ID_AER, true);
 	if (dev->dev_type == PCIE_TYPE_ROOT_PORT)
 		p7ioc_root_port_init(phb, dev, ecap, aercap);
 	else if (dev->dev_type == PCIE_TYPE_SWITCH_UPPORT ||
@@ -1857,7 +1844,7 @@ static int64_t p7ioc_ioda_reset(struct phb *phb, bool purge)
 
 		if ((pesta & IODA_PESTA_MMIO_FROZEN) ||
 		    (pestb & IODA_PESTB_DMA_STOPPED))
-			PHBDBG(p, "Frozen PE#%d (%s - %s)\n",
+			PHBDBG(p, "Frozen PE#%x (%s - %s)\n",
 			       i, (pestb & IODA_PESTB_DMA_STOPPED) ? "DMA" : "",
 			       (pesta & IODA_PESTA_MMIO_FROZEN) ? "MMIO" : "");
 	}
@@ -2331,6 +2318,7 @@ static const struct phb_ops p7ioc_phb_ops = {
 	.choose_bus		= p7ioc_choose_bus,
 	.get_reserved_pe_number	= p7ioc_get_reserved_pe_number,
 	.device_init		= p7ioc_device_init,
+	.device_remove		= NULL,
 	.pci_reinit		= p7ioc_pci_reinit,
 	.eeh_freeze_status	= p7ioc_eeh_freeze_status,
 	.eeh_freeze_clear	= p7ioc_eeh_freeze_clear,
@@ -2598,10 +2586,8 @@ static void p7ioc_pcie_add_node(struct p7ioc_phb *p)
 
 	/* XXX FIXME: add opal-memwin32, dmawins, etc... */
 	m64b = cleanup_addr(p->m64_base);
-	dt_add_property_cells(np, "ibm,opal-m64-window",
-			      hi32(m64b), lo32(m64b),
-			      hi32(m64b), lo32(m64b),
-			      hi32(PHB_M64_SIZE), lo32(PHB_M64_SIZE));
+	dt_add_property_u64s(np, "ibm,opal-m64-window",
+			      m64b, m64b, PHB_M64_SIZE);
 	dt_add_property_cells(np, "ibm,opal-msi-ports", 256);
 	dt_add_property_cells(np, "ibm,opal-num-pes", 128);
 	dt_add_property_cells(np, "ibm,opal-reserved-pe", 127);
@@ -2610,6 +2596,20 @@ static void p7ioc_pcie_add_node(struct p7ioc_phb *p)
 	tkill = reg[0] + PHB_TCE_KILL;
 	dt_add_property_cells(np, "ibm,opal-tce-kill",
 			      hi32(tkill), lo32(tkill));
+	dt_add_property_cells(np, "ibm,supported-tce-sizes",
+			      12, // 4K
+			      16, // 64K
+			      24, // 16M
+			      34); // 16G
+
+	/*
+	 * Linux may use this property to allocate the diag data buffer, which
+	 * can be used for either of these structs.  Pass the largest to ensure
+	 * they can both fit in this buffer.
+	 */
+	dt_add_property_cells(np, "ibm,phb-diag-data-size",
+			      MAX(sizeof(struct OpalIoP7IOCPhbErrorData),
+				  sizeof(struct OpalIoP7IOCErrorData)));
 
 	/* Add associativity properties */
 	add_chip_dev_associativity(np);
@@ -2682,7 +2682,7 @@ void p7ioc_phb_setup(struct p7ioc *ioc, uint8_t index)
 	pci_register_phb(&p->phb, OPAL_DYNAMIC_PHB_ID);
 	slot = p7ioc_phb_slot_create(&p->phb);
 	if (!slot)
-		prlog(PR_NOTICE, "P7IOC: Cannot create PHB#%d slot\n",
+		prlog(PR_NOTICE, "P7IOC: Cannot create PHB#%x slot\n",
 		      p->phb.opal_id);
 
 	/* Platform additional setup */
@@ -2957,7 +2957,7 @@ int64_t p7ioc_phb_init(struct p7ioc_phb *p)
 {
 	uint64_t val;
 
-	PHBDBG(p, "Initializing PHB %d...\n", p->index);
+	PHBDBG(p, "Initializing PHB %x...\n", p->index);
 
 	p->state = P7IOC_PHB_STATE_INITIALIZING;
 

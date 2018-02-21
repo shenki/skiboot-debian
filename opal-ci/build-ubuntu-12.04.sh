@@ -2,9 +2,10 @@
 
 set -uo pipefail
 set -e
+set -vx
 
-export CROSS=/opt/cross/gcc-4.8.0-nolibc/powerpc64-linux/bin/powerpc64-linux-
-export HOSTCC=gcc-4.8
+export CROSS="ccache /opt/cross/gcc-4.8.0-nolibc/powerpc64-linux/bin/powerpc64-linux-"
+export HOSTCC="ccache gcc-4.8"
 MAKE_J=`grep -c processor /proc/cpuinfo`
 
 make -j${MAKE_J} all

@@ -203,6 +203,10 @@ static void fsp_nvram_rd_complete(struct fsp_msg *msg)
 		 */
 	}
 	unlock(&fsp_nvram_lock);
+	nvram_read_complete(fsp_nvram_state == NVRAM_STATE_OPEN);
+	if (fsp_nvram_state != NVRAM_STATE_OPEN)
+		log_simple_error(&e_info(OPAL_RC_NVRAM_INIT),
+		"FSP: NVRAM not read, skipping init\n");
 }
 
 static void fsp_nvram_send_read(void)
@@ -310,6 +314,44 @@ static struct fsp_client fsp_nvram_client_rr = {
 	.message = fsp_nvram_msg_rr,
 };
 
+static bool fsp_vnvram_msg(u32 cmd_sub_mod, struct fsp_msg *msg)
+{
+	u32 cmd;
+	struct fsp_msg *resp;
+
+	assert(msg == NULL);
+	switch (cmd_sub_mod) {
+	case FSP_CMD_GET_VNV_STATS:
+		prlog(PR_DEBUG,
+		      "FSP NVRAM: Get vNVRAM statistics not supported\n");
+		cmd = FSP_RSP_GET_VNV_STATS | FSP_STATUS_INVALID_SUBCMD;
+		break;
+	case FSP_CMD_FREE_VNV_STATS:
+		prlog(PR_DEBUG,
+		      "FSP NVRAM: Free vNVRAM statistics buffer not supported\n");
+		cmd = FSP_RSP_FREE_VNV_STATS | FSP_STATUS_INVALID_SUBCMD;
+		break;
+	default:
+		return false;
+	}
+
+	resp = fsp_mkmsg(cmd, 0);
+	if (!resp) {
+		prerror("FSP NVRAM: Failed to allocate resp message\n");
+		return false;
+	}
+	if (fsp_queue_msg(resp, fsp_freemsg)) {
+		prerror("FSP NVRAM: Failed to queue resp message\n");
+		fsp_freemsg(resp);
+		return false;
+	}
+	return true;
+}
+
+static struct fsp_client fsp_vnvram_client = {
+	.message = fsp_vnvram_msg,
+};
+
 int fsp_nvram_info(uint32_t *total_size)
 {
 	if (!fsp_present()) {
@@ -354,6 +396,9 @@ int fsp_nvram_start_read(void *dst, uint32_t src, uint32_t len)
 	/* Register for the reset/reload event */
 	fsp_register_client(&fsp_nvram_client_rr, FSP_MCLASS_RR_EVENT);
 
+	/* Register for virtual NVRAM interface events */
+	fsp_register_client(&fsp_vnvram_client, FSP_MCLASS_VIRTUAL_NVRAM);
+
 	/* Open and load the nvram from the FSP */
 	fsp_nvram_send_open();
 
@@ -386,28 +431,4 @@ int fsp_nvram_write(uint32_t offset, void *src, uint32_t size)
 	unlock(&fsp_nvram_lock);
 
 	return 0;
-}
-
-/* This is called right before starting the payload (Linux) to
- * ensure the initial open & read of nvram has happened before
- * we transfer control as the guest OS. This is necessary as
- * Linux will not handle a OPAL_BUSY return properly and treat
- * it as an error
- */
-void fsp_nvram_wait_open(void)
-{
-	if (!fsp_present())
-		return;
-
-	while(fsp_nvram_state == NVRAM_STATE_OPENING)
-		opal_run_pollers();
-
-	if (!fsp_nvram_was_read) {
-		log_simple_error(&e_info(OPAL_RC_NVRAM_INIT),
-			"FSP: NVRAM not read, skipping init\n");
-		nvram_read_complete(false);
-		return;
-	}
-
-	nvram_read_complete(true);
 }

@@ -77,7 +77,7 @@ static const struct slot_table_entry *match_slot_dev_entry(struct phb *phb,
 		if (ent->etype == st_npu_slot)
 			bdfn = pd->bdfn & 0xf8;
 		else
-			bdfn = pd->bdfn & 0xff;
+			bdfn = pd->bdfn & 0xffff;
 
 		if (ent->location == bdfn)
 			return ent;
@@ -85,106 +85,176 @@ static const struct slot_table_entry *match_slot_dev_entry(struct phb *phb,
 	return NULL;
 }
 
-static void add_slot_properties(struct pci_slot *slot,
+static void slot_table_add_properties(struct pci_slot *slot,
 				struct dt_node *np)
 {
-	struct phb *phb = slot->phb;
-	struct pci_device *pd = slot->pd;
 	struct slot_table_entry *ent = slot->data;
-	size_t base_loc_code_len, slot_label_len;
-	char label[8], loc_code[LOC_CODE_SIZE];
-
-	if (!np)
-		return;
-
-	if (ent) {
-		dt_add_property_string(np, "ibm,slot-label", ent->name);
-		slot_label_len = strlen(ent->name);
-	} else {
-		snprintf(label, 8, "S%04x%02x", phb->opal_id, pd->secondary_bus);
-		dt_add_property_string(np, "ibm,slot-label", label);
-		slot_label_len = strlen(label);
-	}
-
-	base_loc_code_len = phb->base_loc_code ? strlen(phb->base_loc_code) : 0;
-	if ((base_loc_code_len + slot_label_len + 1) >= LOC_CODE_SIZE)
-		return;
-
-	/* Location code */
-	if (phb->base_loc_code) {
-		strcpy(loc_code, phb->base_loc_code);
-		strcat(loc_code, "-");
-	} else {
-		loc_code[0] = '\0';
-	}
 
 	if (ent)
-		strcat(loc_code, ent->name);
+		pci_slot_add_loc(slot, np, ent->name);
 	else
-		strcat(loc_code, label);
-	dt_add_property(np, "ibm,slot-location-code",
-			loc_code, strlen(loc_code) + 1);
-}
-
-static void init_slot_info(struct pci_slot *slot, bool pluggable, void *data)
-{
-	slot->data = data;
-	slot->ops.add_properties = add_slot_properties;
-
-	slot->pluggable      = pluggable;
-	slot->power_ctl      = false;
-	slot->wired_lanes    = PCI_SLOT_WIRED_LANES_UNKNOWN;
-	slot->connector_type = PCI_SLOT_CONNECTOR_PCIE_NS;
-	slot->card_desc      = PCI_SLOT_DESC_NON_STANDARD;
-	slot->card_mech      = PCI_SLOT_MECH_NONE;
-	slot->power_led_ctl  = PCI_SLOT_PWR_LED_CTL_NONE;
-	slot->attn_led_ctl   = PCI_SLOT_ATTN_LED_CTL_NONE;
-}
-
-static void create_dynamic_slot(struct phb *phb, struct pci_device *pd)
-{
-	uint32_t ecap, val;
-	struct pci_slot *slot;
-
-	if (!phb || !pd || pd->slot)
-		return;
-
-	/* Try to create slot whose details aren't provided by platform.
-	 * We only care the downstream ports of PCIe switch that connects
-	 * to root port.
-	 */
-	if (pd->dev_type != PCIE_TYPE_SWITCH_DNPORT ||
-	    !pd->parent || !pd->parent->parent ||
-	    pd->parent->parent->parent)
-		return;
-
-	ecap = pci_cap(pd, PCI_CFG_CAP_ID_EXP, false);
-	pci_cfg_read32(phb, pd->bdfn, ecap + PCICAP_EXP_SLOTCAP, &val);
-	if (!(val & PCICAP_EXP_SLOTCAP_HPLUG_CAP))
-		return;
-
-	slot = pcie_slot_create(phb, pd);
-	assert(slot);
-	init_slot_info(slot, true, NULL);
+		pci_slot_add_loc(slot, np, NULL);
 }
 
 void slot_table_get_slot_info(struct phb *phb, struct pci_device *pd)
 {
 	const struct slot_table_entry *ent;
 	struct pci_slot *slot;
-	bool pluggable;
 
 	if (!pd || pd->slot)
 		return;
+
 	ent = match_slot_dev_entry(phb, pd);
+
 	if (!ent || !ent->name) {
-		create_dynamic_slot(phb, pd);
+		slot = pcie_slot_create_dynamic(phb, pd);
+		if (slot) {
+			slot->ops.add_properties = slot_table_add_properties;
+			slot->pluggable = true;
+		}
+
 		return;
 	}
 
 	slot = pcie_slot_create(phb, pd);
 	assert(slot);
 
-	pluggable = !!(ent->etype == st_pluggable_slot);
-	init_slot_info(slot, pluggable, (void *)ent);
+	slot->pluggable = !!(ent->etype == st_pluggable_slot);
+	slot->ops.add_properties = slot_table_add_properties;
+	slot->data = (void *)ent;
+}
+
+static void dt_slot_add_properties(struct pci_slot *slot,
+				struct dt_node *np)
+{
+	struct dt_node *slot_np = slot->data;
+	const char *label = NULL;
+
+	if (slot_np)
+		label = dt_prop_get_def(slot_np, "ibm,slot-label", NULL);
+
+	pci_slot_add_loc(slot, np, label);
+}
+
+void dt_slot_get_slot_info(struct phb *phb, struct pci_device *pd)
+{
+	struct dt_node *slot_np;
+	struct pci_slot *slot;
+	const char *name = NULL;
+	bool pluggable = false;
+
+	if (!pd || pd->slot)
+		return;
+
+	slot_np = map_pci_dev_to_slot(phb, pd);
+	if (slot_np) {
+		pluggable = dt_has_node_property(slot_np,
+					"ibm,pluggable", NULL);
+		name = dt_prop_get_def(slot_np, "ibm,slot-label", NULL);
+	}
+
+	if (!slot_np || !name) {
+		slot = pcie_slot_create_dynamic(phb, pd);
+		if (slot) {
+			slot->ops.add_properties = dt_slot_add_properties;
+			slot->pluggable = true;
+			slot->data = (void *)slot_np;
+		}
+
+		return;
+	}
+
+	slot = pcie_slot_create(phb, pd);
+	assert(slot);
+
+	slot->ops.add_properties = dt_slot_add_properties;
+	slot->pluggable = pluggable;
+	slot->data = (void *)slot_np;
+}
+
+static int __pci_find_dev_by_location(struct phb *phb,
+				      struct pci_device *pd, void *userdata)
+{
+	uint16_t location = *((uint16_t *)userdata);
+
+	if (!phb || !pd)
+		return 0;
+
+	if ((pd->bdfn & 0xff) == location)
+		return 1;
+
+	return 0;
+}
+
+static struct pci_device *pci_find_dev_by_location(struct phb *phb, uint16_t location)
+{
+	return pci_walk_dev(phb, NULL, __pci_find_dev_by_location, &location);
+}
+
+static struct phb* get_phb_by_location(uint32_t location)
+{
+	struct phb *phb = NULL;
+	uint32_t chip_id, phb_idx;
+
+	for_each_phb(phb) {
+		chip_id = dt_get_chip_id(phb->dt_node);
+		phb_idx = dt_prop_get_u32_def(phb->dt_node,
+					      "ibm,phb-index", 0);
+		if (location == ST_LOC_PHB(chip_id, phb_idx))
+			break;
+	}
+
+	return phb;
+}
+
+static int check_slot_table(struct phb *phb,
+			    const struct slot_table_entry *parent)
+{
+	const struct slot_table_entry *ent;
+	struct pci_device *dev = NULL;
+	int r = 0;
+
+	if (parent == NULL)
+		return 0;
+
+	for (ent = parent; ent->etype != st_end; ent++) {
+		switch (ent->etype) {
+		case st_phb:
+			phb = get_phb_by_location(ent->location);
+			if (!phb) {
+				prlog(PR_ERR, "PCI: PHB %s (%x) not found\n",
+				      ent->name, ent->location);
+				r++;
+			}
+			break;
+		case st_pluggable_slot:
+		case st_builtin_dev:
+			if (!phb)
+				break;
+			phb_lock(phb);
+			dev = pci_find_dev_by_location(phb, ent->location);
+			phb_unlock(phb);
+			if (!dev) {
+				prlog(PR_ERR, "PCI: built-in device not found: %s (loc: %x)\n",
+				      ent->name, ent->location);
+				r++;
+			}
+			break;
+		case st_end:
+		case st_npu_slot:
+			break;
+		}
+		if (ent->children)
+			r+= check_slot_table(phb, ent->children);
+	}
+	return r;
+}
+
+void check_all_slot_table(void)
+{
+	if (!slot_top_table)
+		return;
+
+	prlog(PR_DEBUG, "PCI: Checking slot table against detected devices\n");
+	check_slot_table(NULL, slot_top_table);
 }
