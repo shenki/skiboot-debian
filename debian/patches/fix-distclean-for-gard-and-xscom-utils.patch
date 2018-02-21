@@ -1,22 +1,28 @@
-Description: Fix distclean targets
- Some files still need to be added to distclean targets.
- Upstream gard's Makefile already does it but not this version of skiboot.
- Fixing xcom-utils distclean target as well
-Author: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+From: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+Date: Wed, 21 Feb 2018 15:36:39 +0100
+Subject: fix-distclean-for-gard-and-xscom-utils
+
 ---
-This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+ external/gard/Makefile        | 2 +-
+ external/xscom-utils/Makefile | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/external/gard/Makefile b/external/gard/Makefile
+index b54923d..52a0de5 100644
 --- a/external/gard/Makefile
 +++ b/external/gard/Makefile
-@@ -35,5 +35,5 @@
+@@ -35,5 +35,5 @@ clean: arch_clean
  
  distclean: clean
  	rm -f *.c~ *.h~ *.sh~ Makefile~ config.mk~ libflash/*.c~ libflash/*.h~
 -	rm -f libflash ccan common io.h make_version.sh
 +	rm -f libflash ccan common io.h version.c make_version.sh test/test.sh
  
+diff --git a/external/xscom-utils/Makefile b/external/xscom-utils/Makefile
+index 3fee247..b4512b7 100644
 --- a/external/xscom-utils/Makefile
 +++ b/external/xscom-utils/Makefile
-@@ -37,11 +37,11 @@
+@@ -37,11 +37,11 @@ install: all
  
  .PHONY: clean
  clean:

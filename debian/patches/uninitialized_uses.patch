@@ -1,14 +1,16 @@
-Description: Uninitialized uses
- Fix up uninitialized variables that make our build fail.
-Author: Mathieu Trudel-Lapierre <mathieu-tl@ubuntu.com>
----
- external/gard/gard.c |    2 +-
- libflash/libffs.c    |    2 +-
- 2 files changed, 2 insertions(+), 2 deletions(-)
+From: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+Date: Wed, 21 Feb 2018 15:36:39 +0100
+Subject: uninitialized_uses
 
+---
+ libflash/libffs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libflash/libffs.c b/libflash/libffs.c
+index 96b7c55..47cb0c5 100644
 --- a/libflash/libffs.c
 +++ b/libflash/libffs.c
-@@ -184,7 +184,7 @@
+@@ -184,7 +184,7 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
  
  	if (mark_ecc) {
  		uint32_t start, total_size;

@@ -1,10 +1,13 @@
-Description: opal-prd.service improvements
- Added reference to the man page
- Take into account /etc/default/opal-prd on Debian to read parameters for the
- daemon.
-Author: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+From: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+Date: Wed, 21 Feb 2018 15:36:39 +0100
+Subject: opal-prd-service-file-improvements
+
 ---
-This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+ external/opal-prd/opal-prd.service | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/external/opal-prd/opal-prd.service b/external/opal-prd/opal-prd.service
+index a53d8d9..d3dc4b9 100644
 --- a/external/opal-prd/opal-prd.service
 +++ b/external/opal-prd/opal-prd.service
 @@ -2,9 +2,11 @@
