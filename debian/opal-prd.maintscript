@@ -1,0 +1,1 @@
+rm_conffile /etc/init/opal-prd.conf 5.9.8-1~ opal-prd
