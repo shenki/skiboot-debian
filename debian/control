@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Frédéric Bonnard <frediz@debian.org>
 Build-Depends: debhelper (>= 9), dh-systemd
 Standards-Version: 3.9.8
-Homepage: http://github.com/open-power/skiboot/
+Homepage: https://github.com/open-power/skiboot/
 
 Package: opal-prd
 Architecture: ppc64el ppc64
