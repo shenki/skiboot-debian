@@ -2,9 +2,11 @@
 Description=OPAL PRD daemon
 ConditionVirtualization=false
 ConditionPathExists=/sys/firmware/devicetree/base/ibm,opal/diagnostics
+Documentation=man:opal-prd(8)
 
 [Service]
-ExecStart=/usr/sbin/opal-prd
+EnvironmentFile=/etc/default/opal-prd
+ExecStart=/usr/sbin/opal-prd $DAEMON_OPTS
 Restart=always
 
 [Install]
