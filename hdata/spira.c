@@ -624,10 +624,10 @@ static bool add_chiptod_old(void)
 	return found;
 }
 
-static bool add_chiptod_new(uint32_t master_cpu)
+static bool add_chiptod_new(void)
 {
 	const void *hdif;
-	unsigned int i, master_chip;
+	unsigned int i;
 	bool found = false;
 
 	/*
@@ -635,8 +635,6 @@ static bool add_chiptod_new(uint32_t master_cpu)
 	 */
 	if (!get_hdif(&spira.ntuples.proc_chip, SPPCRD_HDIF_SIG))
 		return found;
-
-	master_chip = pir_to_chip_id(master_cpu);
 
 	for_each_ntuple_idx(&spira.ntuples.proc_chip, hdif, i,
 			    SPPCRD_HDIF_SIG) {
@@ -668,12 +666,11 @@ static bool add_chiptod_new(uint32_t master_cpu)
 		/* The FSP may strip the chiptod info from HDAT; if we find
 		 * a zero-ed out entry, assume that the chiptod is
 		 * present, but we don't have any primary/secondary info. In
-		 * this case, pick the primary based on the CPU that was
-		 * assigned master.
+		 * this case, pick chip zero as the master.
 		 */
 		if (!size) {
 			flags = CHIPTOD_ID_FLAGS_STATUS_OK;
-			if (be32_to_cpu(cinfo->xscom_id) == master_chip)
+			if (be32_to_cpu(cinfo->xscom_id) == 0x0)
 				flags |= CHIPTOD_ID_FLAGS_PRIMARY;
 		}
 
@@ -804,7 +801,7 @@ static void add_iplparams_sys_params(const void *iplp, struct dt_node *node)
 		u64 freq = be32_to_cpu(p->nest_freq_mhz);
 
 		freq *= 1000000;
-		dt_add_property_cells(dt_root, "nest-frquency",
+		dt_add_property_cells(dt_root, "nest-frequency",
 				      hi32(freq), lo32(freq));
 	}
 }
@@ -1092,15 +1089,13 @@ static void fixup_spira(void)
 	spira.ntuples.hs_data = spiras->ntuples.hs_data;
 }
 
-int parse_hdat(bool is_opal, uint32_t master_cpu)
+int parse_hdat(bool is_opal)
 {
 	cpu_type = PVR_TYPE(mfspr(SPR_PVR));
 
 	prlog(PR_DEBUG, "Parsing HDAT...\n");
 
 	fixup_spira();
-
-	dt_root = dt_new_root("");
 
 	/*
 	 * Basic DT root stuff
@@ -1133,7 +1128,7 @@ int parse_hdat(bool is_opal, uint32_t master_cpu)
 	fsp_parse();
 
 	/* Add ChipTOD's */
-	if (!add_chiptod_old() && !add_chiptod_new(master_cpu))
+	if (!add_chiptod_old() && !add_chiptod_new())
 		prerror("CHIPTOD: No ChipTOD found !\n");
 
 	/* Add NX */

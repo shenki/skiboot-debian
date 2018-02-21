@@ -138,6 +138,7 @@ void add_opal_node(void)
 {
 	uint64_t base, entry, size;
 	extern uint32_t opal_entry;
+	struct dt_node *opal_event;
 
 	/* XXX TODO: Reorg this. We should create the base OPAL
 	 * node early on, and have the various sub modules populate
@@ -171,6 +172,12 @@ void add_opal_node(void)
 	dt_add_property_u64(opal_node, "opal-base-address", base);
 	dt_add_property_u64(opal_node, "opal-entry-address", entry);
 	dt_add_property_u64(opal_node, "opal-runtime-size", size);
+
+	/* Add irqchip interrupt controller */
+	opal_event = dt_new(opal_node, "event");
+	dt_add_property_strings(opal_event, "compatible", "ibm,opal-event");
+	dt_add_property_cells(opal_event, "#interrupt-cells", 0x1);
+	dt_add_property(opal_event, "interrupt-controller", 0, 0);
 
 	add_opal_firmware_node();
 	add_associativity_ref_point();
@@ -306,9 +313,10 @@ void opal_run_pollers(void)
 {
 	struct opal_poll_entry *poll_ent;
 	static int pollers_with_lock_warnings = 0;
+	static int poller_recursion = 0;
 
 	/* Don't re-enter on this CPU */
-	if (this_cpu()->in_poller) {
+	if (this_cpu()->in_poller && poller_recursion < 16) {
 		/**
 		 * @fwts-label OPALPollerRecursion
 		 * @fwts-advice Recursion detected in opal_run_pollers(). This
@@ -317,6 +325,9 @@ void opal_run_pollers(void)
 		 */
 		prlog(PR_ERR, "OPAL: Poller recursion detected.\n");
 		backtrace();
+		poller_recursion++;
+		if (poller_recursion == 16)
+			prlog(PR_ERR, "OPAL: Squashing future poller recursion warnings (>16).\n");
 		return;
 	}
 	this_cpu()->in_poller = true;
@@ -359,6 +370,10 @@ void opal_run_pollers(void)
 
 static int64_t opal_poll_events(__be64 *outstanding_event_mask)
 {
+
+	if (!opal_addr_valid(outstanding_event_mask))
+		return OPAL_PARAMETER;
+
 	/* Check if we need to trigger an attn for test use */
 	if (attn_trigger == 0xdeadbeef) {
 		prlog(PR_EMERG, "Triggering attn\n");

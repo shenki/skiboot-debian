@@ -90,11 +90,15 @@ static int64_t pcie_slot_get_link_state(struct pci_slot *slot,
 static int64_t pcie_slot_get_power_state(struct pci_slot *slot __unused,
 					 uint8_t *val)
 {
-	/* The power is always on if no functionality is supported */
-	if (!(slot->slot_cap & PCICAP_EXP_SLOTCAP_PWCTRL))
-		*val = PCI_SLOT_POWER_ON;
-	else
-		*val = slot->power_state;
+	/* We should return the cached power state that is same to
+	 * the PCI slot hotplug state (added/removed). Otherwise,
+	 * the OS will see mismatched states, causing the adapter
+	 * behind the slot can't be probed successfully on request
+	 * of hot add. So we could run into the situation where the
+	 * OS sees power-off but it's on in hardware.
+	 */
+	*val = slot->power_state;
+
 	return OPAL_SUCCESS;
 }
 
@@ -192,19 +196,33 @@ static int64_t pcie_slot_set_attention_state(struct pci_slot *slot,
 	return OPAL_SUCCESS;
 }
 
-static int64_t pcie_slot_set_power_state(struct pci_slot *slot, uint8_t val)
+static int64_t pcie_slot_set_power_state_ext(struct pci_slot *slot, uint8_t val,
+					     bool surprise_check)
 {
 	struct phb *phb = slot->phb;
 	struct pci_device *pd = slot->pd;
 	uint32_t ecap;
 	uint16_t state;
 
-	/* Drop the request if functionality doesn't exist */
-	if (!(slot->slot_cap & PCICAP_EXP_SLOTCAP_PWCTRL))
-		return OPAL_SUCCESS;
-
 	if (slot->power_state == val)
+		return OPAL_PARAMETER;
+
+	/* Update the power state and return immediately if the power
+	 * control functionality isn't supported on the PCI slot.
+	 */
+	if (!(slot->slot_cap & PCICAP_EXP_SLOTCAP_PWCTRL)) {
+		slot->power_state = val;
 		return OPAL_SUCCESS;
+	}
+
+	/* The power supply to the slot should be always on when surprise
+	 * hotplug is claimed. For this case, update with the requested
+	 * power state and bail immediately.
+	 */
+	if (surprise_check && slot->surprise_pluggable) {
+		slot->power_state = val;
+		return OPAL_SUCCESS;
+	}
 
 	pci_slot_set_state(slot, PCI_SLOT_STATE_SPOWER_START);
 	slot->power_state = val;
@@ -229,6 +247,11 @@ static int64_t pcie_slot_set_power_state(struct pci_slot *slot, uint8_t val)
 	pci_slot_set_state(slot, PCI_SLOT_STATE_SPOWER_DONE);
 
 	return OPAL_ASYNC_COMPLETION;
+}
+
+static int64_t pcie_slot_set_power_state(struct pci_slot *slot, uint8_t val)
+{
+	return pcie_slot_set_power_state_ext(slot, val, true);
 }
 
 static int64_t pcie_slot_sm_poll_link(struct pci_slot *slot)
@@ -375,10 +398,10 @@ static int64_t pcie_slot_sm_freset(struct pci_slot *slot)
 		}
 
 		/* In power on state, power it off */
-		if (power_state == PCI_SLOT_POWER_ON &&
-		    slot->ops.set_power_state) {
+		if (power_state == PCI_SLOT_POWER_ON) {
 			PCIE_SLOT_DBG(slot, "FRESET: Power is on, turn off\n");
-			slot->ops.set_power_state(slot, PCI_SLOT_POWER_OFF);
+			pcie_slot_set_power_state_ext(slot,
+				PCI_SLOT_POWER_OFF, false);
 			pci_slot_set_state(slot,
 				PCI_SLOT_STATE_FRESET_POWER_OFF);
 			return pci_slot_set_sm_timeout(slot, msecs_to_tb(50));
@@ -386,8 +409,7 @@ static int64_t pcie_slot_sm_freset(struct pci_slot *slot)
 		/* No power state change, fall through */
 	case PCI_SLOT_STATE_FRESET_POWER_OFF:
 		PCIE_SLOT_DBG(slot, "FRESET: Power is off, turn on\n");
-		if (slot->ops.set_power_state)
-			slot->ops.set_power_state(slot, PCI_SLOT_POWER_ON);
+		pcie_slot_set_power_state_ext(slot, PCI_SLOT_POWER_ON, false);
 		pci_slot_set_state(slot, PCI_SLOT_STATE_HRESET_START);
 		return pci_slot_set_sm_timeout(slot, msecs_to_tb(50));
 	default:
@@ -404,6 +426,7 @@ struct pci_slot *pcie_slot_create(struct phb *phb, struct pci_device *pd)
 {
 	struct pci_slot *slot;
 	uint32_t ecap;
+	uint16_t slot_ctl;
 
 	/* Allocate PCI slot */
 	slot = pci_slot_alloc(phb, pd);
@@ -419,16 +442,38 @@ struct pci_slot *pcie_slot_create(struct phb *phb, struct pci_device *pd)
 			       &slot->slot_cap);
 	}
 
-	if ((slot->slot_cap & PCICAP_EXP_SLOTCAP_HPLUG_SURP) &&
-	    (slot->slot_cap & PCICAP_EXP_SLOTCAP_HPLUG_CAP))
+	if (slot->slot_cap & PCICAP_EXP_SLOTCAP_HPLUG_CAP)
 		slot->pluggable = 1;
-	if (slot->slot_cap & PCICAP_EXP_SLOTCAP_PWCTRL)
+
+	if (slot->slot_cap & PCICAP_EXP_SLOTCAP_PWCTRL) {
 		slot->power_ctl = 1;
+
+		/* The power is on by default */
+		slot->power_state = PCI_SLOT_POWER_ON;
+		if (pd && ecap) {
+			pci_cfg_read16(phb, pd->bdfn,
+				       ecap + PCICAP_EXP_SLOTCTL, &slot_ctl);
+			if (slot_ctl & PCICAP_EXP_SLOTCTL_PWRCTLR)
+				slot->power_state = PCI_SLOT_POWER_OFF;
+		}
+	}
+
 	if (slot->slot_cap & PCICAP_EXP_SLOTCAP_PWRI)
 		slot->power_led_ctl = PCI_SLOT_PWR_LED_CTL_KERNEL;
 	if (slot->slot_cap & PCICAP_EXP_SLOTCAP_ATTNI)
 		slot->attn_led_ctl = PCI_SLOT_ATTN_LED_CTL_KERNEL;
 	slot->wired_lanes = ((slot->link_cap & PCICAP_EXP_LCAP_MAXWDTH) >> 4);
+
+	/* The surprise hotplug capability is claimed when it's supported
+	 * in the slot's capability bits or link state change reporting is
+	 * supported in PCIe link capability. It means the surprise hotplug
+	 * relies on presence or link state change events. In order for the
+	 * link state change event to be properly raised during surprise hot
+	 * add/remove, the power supply to the slot should be always on.
+	 */
+	if ((slot->slot_cap & PCICAP_EXP_SLOTCAP_HPLUG_SURP) ||
+	    (slot->link_cap & PCICAP_EXP_LCAP_DL_ACT_REP))
+		slot->surprise_pluggable = 1;
 
 	/* Standard slot operations */
 	slot->ops.get_presence_state  = pcie_slot_get_presence_state;
@@ -446,7 +491,6 @@ struct pci_slot *pcie_slot_create(struct phb *phb, struct pci_device *pd)
 	slot->ops.poll_link             = pcie_slot_sm_poll_link;
 	slot->ops.hreset                = pcie_slot_sm_hreset;
 	slot->ops.freset                = pcie_slot_sm_freset;
-	slot->ops.pfreset               = NULL;
 
 	return slot;
 }

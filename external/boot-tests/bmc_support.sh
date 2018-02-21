@@ -37,6 +37,8 @@ function poweroff {
 function force_primary_side {
     # Now we force booting from primary (not golden) side
     $IPMI_COMMAND raw 0x04 0x30 0x5c 0x01 0x00 0x00 0 0 0 0 0 0
+    # and from somewhere else we get this raw command. Obvious really.
+    $IPMI_COMMAND raw 0x04 0x30 0xd2 0x01 0x00 0x00 0 0 0 0 0 0
     sleep 8
 }
 
@@ -55,7 +57,10 @@ function flash {
 	if [ "${LID[1]}" != "" ]; then
 		remotecp ${LID[1]} $target /tmp/bootkernel
 	fi
-	
+	if [ "${arbitrary_lid[1]}" != "" ]; then
+		remotecp ${arbitrary_lid[1]} $target /tmp/$(basename ${arbitrary_lid[1]})
+	fi
+
 	if [ "$?" -ne "0" ] ; then
 		error "Couldn't copy firmware image";
 	fi
@@ -77,6 +82,8 @@ function flash {
 		if [ "$?" -ne "0" ] ; then
 			error "An unexpected pflash error has occurred";
 		fi
+		msg "Removing /tmp/image.pnor"
+		$SSHCMD "rm /tmp/image.pnor"
 	fi
 
 	if [ ! -z "${LID[0]}" ] ; then
@@ -84,7 +91,9 @@ function flash {
 		$SSHCMD "$PFLASH_BINARY -e -f -P PAYLOAD -p /tmp/skiboot.lid"
 		if [ "$?" -ne "0" ] ; then
                         error "An unexpected pflash error has occurred";
-                fi
+		fi
+		msg "Removing /tmp/pskiboot.lid"
+		$SSHCMD "rm /tmp/skiboot.lid"
 	fi
 
         if [ ! -z "${LID[1]}" ] ; then
@@ -92,8 +101,21 @@ function flash {
                 $SSHCMD "$PFLASH_BINARY -e -f -P BOOTKERNEL -p /tmp/bootkernel"
                 if [ "$?" -ne "0" ] ; then
                         error "An unexpected pflash error has occurred";
-                fi
+		fi
+		msg "Removing /tmp/bootkernel"
+		$SSHCMD "rm /tmp/bootkernel"
         fi
+
+	if [ ! -z "${arbitrary_lid[0]}" -a ! -z "${arbitrary_lid[1]}" ] ; then
+		msg "Flashing ${arbitrary_lid[0]} PNOR partition"
+		$SSHCMD "$PFLASH_BINARY -e -f -P ${arbitrary_lid[0]} -p /tmp/$(basename ${arbitrary_lid[1]})"
+                if [ "$?" -ne "0" ] ; then
+                        error "An unexpected pflash error has occurred";
+		fi
+		msg "Removing /tmp/$(basename ${arbitrary_lid[1]})"
+		$SSHCMD "rm /tmp/$(basename ${arbitrary_lid[1]})"
+	fi
+
 }
 
 function boot_firmware {

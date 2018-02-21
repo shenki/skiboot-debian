@@ -43,6 +43,11 @@ enum cpu_thread_state {
 struct cpu_job;
 struct xive_cpu_state;
 
+enum cpu_wake_cause {
+	cpu_wake_on_job,
+	cpu_wake_on_dec,
+};
+
 struct cpu_thread {
 	uint32_t			pir;
 	uint32_t			server_no;
@@ -61,6 +66,9 @@ struct cpu_thread {
 	bool				in_mcount;
 	bool				in_poller;
 	bool				in_reinit;
+	bool				in_fast_sleep;
+	bool				in_sleep;
+	bool				in_idle;
 	uint32_t			hbrt_spec_wakeup; /* primary only */
 	uint64_t			save_l2_fir_action1;
 	uint64_t			current_token;
@@ -74,6 +82,8 @@ struct cpu_thread {
 #endif
 	struct lock			job_lock;
 	struct list_head		job_queue;
+	uint32_t			job_count;
+	bool				job_has_no_return;
 	/*
 	 * Per-core mask tracking for threads in HMI handler and
 	 * a cleanup done bit.
@@ -238,13 +248,14 @@ extern bool cpu_poll_job(struct cpu_job *job);
  */
 extern void cpu_wait_job(struct cpu_job *job, bool free_it);
 
-/* Free a CPU job, only call on a completed job */
-extern void cpu_free_job(struct cpu_job *job);
-
 /* Called by init to process jobs */
 extern void cpu_process_jobs(void);
 /* Fallback to running jobs synchronously for global jobs */
 extern void cpu_process_local_jobs(void);
+/* Check if there's any job pending */
+bool cpu_check_jobs(struct cpu_thread *cpu);
+/* Enable/disable PM */
+void cpu_set_pm_enable(bool pm_enabled);
 
 static inline void cpu_give_self_os(void)
 {
@@ -253,5 +264,7 @@ static inline void cpu_give_self_os(void)
 
 extern unsigned long __attrconst cpu_stack_bottom(unsigned int pir);
 extern unsigned long __attrconst cpu_stack_top(unsigned int pir);
+
+extern void cpu_idle(enum cpu_wake_cause wake_on);
 
 #endif /* __CPU_H */

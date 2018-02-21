@@ -35,10 +35,14 @@ HOSTCC=gcc
 HOSTEND=$(shell uname -m | sed -e 's/^i.*86$$/LITTLE/' -e 's/^x86.*/LITTLE/' -e 's/^ppc64le/LITTLE/' -e 's/^ppc.*/BIG/')
 HOSTCFLAGS=-O1 $(CWARNS) -DHAVE_$(HOSTEND)_ENDIAN -MMD
 HOSTCFLAGS += $(call try-cflag,$(HOSTCC),-std=gnu11)
+HOSTCFLAGS += $(call try-cflag,$(HOSTCC),-m64)
 HOSTCFLAGS += $(call try-cflag,$(HOSTCC),-Wjump-misses-init) \
 	  $(call try-cflag,$(HOSTCC),-Wsuggest-attribute=const) \
 	  $(call try-cflag,$(HOSTCC),-Wsuggest-attribute=noreturn) \
 	  $(call try-cflag,$(HOSTCC),-Wstack-usage=1024)
+HOSTCFLAGS += -DDEBUG -DCCAN_LIST_DEBUG
+
+HOSTGCOVCFLAGS = -fprofile-arcs -ftest-coverage -lgcov -O0 -g -pg
 
 VALGRIND=valgrind -q --show-reachable=yes --error-exitcode=99
 
@@ -60,8 +64,13 @@ CPPFLAGS += -DBITS_PER_LONG=64 -DHAVE_BIG_ENDIAN
 # causing all our printf's to warn
 CPPFLAGS += -ffreestanding
 
-CFLAGS := -fno-strict-aliasing -fstack-protector-all -pie -mbig-endian -m64
+ifeq ($(DEBUG),1)
+CPPFLAGS += -DDEBUG -DCCAN_LIST_DEBUG
+endif
+
+CFLAGS := -fno-strict-aliasing -pie -mbig-endian -m64
 CFLAGS += -Wl,--oformat,elf64-powerpc
+CFLAGS += -ffixed-r13
 CFLAGS += $(call try-cflag,$(CC),-mabi=elfv1)
 CFLAGS += $(call try-cflag,$(CC),-std=gnu11)
 
@@ -69,12 +78,18 @@ ifeq ($(SKIBOOT_GCOV),1)
 CFLAGS += -fprofile-arcs -ftest-coverage -DSKIBOOT_GCOV=1
 endif
 
+# Stack protector disabled for now. gcc tends to use the TLS to
+# access the canary (depending on how gcc was built), and this won't
+# work for us.
+#
 ifeq ($(STACK_CHECK),1)
-CFLAGS += -fstack-protector-all -pg
+#CFLAGS += -fstack-protector-all -pg
+CFLAGS += -fno-stack-protector -pg
 CPPFLAGS += -DSTACK_CHECK_ENABLED
 else
-CFLAGS += -fstack-protector
-CFLAGS += $(call try-cflag,$(CC),-fstack-protector-strong)
+CFLAGS += -fno-stack-protector
+#CFLAGS += -fstack-protector
+#CFLAGS += $(call try-cflag,$(CC),-fstack-protector-strong)
 endif
 
 CFLAGS += $(call try-cflag,$(CC),-Wjump-misses-init) \
@@ -145,6 +160,7 @@ include $(SRC)/libpore/Makefile.inc
 include $(SRC)/libc/Makefile.inc
 include $(SRC)/ccan/Makefile.inc
 include $(SRC)/$(DEVSRC)/Makefile.inc
+include $(SRC)/libstb/Makefile.inc
 
 # hack for travis-ci and coverity
 gard:
@@ -158,7 +174,7 @@ pflash-coverity:
 
 all: $(SUBDIRS) $(TARGET).lid $(TARGET).lid.xz $(TARGET).map extract-gcov
 
-OBJS := $(ASM) $(CORE) $(HW) $(PLATFORMS) $(LIBFDT) $(LIBFLASH)
+OBJS := $(ASM) $(CORE) $(HW) $(PLATFORMS) $(LIBFDT) $(LIBFLASH) $(LIBSTB)
 ifeq ($(PORE),1)
 OBJS += $(LIBPORE)
 endif
@@ -184,7 +200,7 @@ $(TARGET).elf: $(ALL_OBJS_2) $(TARGET).lds $(KERNEL)
 	$(call Q,LD, $(CC) $(LDFLAGS) -T $(TARGET).lds $(ALL_OBJS_2) -o $@, $@)
 
 $(SUBDIRS):
-	$(call Q,MKDIR,mkdir $@, $@)
+	$(call Q,MKDIR,mkdir -p $@, $@)
 
 -include $(wildcard *.d)
 -include $(wildcard $(SUBDIRS:%=%/*.d))

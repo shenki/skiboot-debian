@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include <libflash/errors.h>
 
@@ -33,7 +34,7 @@
  * 0  - The region is not ECC protected
  * -1 - Partially protected
  */
-static int ecc_protected(struct blocklevel_device *bl, uint32_t pos, uint32_t len)
+static int ecc_protected(struct blocklevel_device *bl, uint64_t pos, uint64_t len)
 {
 	int i;
 
@@ -77,11 +78,9 @@ static int release(struct blocklevel_device *bl)
 	return rc;
 }
 
-int blocklevel_read(struct blocklevel_device *bl, uint32_t pos, void *buf, uint32_t len)
+int blocklevel_raw_read(struct blocklevel_device *bl, uint64_t pos, void *buf, uint64_t len)
 {
 	int rc;
-	struct ecc64 *buffer;
-	uint32_t ecc_len = ecc_buffer_size(len);
 
 	if (!bl || !bl->read || !buf) {
 		errno = EINVAL;
@@ -92,11 +91,26 @@ int blocklevel_read(struct blocklevel_device *bl, uint32_t pos, void *buf, uint3
 	if (rc)
 		return rc;
 
-	if (!ecc_protected(bl, pos, len)) {
-		rc = bl->read(bl, pos, buf, len);
-		release(bl);
-		return rc;
+	rc = bl->read(bl, pos, buf, len);
+
+	release(bl);
+
+	return rc;
+}
+
+int blocklevel_read(struct blocklevel_device *bl, uint64_t pos, void *buf, uint64_t len)
+{
+	int rc;
+	struct ecc64 *buffer;
+	uint64_t ecc_len = ecc_buffer_size(len);
+
+	if (!bl || !buf) {
+		errno = EINVAL;
+		return FLASH_ERR_PARM_ERROR;
 	}
+
+	if (!ecc_protected(bl, pos, len))
+		return blocklevel_raw_read(bl, pos, buf, len);
 
 	buffer = malloc(ecc_len);
 	if (!buffer) {
@@ -105,7 +119,7 @@ int blocklevel_read(struct blocklevel_device *bl, uint32_t pos, void *buf, uint3
 		goto out;
 	}
 
-	rc = bl->read(bl, pos, buffer, ecc_len);
+	rc = blocklevel_raw_read(bl, pos, buffer, ecc_len);
 	if (rc)
 		goto out;
 
@@ -115,16 +129,14 @@ int blocklevel_read(struct blocklevel_device *bl, uint32_t pos, void *buf, uint3
 	}
 
 out:
-	release(bl);
 	free(buffer);
 	return rc;
 }
 
-int blocklevel_write(struct blocklevel_device *bl, uint32_t pos, const void *buf, uint32_t len)
+int blocklevel_raw_write(struct blocklevel_device *bl, uint64_t pos,
+		const void *buf, uint64_t len)
 {
 	int rc;
-	struct ecc64 *buffer;
-	uint32_t ecc_len = ecc_buffer_size(len);
 
 	if (!bl || !bl->write || !buf) {
 		errno = EINVAL;
@@ -135,11 +147,27 @@ int blocklevel_write(struct blocklevel_device *bl, uint32_t pos, const void *buf
 	if (rc)
 		return rc;
 
-	if (!ecc_protected(bl, pos, len)) {
-		rc =  bl->write(bl, pos, buf, len);
-		release(bl);
-		return rc;
+	rc = bl->write(bl, pos, buf, len);
+
+	release(bl);
+
+	return rc;
+}
+
+int blocklevel_write(struct blocklevel_device *bl, uint64_t pos, const void *buf,
+		uint64_t len)
+{
+	int rc;
+	struct ecc64 *buffer;
+	uint64_t ecc_len = ecc_buffer_size(len);
+
+	if (!bl || !buf) {
+		errno = EINVAL;
+		return FLASH_ERR_PARM_ERROR;
 	}
+
+	if (!ecc_protected(bl, pos, len))
+		return blocklevel_raw_write(bl, pos, buf, len);
 
 	buffer = malloc(ecc_len);
 	if (!buffer) {
@@ -154,15 +182,14 @@ int blocklevel_write(struct blocklevel_device *bl, uint32_t pos, const void *buf
 		goto out;
 	}
 
-	rc = bl->write(bl, pos, buffer, ecc_len);
+	rc = blocklevel_raw_write(bl, pos, buffer, ecc_len);
 
 out:
-	release(bl);
 	free(buffer);
 	return rc;
 }
 
-int blocklevel_erase(struct blocklevel_device *bl, uint32_t pos, uint32_t len)
+int blocklevel_erase(struct blocklevel_device *bl, uint64_t pos, uint64_t len)
 {
 	int rc;
 	if (!bl || !bl->erase) {
@@ -172,7 +199,7 @@ int blocklevel_erase(struct blocklevel_device *bl, uint32_t pos, uint32_t len)
 
 	/* Programmer may be making a horrible mistake without knowing it */
 	if (len & bl->erase_mask) {
-		fprintf(stderr, "blocklevel_erase: len (0x%08x) is not erase block (0x%08x) aligned\n",
+		fprintf(stderr, "blocklevel_erase: len (0x%"PRIu64") is not erase block (0x%08x) aligned\n",
 				len, bl->erase_mask + 1);
 		return FLASH_ERR_ERASE_BOUNDARY;
 	}
@@ -188,7 +215,7 @@ int blocklevel_erase(struct blocklevel_device *bl, uint32_t pos, uint32_t len)
 	return rc;
 }
 
-int blocklevel_get_info(struct blocklevel_device *bl, const char **name, uint32_t *total_size,
+int blocklevel_get_info(struct blocklevel_device *bl, const char **name, uint64_t *total_size,
 		uint32_t *erase_granule)
 {
 	int rc;
@@ -224,9 +251,10 @@ int blocklevel_get_info(struct blocklevel_device *bl, const char **name, uint32_
  * returns  0 for b
  * returns  1 for c
  */
-static int blocklevel_flashcmp(const void *flash_buf, const void *mem_buf, uint32_t len)
+static int blocklevel_flashcmp(const void *flash_buf, const void *mem_buf, uint64_t len)
 {
-	int i, same = true;
+	uint64_t i;
+	int same = true;
 	const uint8_t *f_buf, *m_buf;
 
 	f_buf = flash_buf;
@@ -242,7 +270,7 @@ static int blocklevel_flashcmp(const void *flash_buf, const void *mem_buf, uint3
 	return same ? 0 : 1;
 }
 
-int blocklevel_smart_write(struct blocklevel_device *bl, uint32_t pos, const void *buf, uint32_t len)
+int blocklevel_smart_write(struct blocklevel_device *bl, uint64_t pos, const void *buf, uint64_t len)
 {
 	uint32_t erase_size;
 	const void *write_buf = buf;
@@ -327,53 +355,95 @@ out_free:
 	return rc;
 }
 
-static int insert_bl_prot_range(struct blocklevel_range *ranges, struct bl_prot_range range)
+static bool insert_bl_prot_range(struct blocklevel_range *ranges, struct bl_prot_range range)
 {
-	struct bl_prot_range *new_ranges;
-	struct bl_prot_range *old_ranges = ranges->prot;
-	int i, count = ranges->n_prot;
+	int i;
+	uint32_t pos, len;
+	struct bl_prot_range *prot = ranges->prot;
 
-	/* Try to merge into an existing range */
-	for (i = 0; i < count; i++) {
-		if (!(range.start + range.len == old_ranges[i].start ||
-			  old_ranges[i].start + old_ranges[i].len == range.start))
-			continue;
+	pos = range.start;
+	len = range.len;
 
-		if (range.start + range.len == old_ranges[i].start)
-			old_ranges[i].start = range.start;
+	if (len == 0)
+		return true;
 
-		old_ranges[i].len += range.len;
+	/* Check for overflow */
+	if (pos + len < len)
+		return false;
 
-		/*
-		 * Check the inserted range isn't wedged between two ranges, if it
-		 * is, merge as well
-		 */
-		i++;
-		if (i < count && range.start + range.len == old_ranges[i].start) {
-			old_ranges[i - 1].len += old_ranges[i].len;
-
-			for (; i + 1 < count; i++)
-				old_ranges[i] = old_ranges[i + 1];
-			ranges->n_prot--;
+	for (i = 0; i < ranges->n_prot && len > 0; i++) {
+		if (prot[i].start <= pos && prot[i].start + prot[i].len >= pos + len) {
+			len = 0;
+			break; /* Might as well, the next two conditions can't be true */
 		}
 
-		return 0;
+		/* Can easily extend this down just by adjusting start */
+		if (pos <= prot[i].start && pos + len >= prot[i].start) {
+			prot[i].len += prot[i].start - pos;
+			prot[i].start = pos;
+			pos += prot[i].len;
+			if (prot[i].len >= len)
+				len = 0;
+			else
+				len -= prot[i].len;
+		}
+
+		/*
+		 * Jump over this range but the new range might be so big that
+		 * theres a chunk after
+		 */
+		if (pos >= prot[i].start && pos < prot[i].start + prot[i].len) {
+			if (prot[i].start + prot[i].len - pos > len) {
+				len -= prot[i].start + prot[i].len - pos;
+				pos = prot[i].start + prot[i].len;
+			} else {
+				len = 0;
+			}
+		}
+		/*
+		 * This condition will be true if the range is smaller than
+		 * the current range, therefore it should go here!
+		 */
+		if (pos < prot[i].start && pos + len <= prot[i].start)
+			break;
 	}
 
-	if (ranges->n_prot == ranges->total_prot) {
-		new_ranges = realloc(ranges->prot, sizeof(range) * ((ranges->n_prot) + PROT_REALLOC_NUM));
-		if (new_ranges)
+	if (len) {
+		int insert_pos = i;
+		struct bl_prot_range *new_ranges = ranges->prot;
+		if (ranges->n_prot == ranges->total_prot) {
+			new_ranges = realloc(ranges->prot,
+					sizeof(range) * ((ranges->n_prot) + PROT_REALLOC_NUM));
+			if (!new_ranges)
+				return false;
 			ranges->total_prot += PROT_REALLOC_NUM;
-	} else {
-		new_ranges = old_ranges;
-	}
-	if (new_ranges) {
-		memcpy(new_ranges + ranges->n_prot, &range, sizeof(range));
+		}
+		if (insert_pos != ranges->n_prot)
+			for (i = ranges->n_prot; i > insert_pos; i--)
+				memcpy(&new_ranges[i], &new_ranges[i - 1], sizeof(range));
+		range.start = pos;
+		range.len = len;
+		memcpy(&new_ranges[insert_pos], &range, sizeof(range));
 		ranges->prot = new_ranges;
 		ranges->n_prot++;
 	}
 
-	return !new_ranges;
+	/* Probably only worth mergeing when we're low on space */
+	if (ranges->n_prot + 1 == ranges->total_prot) {
+		/* Check to see if we can merge ranges */
+		for (i = 0; i < ranges->n_prot - 1; i++) {
+			if (prot[i].start + prot[i].len == prot[i + 1].start) {
+				int j;
+				prot[i].len += prot[i + 1].len;
+				for (j = i + 1; j < ranges->n_prot - 1; j++)
+					memcpy(&prot[j] , &prot[j + 1], sizeof(range));
+				ranges->n_prot--;
+				i--; /* Maybe the next one can merge too */
+			}
+		}
+	}
+
+	return true;
 }
 
 int blocklevel_ecc_protect(struct blocklevel_device *bl, uint32_t start, uint32_t len)
@@ -385,11 +455,7 @@ int blocklevel_ecc_protect(struct blocklevel_device *bl, uint32_t start, uint32_
 	 */
 	struct bl_prot_range range = { .start = start, .len = len };
 
-	/*
-	 * Refuse to add regions that are already protected or are partially
-	 * protected
-	 */
-	if (len < BYTES_PER_ECC || ecc_protected(bl, start, len))
+	if (len < BYTES_PER_ECC)
 		return -1;
-	return insert_bl_prot_range(&bl->ecc_prot, range);
+	return !insert_bl_prot_range(&bl->ecc_prot, range);
 }
