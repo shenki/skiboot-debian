@@ -461,6 +461,8 @@ static void print_help(const char *pname)
 	printf("\t\tTarget BMC flash instead of host flash.\n");
 	printf("\t\tNote: This carries a high chance of bricking your BMC if you\n");
 	printf("\t\tdon't know what you're doing. Consider --mtd to be safe(r)\n\n");
+	printf("\t-F filename, --flash-file filename\n");
+	printf("\t\tTarget filename instead of actual flash.\n\n");
 	printf("\t-S, --side\n");
 	printf("\t\tSide of the flash on which to operate, 0 (default) or 1\n\n");
 	printf("\t-T, --toc\n");
@@ -507,7 +509,7 @@ static void print_help(const char *pname)
 	printf("\t\tThis message.\n\n");
 }
 
-void exiting(int d, void *p)
+void exiting(void)
 {
 	if (need_relock)
 		arch_flash_set_wrprotect(bl, 1);
@@ -527,6 +529,7 @@ int main(int argc, char *argv[])
 	char *write_file = NULL, *read_file = NULL, *part_name = NULL;
 	bool ffs_toc_seen = false, mtd = false;
 	int rc;
+	const char *flashfilename = NULL;
 
 	while(1) {
 		struct option long_opts[] = {
@@ -542,6 +545,7 @@ int main(int argc, char *argv[])
 			{"erase",	no_argument,		NULL,	'e'},
 			{"program",	required_argument,	NULL,	'p'},
 			{"force",	no_argument,		NULL,	'f'},
+			{"flash-file",	required_argument,	NULL,	'F'},
 			{"info",	no_argument,		NULL,	'i'},
 			{"tune",	no_argument,		NULL,	't'},
 			{"dummy",	no_argument,		NULL,	'd'},
@@ -550,13 +554,14 @@ int main(int argc, char *argv[])
 			{"debug",	no_argument,		NULL,	'g'},
 			{"side",	required_argument,	NULL,	'S'},
 			{"toc",		required_argument,	NULL,	'T'},
-			{"clear",   no_argument,        NULL,   'c'}
+			{"clear",   no_argument,        NULL,   'c'},
+			{NULL,	    0,                  NULL,    0 }
 		};
 		int c, oidx = 0;
 
-		c = getopt_long(argc, argv, "a:s:P:r:43Eemp:fdihvbtgS:T:c",
+		c = getopt_long(argc, argv, "+:a:s:P:r:43Eemp:fdihvbtgS:T:cF:",
 				long_opts, &oidx);
-		if (c == EOF)
+		if (c == -1)
 			break;
 		switch(c) {
 		case 'a':
@@ -594,6 +599,9 @@ int main(int argc, char *argv[])
 		case 'f':
 			must_confirm = false;
 			break;
+		case 'F':
+			flashfilename = optarg;
+			break;
 		case 'd':
 			must_confirm = false;
 			dummy_run = true;
@@ -626,16 +634,36 @@ int main(int argc, char *argv[])
 		case 'c':
 			do_clear = true;
 			break;
+		case ':':
+			fprintf(stderr, "Unrecognised option \"%s\" to '%c'\n", optarg, optopt);
+			no_action = true;
+			break;
+		case '?':
+			fprintf(stderr, "Unrecognised option '%c'\n", optopt);
+			no_action = true;
+			break;
 		default:
-			exit(1);
+			fprintf(stderr , "Encountered unknown error parsing options\n");
+			no_action = true;
 		}
+	}
+
+	if (optind < argc) {
+		/*
+		 * It appears not everything passed to pflash was an option, best to
+		 * not continue
+		 */
+		while (optind < argc)
+			fprintf(stderr, "Unrecognised option or argument \"%s\"\n", argv[optind++]);
+
+		no_action = true;
 	}
 
 	/* Check if we need to access the flash at all (which will
 	 * also tune them as a side effect
 	 */
-	no_action = !erase && !program && !info && !do_read &&
-		!enable_4B && !disable_4B && !tune && !do_clear;
+	no_action = no_action || (!erase && !program && !info && !do_read &&
+		!enable_4B && !disable_4B && !tune && !do_clear);
 
 	/* Nothing to do, if we didn't already, print usage */
 	if (no_action && !show_version)
@@ -742,13 +770,12 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (arch_flash_init(&bl, NULL, true)) {
+	if (arch_flash_init(&bl, flashfilename, true)) {
 		fprintf(stderr, "Couldn't initialise architecture flash structures\n");
 		exit(1);
 	}
 
-	on_exit(exiting, NULL);
-
+	atexit(exiting);
 
 	rc = blocklevel_get_info(bl, &fl_name,
 			    &fl_total_size, &fl_erase_granule);

@@ -9,8 +9,9 @@ proc mconfig { name env_name def } {
     if { ![info exists mconf($name)] } { set mconf($name) $def }
 }
 
+mconfig cpus CPUS 1
 mconfig threads THREADS 1
-mconfig memory MEM_SIZE 1G
+mconfig memory MEM_SIZE 4G
 
 # Should we stop on an illeagal instruction
 mconfig stop_on_ill MAMBO_STOP_ON_ILL false
@@ -61,10 +62,9 @@ mconfig tap_base MAMBO_NET_TAP_BASE 0
 #
 # Create machine config
 #
-if { ! [info exists env(SIMHOST)] } {
-    set env(SIMHOST) "pegasus"
-}
-define dup $env(SIMHOST) myconf
+set default_config [display default_configure]
+define dup $default_config myconf
+myconf config cpus $mconf(cpus)
 myconf config processor/number_of_threads $mconf(threads)
 myconf config memory_size $mconf(memory)
 myconf config processor_option/ATTN_STOP true
@@ -75,12 +75,17 @@ myconf config enable_rtas_support false
 myconf config processor/cpu_frequency 512M
 myconf config processor/timebase_frequency 1/1
 myconf config enable_pseries_nvram false
+myconf config machine_option/NO_RAM TRUE
+myconf config machine_option/NO_ROM TRUE
 
-# We need to be DD2 or greater on p8 for the HILE HID bit.
-if { $env(SIMHOST) == "pegasus" } {
+if { $default_config == "PEGASUS" } {
+    # We need to be DD2 or greater on p8 for the HILE HID bit.
     myconf config processor/initial/PVR 0x4b0201
 }
-
+if { $default_config == "P9" } {
+    # make sure we look like a POWER9
+    myconf config processor/initial/SIM_CTRL1 0xc228000400000000
+}
 if { [info exists env(SKIBOOT_SIMCONF)] } {
     source $env(SKIBOOT_SIMCONF)
 }
@@ -149,11 +154,6 @@ set cpus_node [mysim of find_device "/cpus"]
 mysim of addprop $cpus_node int "#address-cells" 1
 mysim of addprop $cpus_node int "#size-cells" 0
 
-set cpu0_node [mysim of find_device "/cpus/PowerPC@0"]
-mysim of addprop $cpu0_node int "ibm,chip-id" 0
-set reg  [list 0x0000001c00000028 0xffffffffffffffff]
-mysim of addprop $cpu0_node array64 "ibm,processor-segment-sizes" reg
-
 set mem0_node [mysim of find_device "/memory@0"]
 mysim of addprop $mem0_node int "ibm,chip-id" 0
 
@@ -174,16 +174,59 @@ if { [info exists env(SKIBOOT_INITRD)] } {
     set cpio_file $env(SKIBOOT_INITRD)
     set chosen_node [mysim of find_device /chosen]
     set cpio_size [file size $cpio_file]
-    set cpio_start 0x10000000
+    set cpio_start 0x80000000
     set cpio_end [expr $cpio_start + $cpio_size]
     mysim of addprop $chosen_node int "linux,initrd-start" $cpio_start
     mysim of addprop $chosen_node int "linux,initrd-end"   $cpio_end
     mysim mcm 0 memory fread $cpio_start $cpio_size $cpio_file
 }
 
-# Flatten it
+# Init CPUs
+set pir 0
+for { set c 0 } { $c < $mconf(cpus) } { incr c } {
+    set cpu_node [mysim of find_device "/cpus/PowerPC@$pir"]
+    mysim of addprop $cpu_node int "ibm,chip-id" $c
+    mysim of addprop $cpu_node int "ibm,pir" $pir
+    set reg  [list 0x0000001c00000028 0xffffffffffffffff]
+    mysim of addprop $cpu_node array64 "ibm,processor-segment-sizes" reg
 
-epapr::of2dtb mysim $mconf(epapr_dt_addr) 
+    set reg {}
+    if { $default_config == "P9" } {
+	# POWER9 PAPR defines upto bytes 62-63
+	# header + bytes 0-5
+	lappend reg 0x4000f63fc70080c0
+	# bytes 6-13
+	lappend reg 0x8000000000000000
+	# bytes 14-21
+	lappend reg 0x0000800080008000
+	# bytes 22-29 22/23=TM
+	lappend reg 0x8000800080008000
+	# bytes 30-37
+	lappend reg 0x80008000C0008000
+	# bytes 38-45 40/41=radix
+	lappend reg 0x8000800080008000
+	# bytes 46-55
+	lappend reg 0x8000800080008000
+	# bytes 54-61 58/59=seg tbl
+	lappend reg 0x8000800080008000
+	# bytes 62-69
+	lappend reg 0x8000000000000000
+    } else {
+	lappend reg 0x6000f63fc70080c0
+    }
+    mysim of addprop $cpu_node array64 "ibm,pa-features" reg
+
+    set irqreg [list]
+    for { set t 0 } { $t < $mconf(threads) } { incr t } {
+	mysim mcm 0 cpu $c thread $t set spr pc $mconf(boot_pc)
+	mysim mcm 0 cpu $c thread $t set gpr 3 $mconf(epapr_dt_addr)
+	mysim mcm 0 cpu $c thread $t config_on
+	mysim mcm 0 cpu $c thread $t set spr pir $pir
+	lappend irqreg $pir
+	incr pir
+    }
+    mysim of addprop $cpu_node array "ibm,ppc-interrupt-server#s" irqreg
+}
 
 # Load images
 
@@ -193,16 +236,11 @@ mysim memory fread $mconf(boot_load) $boot_size $mconf(boot_image)
 set payload_size [file size $mconf(payload)]
 mysim memory fread $mconf(payload_addr) $payload_size $mconf(payload)
 
-# Init CPUs
+# Flatten it
+epapr::of2dtb mysim $mconf(epapr_dt_addr)
 
-for { set i 0 } { $i < $mconf(threads) } { incr i } {
-    mysim mcm 0 cpu 0 thread $i set spr pc $mconf(boot_pc) 
-    mysim mcm 0 cpu 0 thread $i set gpr 3 $mconf(epapr_dt_addr)
-    mysim mcm 0 cpu 0 thread $i config_on    
-}
-
-# Turbo mode & run
-mysim mode turbo
+# Set run speed
+mysim mode fastest
 
 if { [info exists env(SKIBOOT_AUTORUN)] } {
     mysim go

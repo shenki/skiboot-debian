@@ -78,6 +78,11 @@ static void astbmc_ipmi_setenables(void)
 
         msg = ipmi_mkmsg_simple(IPMI_SET_ENABLES, &data, sizeof(data));
         if (!msg) {
+		/**
+		 * @fwts-label ASTBMCFailedSetEnables
+		 * @fwts-advice AST BMC is likely to be non-functional
+		 * when accessed from host.
+		 */
                 prlog(PR_ERR, "ASTBMC: failed to set enables\n");
                 return;
         }
@@ -347,8 +352,8 @@ void astbmc_early_init(void)
 	/* Similarly, some BMCs don't configure the BT interrupt properly */
 	ast_setup_ibt(BT_IO_BASE, BT_LPC_IRQ);
 
-	/* Setup UART and use it as console with interrupts */
-	uart_init(true);
+	/* Setup UART and use it as console */
+	uart_init();
 
 	prd_init();
 }

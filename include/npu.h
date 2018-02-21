@@ -148,13 +148,15 @@ struct npu_dev {
 	uint32_t		procedure_status;
 
 	uint8_t			pe_num;
+
+	/* Used to associate the NPU device with GPU PCI devices */
+	const char		*slot_label;
 };
 
 /* NPU PHB descriptor */
 struct npu {
 	uint32_t		flags;
 	uint32_t		index;
-	struct lock		lock;
 	uint32_t		chip_id;
 	uint64_t		xscom_base;
 	uint64_t		at_xscom;
@@ -202,15 +204,14 @@ int64_t npu_dev_procedure_write(struct npu_dev_trap *trap,
 				uint32_t size,
 				uint32_t data);
 
+void npu_set_fence_state(struct npu *p, bool fence);
+
 #define NPUDBG(p, fmt, a...)	prlog(PR_DEBUG, "NPU%d: " fmt, \
 				      (p)->phb.opal_id, ##a)
 #define NPUINF(p, fmt, a...)	prlog(PR_INFO,  "NPU%d: " fmt, \
 				      (p)->phb.opal_id, ##a)
-#define NPUERR(p, fmt, a...)	prlog(PR_ERR,   "NPU%d: " fmt, \
-				      (p)->phb.opal_id, ##a)
 
 #define NPUDEVDBG(p, fmt, a...)	NPUDBG((p)->npu, fmt, ##a)
 #define NPUDEVINF(p, fmt, a...)	NPUINF((p)->npu, fmt, ##a)
-#define NPUDEVERR(p, fmt, a...)	NPUERR((p)->npu, fmt, ##a)
 
 #endif /* __NPU_H */

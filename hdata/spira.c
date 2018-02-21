@@ -147,6 +147,55 @@ __section(".spira.data") struct spira spira = {
 	},
 };
 
+/* The Hypervisor SPIRA-H Structure */
+__section(".spirah.data") struct spirah spirah = {
+	.hdr = HDIF_SIMPLE_HDR(SPIRAH_HDIF_SIG, SPIRAH_VERSION, struct spirah),
+	.ntuples_ptr = HDIF_IDATA_PTR(offsetof(struct spirah, ntuples),
+				      sizeof(struct spirah_ntuples)),
+	.ntuples = {
+		.array_hdr = {
+			.offset		= CPU_TO_BE32(HDIF_ARRAY_OFFSET),
+			.ecnt		= CPU_TO_BE32(SPIRAH_NTUPLES_COUNT),
+			.esize
+				= CPU_TO_BE32(sizeof(struct spira_ntuple)),
+			.eactsz		= CPU_TO_BE32(0x18),
+		},
+		/* Host Data Areas */
+		.hs_data_area = {
+			.addr		= CPU_TO_BE64(SPIRA_HEAP_BASE),
+			.alloc_cnt	= CPU_TO_BE16(1),
+			.alloc_len	= CPU_TO_BE32(SPIRA_HEAP_SIZE),
+		},
+		/* We only populate some n-tuples */
+		.proc_init = {
+			.addr		= CPU_TO_BE64(PROCIN_OFF),
+			.alloc_cnt	= CPU_TO_BE16(1),
+			.act_cnt	= CPU_TO_BE16(1),
+			.alloc_len
+			= CPU_TO_BE32(sizeof(struct proc_init_data)),
+		},
+#if !defined(TEST)
+		.cpu_ctrl = {
+			.addr		= CPU_TO_BE64((unsigned long)&cpu_ctl_init_data),
+			.alloc_cnt	= CPU_TO_BE16(1),
+			.act_cnt	= CPU_TO_BE16(1),
+			.alloc_len	=
+					CPU_TO_BE32(sizeof(cpu_ctl_init_data)),
+		},
+#endif
+		.mdump_src = {
+			.addr		= CPU_TO_BE64(MDST_TABLE_OFF),
+			.alloc_cnt	= CPU_TO_BE16(ARRAY_SIZE(init_mdst_table)),
+			.act_cnt	= CPU_TO_BE16(ARRAY_SIZE(init_mdst_table)),
+			.alloc_len	=
+				CPU_TO_BE32(sizeof(init_mdst_table)),
+		},
+	},
+};
+
+/* The service processor SPIRA-S structure */
+struct spiras *spiras;
+
 /* Overridden for testing. */
 #ifndef spira_check_ptr
 bool spira_check_ptr(const void *ptr, const char *file, unsigned int line)
@@ -322,7 +371,7 @@ static bool add_xscom_sppcrd(uint64_t xscom_base)
 	const struct HDIF_common_hdr *hdif;
 	unsigned int i, vpd_sz;
 	const void *vpd;
-	struct dt_node *np;
+	struct dt_node *np, *vpd_node;
 
 	for_each_ntuple_idx(&spira.ntuples.proc_chip, hdif, i,
 			    SPPCRD_HDIF_SIG) {
@@ -360,7 +409,11 @@ static bool add_xscom_sppcrd(uint64_t xscom_base)
 		}
 
 		/* Add chip VPD */
-		dt_add_vpd_node(hdif, SPPCRD_IDATA_FRU_ID, SPPCRD_IDATA_KW_VPD);
+		vpd_node = dt_add_vpd_node(hdif, SPPCRD_IDATA_FRU_ID,
+					   SPPCRD_IDATA_KW_VPD);
+		if (vpd_node)
+			dt_add_property_cells(vpd_node, "ibm,chip-id",
+					      be32_to_cpu(cinfo->xscom_id));
 
 		/* Add module VPD on version A and later */
 		if (version >= 0x000a) {
@@ -388,7 +441,7 @@ static void add_xscom_sppaca(uint64_t xscom_base)
 {
 	const struct HDIF_common_hdr *hdif;
 	unsigned int i;
-	struct dt_node *np;
+	struct dt_node *np, *vpd_node;
 
 	for_each_ntuple_idx(&spira.ntuples.paca, hdif, i, PACA_HDIF_SIG) {
 		const struct sppaca_cpu_id *id;
@@ -425,7 +478,10 @@ static void add_xscom_sppaca(uint64_t xscom_base)
 			continue;
 
 		/* Add chip VPD */
-		dt_add_vpd_node(hdif, SPPACA_IDATA_FRU_ID, SPPACA_IDATA_KW_VPD);
+		vpd_node = dt_add_vpd_node(hdif, SPPACA_IDATA_FRU_ID,
+					   SPPACA_IDATA_KW_VPD);
+		if (vpd_node)
+			dt_add_property_cells(vpd_node, "ibm,chip-id", chip_id);
 
 		/* Add chip associativity data */
 		dt_add_property_cells(np, "ibm,ccm-node-id",
@@ -993,11 +1049,56 @@ static void hostservices_parse(void)
 	hservices_from_hdat(dt_blob, size);
 }
 
-void parse_hdat(bool is_opal, uint32_t master_cpu)
+/*
+ * Legacy SPIRA is being deprecated and we have new SPIRA-H/S structures.
+ * But on older system (p7?) we will continue to get legacy SPIRA.
+ *
+ * SPIRA-S is initialized and provided by FSP. We use SPIRA-S signature
+ * to identify supported format. Also if required adjust spira pointer.
+ */
+static void fixup_spira(void)
+{
+#if !defined(TEST)
+	spiras = (struct spiras *)CPU_TO_BE64(SPIRA_HEAP_BASE);
+#endif
+
+	/* Validate SPIRA-S signature */
+	if (!spiras)
+		return;
+	if (!HDIF_check(&spiras->hdr, SPIRAS_HDIF_SIG))
+		return;
+
+	prlog(PR_NOTICE, "SPIRA-S found.\n");
+
+	spira.ntuples.sp_subsys = spiras->ntuples.sp_subsys;
+	spira.ntuples.ipl_parms = spiras->ntuples.ipl_parms;
+	spira.ntuples.nt_enclosure_vpd = spiras->ntuples.nt_enclosure_vpd;
+	spira.ntuples.slca = spiras->ntuples.slca;
+	spira.ntuples.backplane_vpd = spiras->ntuples.backplane_vpd;
+	spira.ntuples.system_vpd = spiras->ntuples.system_vpd;
+	spira.ntuples.proc_init = spirah.ntuples.proc_init;
+	spira.ntuples.clock_vpd = spiras->ntuples.clock_vpd;
+	spira.ntuples.anchor_vpd = spiras->ntuples.anchor_vpd;
+	spira.ntuples.op_panel_vpd = spiras->ntuples.op_panel_vpd;
+	spira.ntuples.misc_cec_fru_vpd = spiras->ntuples.misc_cec_fru_vpd;
+	spira.ntuples.ms_vpd = spiras->ntuples.ms_vpd;
+	spira.ntuples.cec_iohub_fru = spiras->ntuples.cec_iohub_fru;
+	spira.ntuples.cpu_ctrl = spirah.ntuples.cpu_ctrl;
+	spira.ntuples.mdump_src = spirah.ntuples.mdump_src;
+	spira.ntuples.mdump_dst = spirah.ntuples.mdump_dst;
+	spira.ntuples.mdump_res  = spirah.ntuples.mdump_res;
+	spira.ntuples.pcia = spiras->ntuples.pcia;
+	spira.ntuples.proc_chip = spiras->ntuples.proc_chip;
+	spira.ntuples.hs_data = spiras->ntuples.hs_data;
+}
+
+int parse_hdat(bool is_opal, uint32_t master_cpu)
 {
 	cpu_type = PVR_TYPE(mfspr(SPR_PVR));
 
 	prlog(PR_DEBUG, "Parsing HDAT...\n");
+
+	fixup_spira();
 
 	dt_root = dt_new_root("");
 
@@ -1016,7 +1117,8 @@ void parse_hdat(bool is_opal, uint32_t master_cpu)
 
 	/* Parse SPPACA and/or PCIA */
 	if (!pcia_parse())
-		paca_parse();
+		if (paca_parse() < 0)
+			return -1;
 
 	/* IPL params */
 	add_iplparams();
@@ -1050,4 +1152,6 @@ void parse_hdat(bool is_opal, uint32_t master_cpu)
 	slca_dt_add_sai_node();
 
 	prlog(PR_INFO, "Parsing HDAT...done\n");
+
+	return 0;
 }

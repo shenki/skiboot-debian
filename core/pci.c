@@ -18,6 +18,7 @@
 #include <cpu.h>
 #include <pci.h>
 #include <pci-cfg.h>
+#include <pci-slot.h>
 #include <timebase.h>
 #include <device.h>
 #include <fsp.h>
@@ -262,7 +263,7 @@ static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *paren
 	 * Call PHB hook
 	 */
 	if (phb->ops->device_init)
-		phb->ops->device_init(phb, pd);
+		phb->ops->device_init(phb, pd, NULL);
 
 	return pd;
  fail:
@@ -281,11 +282,19 @@ static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *paren
  */
 static void pci_check_clear_freeze(struct phb *phb)
 {
-	int64_t rc;
 	uint8_t freeze_state;
 	uint16_t pci_error_type, sev;
+	int64_t pe_number, rc;
 
-	rc = phb->ops->eeh_freeze_status(phb, 0, &freeze_state,
+	/* Retrieve the reserved PE number */
+	pe_number = OPAL_PARAMETER;
+	if (phb->ops->get_reserved_pe_number)
+		pe_number = phb->ops->get_reserved_pe_number(phb);
+	if (pe_number < 0)
+		return;
+
+	/* Retrieve the frozen state */
+	rc = phb->ops->eeh_freeze_status(phb, pe_number, &freeze_state,
 					 &pci_error_type, &sev, NULL);
 	if (rc)
 		return;
@@ -297,7 +306,8 @@ static void pci_check_clear_freeze(struct phb *phb)
 		PCIERR(phb, 0, "Fatal probe in %s error !\n", __func__);
 		return;
 	}
-	phb->ops->eeh_freeze_clear(phb, 0, OPAL_EEH_ACTION_CLEAR_FREEZE_ALL);
+	phb->ops->eeh_freeze_clear(phb, pe_number,
+				   OPAL_EEH_ACTION_CLEAR_FREEZE_ALL);
 }
 
 /* pci_enable_bridge - Called before scanning a bridge
@@ -450,11 +460,81 @@ static void pci_cleanup_bridge(struct phb *phb, struct pci_device *pd)
 	pci_cfg_write16(phb, pd->bdfn, PCI_CFG_CMD, cmd);	
 }
 
+/* Remove all subordinate PCI devices leading from the indicated
+ * PCI bus. It's used to remove all PCI devices behind one PCI
+ * slot at unplugging time
+ */
+void pci_remove_bus(struct phb *phb, struct list_head *list)
+{
+	struct pci_device *pd, *tmp;
 
-/* pci_scan - Perform a recursive scan of the bus at bus_number
- *            populating the list passed as an argument. This also
- *            performs the bus numbering, so it returns the largest
- *            bus number that was assigned.
+	list_for_each_safe(list, pd, tmp, link) {
+		pci_remove_bus(phb, &pd->children);
+
+		/* Release device node and PCI slot */
+		if (pd->dn)
+			dt_free(pd->dn);
+		if (pd->slot)
+			free(pd->slot);
+
+		/* Remove from parent list and release itself */
+		list_del(&pd->link);
+		free(pd);
+	}
+}
+
+/*
+ * Turn off slot's power supply if there are nothing connected for
+ * 2 purposes: power saving obviously and initialize the slot to
+ * to initial power-off state for hotplug.
+ */
+static void pci_slot_power_off(struct phb *phb, struct pci_device *pd)
+{
+	struct pci_slot *slot;
+	int32_t wait = 100;
+	int64_t rc;
+
+	if (!pd || !pd->slot)
+		return;
+
+	slot = pd->slot;
+	if (!slot->pluggable || !slot->ops.set_power_state)
+		return;
+
+	/* Bail if there're something connected */
+	if (!list_empty(&pd->children))
+		return;
+
+	pci_slot_add_flags(slot, PCI_SLOT_FLAG_BOOTUP);
+	rc = slot->ops.set_power_state(slot, PCI_SLOT_POWER_OFF);
+	if (rc == OPAL_SUCCESS) {
+		PCIDBG(phb, pd->bdfn, "Power off hotpluggable slot\n");
+		return;
+	} else if (rc != OPAL_ASYNC_COMPLETION) {
+		pci_slot_set_state(slot, PCI_SLOT_STATE_NORMAL);
+		PCINOTICE(phb, pd->bdfn, "Error %lld powering off slot\n", rc);
+		return;
+	}
+
+	do {
+		if (slot->state == PCI_SLOT_STATE_SPOWER_DONE)
+			break;
+
+		check_timers(false);
+		time_wait(10);
+	} while (--wait >= 0);
+
+	pci_slot_set_state(slot, PCI_SLOT_STATE_NORMAL);
+	if (wait >= 0)
+		PCIDBG(phb, pd->bdfn, "Power off hotpluggable slot\n");
+	else
+		PCINOTICE(phb, pd->bdfn, "Timeout powering off slot\n");
+}
+
+/* Perform a recursive scan of the bus at bus_number populating
+ * the list passed as an argument. This also performs the bus
+ * numbering, so it returns the largest bus number that was
+ * assigned.
  *
  * Note: Eventually this might want to access some VPD information
  *       in order to know what slots to scan and what not etc..
@@ -464,9 +544,9 @@ static void pci_cleanup_bridge(struct phb *phb, struct pci_device *pd)
  * XXX NOTE: We might also want to setup the PCIe MPS/MRSS properly
  *           here as Linux may or may not do it
  */
-static uint8_t pci_scan(struct phb *phb, uint8_t bus, uint8_t max_bus,
-			struct list_head *list, struct pci_device *parent,
-			bool scan_downstream)
+uint8_t pci_scan_bus(struct phb *phb, uint8_t bus, uint8_t max_bus,
+		     struct list_head *list, struct pci_device *parent,
+		     bool scan_downstream)
 {
 	struct pci_device *pd = NULL;
 	uint8_t dev, fn, next_bus, max_sub, save_max;
@@ -514,8 +594,12 @@ static uint8_t pci_scan(struct phb *phb, uint8_t bus, uint8_t max_bus,
 	 * link is down already, which happens for the top level
 	 * root complex, and avoids a long secondary timeout
 	 */
-	if (!scan_downstream)
+	if (!scan_downstream) {
+		list_for_each(list, pd, link)
+			pci_slot_power_off(phb, pd);
+
 		return bus;
+	}
 
 	next_bus = bus + 1;
 	max_sub = bus;
@@ -583,8 +667,8 @@ static uint8_t pci_scan(struct phb *phb, uint8_t bus, uint8_t max_bus,
 
 		/* Perform recursive scan */
 		if (do_scan) {
-			max_sub = pci_scan(phb, next_bus, max_bus,
-					   &pd->children, pd, true);
+			max_sub = pci_scan_bus(phb, next_bus, max_bus,
+					       &pd->children, pd, true);
 		} else if (!use_max) {
 			/* XXX Empty bridge... we leave room for hotplug
 			 * slots etc.. but we should be smarter at figuring
@@ -601,6 +685,8 @@ static uint8_t pci_scan(struct phb *phb, uint8_t bus, uint8_t max_bus,
 		pd->subordinate_bus = max_sub;
 		pci_cfg_write8(phb, pd->bdfn, PCI_CFG_SUBORDINATE_BUS, max_sub);
 		next_bus = max_sub + 1;
+
+		pci_slot_power_off(phb, pd);
 	}
 
 	return max_sub;
@@ -689,115 +775,62 @@ void pci_device_init(struct phb *phb, struct pci_device *pd)
 	pci_disable_completion_timeout(phb, pd);
 }
 
-/*
- * The power state would be checked. If the power has
- * been on, we will issue fundamental reset. Otherwise,
- * we will power it on before issuing fundamental reset.
- */
-static int64_t pci_phb_reset(struct phb *phb)
-{
-	const char *desc;
-	int64_t rc;
-
-	rc = phb->ops->power_state(phb);
-	if (rc < 0) {
-		PCIERR(phb, 0, "Failed to get power state, rc=%lld\n", rc);
-		return rc;
-	}
-
-	if (rc == OPAL_SHPC_POWER_ON) {
-		desc = "fundamental reset";
-		rc = phb->ops->fundamental_reset(phb);
-	} else {
-		desc = "power on";
-		rc = phb->ops->slot_power_on(phb);
-	}
-
-	if (rc < 0) {
-		/* Don't warn if it's just an empty slot */
-		if (rc != OPAL_CLOSED)
-			goto warn_err;
-		return rc;
-	}
-
-	/* Wait the internal state machine */
-	while (rc > 0) {
-		time_wait(rc);
-		rc = phb->ops->poll(phb);
-	}
-
- warn_err:
-	if (rc < 0)
-		PCIERR(phb, 0, "Failed to %s, rc=%lld\n", desc, rc);
-
-        return rc;
-}
-
 static void pci_reset_phb(void *data)
 {
 	struct phb *phb = data;
+	struct pci_slot *slot = phb->slot;
 	int64_t rc;
 
-	PCIDBG(phb, 0, "Init slot...\n");
-
-	/*
-	 * For PCI/PCI-X, we get the slot info and we also
-	 * check if the PHB has anything connected to it
-	 */
-	if (phb->phb_type < phb_type_pcie_v1) {
-		if (platform.pci_get_slot_info)
-			platform.pci_get_slot_info(phb, NULL);
-		rc = phb->ops->presence_detect(phb);
-		if (rc != OPAL_SHPC_DEV_PRESENT) {
-			PCIDBG(phb, 0, "Slot empty\n");
-			return;
-		}
+	if (!slot || !slot->ops.freset) {
+		PCINOTICE(phb, 0, "Cannot issue fundamental reset\n");
+		return;
 	}
 
-	/*
-	 * Power on the PHB, the PHB should be reset in
-	 * fundamental way while powering on. The reset
-	 * state machine is going to wait for the link
-	 */
-	pci_phb_reset(phb);
+	pci_slot_add_flags(slot, PCI_SLOT_FLAG_BOOTUP);
+	rc = slot->ops.freset(slot);
+	while (rc > 0) {
+		time_wait(rc);
+		rc = slot->ops.poll(slot);
+	}
+	pci_slot_remove_flags(slot, PCI_SLOT_FLAG_BOOTUP);
+	if (rc < 0)
+		PCIERR(phb, 0, "Error %lld fundamental resetting\n", rc);
 }
 
 static void pci_scan_phb(void *data)
 {
 	struct phb *phb = data;
+	struct pci_slot *slot = phb->slot;
+	uint8_t link;
 	uint32_t mps = 0xffffffff;
-	bool has_link = false;
 	int64_t rc;
 
-	rc = phb->ops->link_state(phb);
-	if (rc < 0) {
-		PCIERR(phb, 0, "Failed to query link state, rc=%lld\n", rc);
-		return;
+	if (!slot || !slot->ops.get_link_state) {
+		PCIERR(phb, 0, "Cannot query link status\n");
+		link = 0;
+	} else {
+		rc = slot->ops.get_link_state(slot, &link);
+		if (rc != OPAL_SUCCESS) {
+			PCIERR(phb, 0, "Error %lld querying link status\n",
+			       rc);
+			link = 0;
+		}
 	}
 
-	/*
-	 * We will probe the root port. If the PHB has trained
-	 * link, we will probe the downstream port as well.
-	 */
-	if (rc != OPAL_SHPC_LINK_DOWN)
-		has_link = true;
-
-	if (has_link && phb->phb_type >= phb_type_pcie_v1)
-		PCIDBG(phb, 0, "Link up at x%lld width\n", rc);
-	else if (has_link)
-		PCIDBG(phb, 0, "Link up\n");
-	else
+	if (!link)
 		PCIDBG(phb, 0, "Link down\n");
+	else
+		PCIDBG(phb, 0, "Link up at x%d width\n", link);
 
 	/* Scan root port and downstream ports if applicable */
 	PCIDBG(phb, 0, "Scanning (upstream%s)...\n",
-	       has_link ? "+downsteam" : " only");
-	pci_scan(phb, 0, 0xff, &phb->devices, NULL, has_link);
+	       link ? "+downsteam" : " only");
+	pci_scan_bus(phb, 0, 0xff, &phb->devices, NULL, link);
 
 	/* Configure MPS (Max Payload Size) for PCIe domain */
-	pci_walk_dev(phb, pci_get_mps, &mps);
+	pci_walk_dev(phb, NULL, pci_get_mps, &mps);
 	phb->mps = mps;
-	pci_walk_dev(phb, pci_configure_mps, NULL);
+	pci_walk_dev(phb, NULL, pci_configure_mps, NULL);
 }
 
 int64_t pci_register_phb(struct phb *phb, int opal_id)
@@ -831,6 +864,7 @@ int64_t pci_register_phb(struct phb *phb, int opal_id)
 	dt_add_property_cells(phb->dt_node, "ibm,opal-phbid", 0, phb->opal_id);
 	PCIDBG(phb, 0, "PCI: Registered PHB\n");
 
+	init_lock(&phb->lock);
 	list_head_init(&phb->devices);
 
 	return OPAL_SUCCESS;
@@ -1090,11 +1124,17 @@ void pci_std_swizzle_irq_map(struct dt_node *np,
 			     uint8_t swizzle)
 {
 	uint32_t *map, *p;
-	int dev, irq;
-	size_t map_size;
+	int dev, irq, esize, edevcount;
+	size_t map_size, isize;
+
+	/* Some emulated setups don't use standard interrupts
+	 * representation
+	 */
+	if (lstate->int_size == 0)
+		return;
 
 	/* Size in bytes of a target interrupt */
-	size_t isize = lstate->int_size * sizeof(uint32_t);
+	isize = lstate->int_size * sizeof(uint32_t);
 
 	/* Calculate the size of a map entry:
 	 *
@@ -1105,7 +1145,7 @@ void pci_std_swizzle_irq_map(struct dt_node *np,
 	 *
 	 * Assumption: PIC address is 0-size
 	 */
-	int esize = 3 + 1 + 1 + lstate->int_size;
+	esize = 3 + 1 + 1 + lstate->int_size;
 
 	/* Number of map "device" entries
 	 *
@@ -1116,8 +1156,6 @@ void pci_std_swizzle_irq_map(struct dt_node *np,
 	 * If we have been passed a host bridge (pd == NULL) we also
 	 * do a simple per-pin map
 	 */
-	int edevcount;
-
 	if (!pd || (pd->dev_type == PCIE_TYPE_ROOT_PORT ||
 		    pd->dev_type == PCIE_TYPE_SWITCH_DNPORT)) {
 		edevcount = 1;
@@ -1160,52 +1198,6 @@ void pci_std_swizzle_irq_map(struct dt_node *np,
 	free(map);
 }
 
-static void pci_add_slot_properties(struct phb *phb, struct pci_slot_info *info,
-				    struct dt_node *np)
-{
-	char loc_code[LOC_CODE_SIZE];
-	size_t base_loc_code_len = 0, slot_label_len = 0;
-
-	loc_code[0] = '\0';
-
-	if (phb->base_loc_code) {
-		base_loc_code_len = strlen(phb->base_loc_code);
-		strcpy(loc_code, phb->base_loc_code);
-	}
-	slot_label_len = strlen(info->label);
-	if (slot_label_len) {
-		if ((base_loc_code_len + slot_label_len + 1) < LOC_CODE_SIZE) {
-			if (base_loc_code_len)
-				strcat(loc_code, "-");
-			strcat(loc_code, info->label);
-			dt_add_property(np, "ibm,slot-location-code",
-					loc_code, strlen(loc_code) + 1);
-		} else {
-			PCIERR(phb, 0, "Loc Code too long - %zu + %zu + 1\n",
-			       base_loc_code_len, slot_label_len);
-		}
-	}
-
-	/* Add other slot information */
-	dt_add_property_cells(np, "ibm,slot-pluggable", info->pluggable);
-	dt_add_property_cells(np, "ibm,slot-power-ctl", info->power_ctl);
-	if (info->wired_lanes >= 0)
-		dt_add_property_cells(np, "ibm,slot-wired-lanes", info->wired_lanes);
-	/*dt_add_property(np, "ibm,slot-bus-clock", &pd->slot_info->bus_clock, sizeof(uint8_t));*/
-	if (info->connector_type >= 0)
-		dt_add_property_cells(np, "ibm,slot-connector-type", info->connector_type);
-	if (info->card_desc >= 0)
-		dt_add_property_cells(np, "ibm,slot-card-desc", info->card_desc);
-	if (info->card_mech >= 0)
-		dt_add_property_cells(np, "ibm,slot-card-mech", info->card_mech);
-	if (info->pwr_led_ctl >= 0)
-		dt_add_property_cells(np, "ibm,slot-pwr-led-ctl", info->pwr_led_ctl);
-	if (info->attn_led_ctl >= 0)
-		dt_add_property_cells(np, "ibm,slot-attn-led-ctl", info->attn_led_ctl);
-	if (strlen(info->label) > 0)
-		dt_add_property_string(np, "ibm,slot-label", info->label);
-}
-
 static void pci_add_loc_code(struct dt_node *np, struct pci_device *pd)
 {
 	struct dt_node *p = np->parent;
@@ -1216,14 +1208,13 @@ static void pci_add_loc_code(struct dt_node *np, struct pci_device *pd)
 	uint8_t pos, len;
 
 	/* If there is a label assigned to the function, use it on openpower machines */
-	if (pd->slot_info && strlen(pd->slot_info->label) && !fsp_present()) {
-		blcode = pd->slot_info->label;
-	} else {
-		/* Look for a parent with a slot-location-code */
-		while (p && !blcode) {
-			blcode = dt_prop_get_def(p, "ibm,slot-location-code", NULL);
-			p = p->parent;
-		}
+	if (pd->slot)
+		blcode = dt_prop_get_def(np, "ibm,slot-label", NULL);
+
+	/* Look for a parent with a slot-location-code */
+	while (!blcode && p) {
+		blcode = dt_prop_get_def(p, "ibm,slot-location-code", NULL);
+		p = p->parent;
 	}
 	if (!blcode)
 		return;
@@ -1317,12 +1308,12 @@ static void pci_print_summary_line(struct phb *phb, struct pci_device *pd,
 			  rev_class & 0xff, rev_class >> 8, cname, slotstr);
 }
 
-
-static void pci_add_one_node(struct phb *phb, struct pci_device *pd,
-			     struct dt_node *parent_node,
-			     struct pci_lsi_state *lstate, uint8_t swizzle)
+static void pci_add_one_device_node(struct phb *phb,
+				    struct pci_device *pd,
+				    struct dt_node *parent_node,
+				    struct pci_lsi_state *lstate,
+				    uint8_t swizzle)
 {
-	struct pci_device *child;
 	struct dt_node *np;
 	const char *cname;
 #define MAX_NAME 256
@@ -1389,8 +1380,8 @@ static void pci_add_one_node(struct phb *phb, struct pci_device *pd,
 	 */
 
 	/* Add slot properties if needed and iff this is a bridge */
-	if (pd->slot_info && pd->is_bridge)
-		pci_add_slot_properties(phb, pd->slot_info, np);
+	if (pd->slot)
+		pci_slot_add_dt_properties(pd->slot, np);
 
 	/* Make up location code */
 	pci_add_loc_code(np, pd);
@@ -1437,34 +1428,26 @@ static void pci_add_one_node(struct phb *phb, struct pci_device *pd,
 	 * Instead add a ranges property that explicitly translates 1:1.
 	 */
 	dt_add_property(np, "ranges", ranges_direct, sizeof(ranges_direct));
-
-	list_for_each(&pd->children, child, link)
-		pci_add_one_node(phb, child, np, lstate, swizzle);
 }
 
-static void pci_add_nodes(struct phb *phb)
+void pci_add_device_nodes(struct phb *phb,
+			  struct list_head *list,
+			  struct dt_node *parent_node,
+			  struct pci_lsi_state *lstate,
+			  uint8_t swizzle)
 {
-	struct pci_lsi_state *lstate = &phb->lstate;
 	struct pci_device *pd;
-
-	/* If the PHB has its own slot info, add them */
-	if (phb->slot_info)
-		pci_add_slot_properties(phb, phb->slot_info, NULL);
 
 	/* Add all child devices */
-	list_for_each(&phb->devices, pd, link)
-		pci_add_one_node(phb, pd, phb->dt_node, lstate, 0);
-}
+	list_for_each(list, pd, link) {
+		pci_add_one_device_node(phb, pd, parent_node,
+					lstate, swizzle);
+		if (list_empty(&pd->children))
+			continue;
 
-static void pci_fixup_nodes(struct phb *phb)
-{
-	struct pci_device *pd;
-
-	if (!phb->ops->device_node_fixup)
-		return;
-
-	list_for_each(&phb->devices, pd, link)
-		phb->ops->device_node_fixup(phb, pd);
+		pci_add_device_nodes(phb, &pd->children,
+				     pd->dn, lstate, swizzle);
+	}
 }
 
 static void __pci_reset(struct list_head *list)
@@ -1545,15 +1528,17 @@ void pci_init_slots(void)
 	for (i = 0; i < ARRAY_SIZE(phbs); i++) {
 		if (!phbs[i])
 			continue;
-		pci_add_nodes(phbs[i]);
+
+		pci_add_device_nodes(phbs[i], &phbs[i]->devices,
+				     phbs[i]->dt_node, &phbs[i]->lstate, 0);
 	}
 
-	/* Do device node fixups now that all the devices have been
-	 * added to the device tree. */
+	/* PHB final fixup */
 	for (i = 0; i < ARRAY_SIZE(phbs); i++) {
-		if (!phbs[i])
+		if (!phbs[i] || !phbs[i]->ops || !phbs[i]->ops->phb_final_fixup)
 			continue;
-		pci_fixup_nodes(phbs[i]);
+
+		phbs[i]->ops->phb_final_fixup(phbs[i]);
 	}
 }
 
@@ -1589,11 +1574,15 @@ static struct pci_device *__pci_walk_dev(struct phb *phb,
 }
 
 struct pci_device *pci_walk_dev(struct phb *phb,
+				struct pci_device *pd,
 				int (*cb)(struct phb *,
 					  struct pci_device *,
 					  void *),
 				void *userdata)
 {
+	if (pd)
+		return __pci_walk_dev(phb, &pd->children, cb, userdata);
+
 	return __pci_walk_dev(phb, &phb->devices, cb, userdata);
 }
 
@@ -1613,15 +1602,21 @@ static int __pci_find_dev(struct phb *phb,
 
 struct pci_device *pci_find_dev(struct phb *phb, uint16_t bdfn)
 {
-	return pci_walk_dev(phb, __pci_find_dev, &bdfn);
+	return pci_walk_dev(phb, NULL, __pci_find_dev, &bdfn);
 }
 
 static int __pci_restore_bridge_buses(struct phb *phb,
 				      struct pci_device *pd,
 				      void *data __unused)
 {
-	if (!pd->is_bridge)
+	if (!pd->is_bridge) {
+		uint32_t vdid;
+
+		/* Make all devices below a bridge "re-capture" the bdfn */
+		if (pci_cfg_read32(phb, pd->bdfn, 0, &vdid) == 0)
+			pci_cfg_write32(phb, pd->bdfn, 0, vdid);
 		return 0;
+	}
 
 	pci_cfg_write8(phb, pd->bdfn, PCI_CFG_PRIMARY_BUS,
 		       pd->primary_bus);
@@ -1632,9 +1627,9 @@ static int __pci_restore_bridge_buses(struct phb *phb,
 	return 0;
 }
 
-void pci_restore_bridge_buses(struct phb *phb)
+void pci_restore_bridge_buses(struct phb *phb, struct pci_device *pd)
 {
-	pci_walk_dev(phb, __pci_restore_bridge_buses, NULL);
+	pci_walk_dev(phb, pd, __pci_restore_bridge_buses, NULL);
 }
 
 struct pci_cfg_reg_filter *pci_find_cfg_reg_filter(struct pci_device *pd,

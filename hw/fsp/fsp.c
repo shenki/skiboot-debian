@@ -249,8 +249,14 @@ struct fsp_msg *fsp_allocmsg(bool alloc_response)
 	msg = __fsp_allocmsg();
 	if (!msg)
 		return NULL;
-	if (alloc_response)
+	if (alloc_response) {
 		msg->resp = __fsp_allocmsg();
+		if (!msg->resp) {
+			free(msg);
+			return NULL;
+		}
+	}
+
 	return msg;
 }
 
@@ -2260,6 +2266,7 @@ int fsp_fetch_data_queue(uint8_t flags, uint16_t id, uint32_t sub_id,
 #define CAPP_IDX_VENICE_DD20 0x200ea
 #define CAPP_IDX_MURANO_DD20 0x200ef
 #define CAPP_IDX_MURANO_DD21 0x201ef
+#define CAPP_IDX_NAPLES_DD10 0x100d3
 
 static struct {
 	enum resource_id	id;
@@ -2272,6 +2279,7 @@ static struct {
 	{ RESOURCE_ID_CAPP,	CAPP_IDX_MURANO_DD21,	0x80a02001 },
 	{ RESOURCE_ID_CAPP,	CAPP_IDX_VENICE_DD10,	0x80a02003 },
 	{ RESOURCE_ID_CAPP,	CAPP_IDX_VENICE_DD20,	0x80a02004 },
+	{ RESOURCE_ID_CAPP,	CAPP_IDX_NAPLES_DD10,	0x80a02005 },
 };
 
 static void fsp_start_fetching_next_lid(void);

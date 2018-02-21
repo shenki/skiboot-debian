@@ -41,6 +41,7 @@ enum cpu_thread_state {
 };
 
 struct cpu_job;
+struct xive_cpu_state;
 
 struct cpu_thread {
 	uint32_t			pir;
@@ -59,6 +60,7 @@ struct cpu_thread {
 	bool				con_need_flush;
 	bool				in_mcount;
 	bool				in_poller;
+	bool				in_reinit;
 	uint32_t			hbrt_spec_wakeup; /* primary only */
 	uint64_t			save_l2_fir_action1;
 	uint64_t			current_token;
@@ -86,6 +88,9 @@ struct cpu_thread {
 	/* Mask to indicate thread id in core. */
 	uint8_t				thread_mask;
 	bool				tb_invalid;
+
+	/* For use by XICS emulation on XIVE */
+	struct xive_cpu_state		*xstate;
 };
 
 /* This global is set to 1 to allow secondaries to callin,
@@ -120,6 +125,7 @@ static inline void __nomcount cpu_relax(void)
 void pre_init_boot_cpu(void);
 void init_boot_cpu(void);
 void init_all_cpus(void);
+void init_hid(void);
 
 /* This brings up our secondaries */
 extern void cpu_bringup(void);

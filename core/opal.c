@@ -70,7 +70,16 @@ long opal_bad_token(uint64_t token);
 
 long opal_bad_token(uint64_t token)
 {
-	prerror("OPAL: Called with bad token %lld !\n", token);
+	/**
+	 * @fwts-label OPALBadToken
+	 * @fwts-advice OPAL was called with a bad token. On POWER8 and
+	 * earlier, Linux kernels had a bug where they wouldn't check
+	 * if firmware supported particular OPAL calls before making them.
+	 * It is, in fact, harmless for these cases. On systems newer than
+	 * POWER8, this should never happen and indicates a kernel bug
+	 * where OPAL_CHECK_TOKEN isn't being called where it should be.
+	 */
+	prlog(PR_ERR, "OPAL: Called with bad token %lld !\n", token);
 
 	return OPAL_PARAMETER;
 }
@@ -150,8 +159,13 @@ void add_opal_node(void)
 
 	dt_add_property_cells(opal_node, "#address-cells", 0);
 	dt_add_property_cells(opal_node, "#size-cells", 0);
-	dt_add_property_strings(opal_node, "compatible", "ibm,opal-v2",
-				"ibm,opal-v3");
+
+	if (proc_gen < proc_gen_p9)
+		dt_add_property_strings(opal_node, "compatible", "ibm,opal-v2",
+					"ibm,opal-v3");
+	else
+		dt_add_property_strings(opal_node, "compatible", "ibm,opal-v3");
+
 	dt_add_property_cells(opal_node, "opal-msg-async-num", OPAL_MAX_ASYNC_COMP);
 	dt_add_property_cells(opal_node, "opal-msg-size", sizeof(struct opal_msg));
 	dt_add_property_u64(opal_node, "opal-base-address", base);
@@ -269,6 +283,11 @@ void opal_del_poller(void (*poller)(void *data))
 	 * if anybody uses it, print a warning and leak the entry, don't
 	 * free it.
 	 */
+	/**
+	 * @fwts-label UnsupportedOPALdelpoller
+	 * @fwts-advice Currently removing a poller is DANGEROUS and
+	 * MUST NOT be done in production firmware.
+	 */
 	prlog(PR_ALERT, "WARNING: Unsupported opal_del_poller."
 	      " Interesting locking issues, don't call this.\n");
 
@@ -290,6 +309,12 @@ void opal_run_pollers(void)
 
 	/* Don't re-enter on this CPU */
 	if (this_cpu()->in_poller) {
+		/**
+		 * @fwts-label OPALPollerRecursion
+		 * @fwts-advice Recursion detected in opal_run_pollers(). This
+		 * indicates a bug in OPAL where a poller ended up running
+		 * pollers, which doesn't lead anywhere good.
+		 */
 		prlog(PR_ERR, "OPAL: Poller recursion detected.\n");
 		backtrace();
 		return;
@@ -297,12 +322,25 @@ void opal_run_pollers(void)
 	this_cpu()->in_poller = true;
 
 	if (this_cpu()->lock_depth && pollers_with_lock_warnings < 64) {
+		/**
+		 * @fwts-label OPALPollerWithLock
+		 * @fwts-advice opal_run_pollers() was called with a lock
+		 * held, which could lead to deadlock if not excessively
+		 * lucky/careful.
+		 */
 		prlog(PR_ERR, "Running pollers with lock held !\n");
 		backtrace();
 		pollers_with_lock_warnings++;
-		if (pollers_with_lock_warnings == 64)
+		if (pollers_with_lock_warnings == 64) {
+			/**
+			 * @fwts-label OPALPollerWithLock64
+			 * @fwts-advice Your firmware is buggy, see the 64
+			 * messages complaining about opal_run_pollers with
+			 * lock held.
+			 */
 			prlog(PR_ERR, "opal_run_pollers with lock run 64 "
 			      "times, disabling warning.\n");
+		}
 	}
 
 	/* We run the timers first */

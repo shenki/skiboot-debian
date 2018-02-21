@@ -26,15 +26,15 @@
 #include <libflash/ecc.h>
 
 struct flash {
-	bool			registered;
+	struct list_node	list;
 	bool			busy;
 	struct blocklevel_device *bl;
 	uint32_t		size;
 	uint32_t		block_size;
+	int			id;
 };
 
-#define MAX_FLASH 1
-static struct flash flashes[MAX_FLASH];
+static LIST_HEAD(flashes);
 static struct flash *system_flash;
 
 /* Using a single lock as we only have one flash at present. */
@@ -161,6 +161,13 @@ static int flash_nvram_probe(struct flash *flash, struct ffs_handle *ffs)
 	rc = ffs_part_info(ffs, part, NULL,
 			   &start, &size, NULL, NULL);
 	if (rc) {
+		/**
+		 * @fwts-label NVRAMNoPartition
+		 * @fwts-advice OPAL could not find an NVRAM partition
+		 *     on the system flash. Check that the system flash
+		 *     has a valid partition table, and that the firmware
+		 *     build process has added a NVRAM partition.
+		 */
 		prlog(PR_ERR, "FLASH: Can't parse ffs info for NVRAM\n");
 		return OPAL_HARDWARE;
 	}
@@ -202,14 +209,27 @@ static void setup_system_flash(struct flash *flash, struct dt_node *node,
 	char *path;
 
 	if (system_flash) {
+		/**
+		 * @fwts-label SystemFlashDuplicate
+		 * @fwts-advice More than one flash device was registered
+		 *  as the system flash device. Check for duplicate calls
+		 *  to flash_register(..., true).
+		 */
 		prlog(PR_WARNING, "FLASH: attempted to register a second "
 				"system flash device %s\n", name);
 		return;
 	}
 
 	if (!ffs) {
+		/**
+		 * @fwts-label SystemFlashNoPartitionTable
+		 * @fwts-advice OPAL Could not read a partition table on
+		 *    system flash. Since we've still booted the machine (which
+		 *    requires flash), check that we're registering the proper
+		 *    system flash device.
+		 */
 		prlog(PR_WARNING, "FLASH: attempted to register system flash "
-				"%s, wwhich has no partition info\n", name);
+				"%s, which has no partition info\n", name);
 		return;
 	}
 
@@ -223,14 +243,24 @@ static void setup_system_flash(struct flash *flash, struct dt_node *node,
 	flash_nvram_probe(flash, ffs);
 }
 
+static int num_flashes(void)
+{
+	struct flash *flash;
+	int i = 0;
+
+	list_for_each(&flashes, flash, list)
+		i++;
+
+	return i;
+}
+
 int flash_register(struct blocklevel_device *bl, bool is_system_flash)
 {
 	uint32_t size, block_size;
 	struct ffs_handle *ffs;
 	struct dt_node *node;
-	struct flash *flash = NULL;
+	struct flash *flash;
 	const char *name;
-	unsigned int i;
 	int rc;
 
 	rc = blocklevel_get_info(bl, &name, &size, &block_size);
@@ -242,33 +272,36 @@ int flash_register(struct blocklevel_device *bl, bool is_system_flash)
 			name ?: "(unnamed)", size, block_size);
 
 	lock(&flash_lock);
-	for (i = 0; i < ARRAY_SIZE(flashes); i++) {
-		if (flashes[i].registered)
-			continue;
 
-		flash = &flashes[i];
-		flash->registered = true;
-		flash->busy = false;
-		flash->bl = bl;
-		flash->size = size;
-		flash->block_size = block_size;
-		break;
-	}
-
+	flash = malloc(sizeof(struct flash));
 	if (!flash) {
+		prlog(PR_ERR, "FLASH: Error allocating flash structure\n");
 		unlock(&flash_lock);
-		prlog(PR_ERR, "FLASH: No flash slots available\n");
 		return OPAL_RESOURCE;
 	}
 
+	flash->busy = false;
+	flash->bl = bl;
+	flash->size = size;
+	flash->block_size = block_size;
+	flash->id = num_flashes();
+
+	list_add(&flashes, &flash->list);
+
 	rc = ffs_init(0, flash->size, bl, &ffs, 0);
 	if (rc) {
+		/**
+		 * @fwts-label NoFFS
+		 * @fwts-advice System flash isn't formatted as expected.
+		 * This could mean several OPAL utilities do not function
+		 * as expected. e.g. gard, pflash.
+		 */
 		prlog(PR_WARNING, "FLASH: No ffs info; "
 				"using raw device only\n");
 		ffs = NULL;
 	}
 
-	node = flash_add_dt_node(flash, i);
+	node = flash_add_dt_node(flash, flash->id);
 
 	if (is_system_flash)
 		setup_system_flash(flash, node, name, ffs);
@@ -290,24 +323,24 @@ enum flash_op {
 static int64_t opal_flash_op(enum flash_op op, uint64_t id, uint64_t offset,
 		uint64_t buf, uint64_t size, uint64_t token)
 {
-	struct flash *flash;
+	struct flash *flash = NULL;
 	int rc;
-
-	if (id >= ARRAY_SIZE(flashes))
-		return OPAL_PARAMETER;
 
 	if (!try_lock(&flash_lock))
 		return OPAL_BUSY;
 
-	flash = &flashes[id];
+	list_for_each(&flashes, flash, list)
+		if (flash->id == id)
+			break;
 
-	if (flash->busy) {
-		rc = OPAL_BUSY;
+	if (flash->id != id) {
+		/* Couldn't find the flash */
+		rc = OPAL_PARAMETER;
 		goto err;
 	}
 
-	if (!flash->registered) {
-		rc = OPAL_PARAMETER;
+	if (flash->busy) {
+		rc = OPAL_BUSY;
 		goto err;
 	}
 
@@ -422,7 +455,7 @@ static int flash_find_subpartition(struct blocklevel_device *bl, uint32_t subid,
 
 	/* Get the TOC */
 	rc = flash_read_corrected(bl, *start, header,
-			FLASH_SUBPART_HEADER_SIZE, ecc);
+			FLASH_SUBPART_HEADER_SIZE, *ecc);
 	if (rc) {
 		prerror("FLASH: flash subpartition TOC read failed %i\n", rc);
 		goto end;

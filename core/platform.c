@@ -24,6 +24,7 @@
 #include <xscom.h>
 #include <errorlog.h>
 
+bool manufacturing_mode = false;
 struct platform	platform;
 
 DEFINE_LOG_ENTRY(OPAL_RC_ABNORMAL_REBOOT, OPAL_PLATFORM_ERR_EVT, OPAL_CEC,
@@ -98,15 +99,18 @@ opal_call(OPAL_CEC_REBOOT2, opal_cec_reboot2, 2);
 
 static void generic_platform_init(void)
 {
-	force_dummy_console();
+	/* Enable a UART if we find one in the device-tree */
+	uart_init();
+
+	if (uart_enabled())
+		uart_setup_opal_console();
+	else
+		force_dummy_console();
 	fake_rtc_init();
 }
 
 static int64_t generic_cec_power_down(uint64_t request __unused)
 {
-	if (chip_quirk(QUIRK_MAMBO_CALLOUTS))
-		mambo_sim_exit();
-
 	return OPAL_UNSUPPORTED;
 }
 
@@ -121,8 +125,13 @@ void probe_platform(void)
 	struct platform *platforms = &__platforms_start;
 	unsigned int i;
 
-	platform = generic_platform;
+	/* Detect Manufacturing mode */
+	if (dt_find_property(dt_root, "ibm,manufacturing-mode")) {
+		prlog(PR_NOTICE, "PLAT: Manufacturing mode ON\n");
+		manufacturing_mode = true;
+	}
 
+	platform = generic_platform;
 	for (i = 0; &platforms[i] < &__platforms_end; i++) {
 		if (platforms[i].probe && platforms[i].probe()) {
 			platform = platforms[i];

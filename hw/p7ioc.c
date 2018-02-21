@@ -190,10 +190,10 @@ static const struct io_hub_ops p7ioc_hub_ops = {
 	.reset		= p7ioc_reset,
 };
 
-static int64_t p7ioc_rgc_get_xive(void *data, uint32_t isn,
+static int64_t p7ioc_rgc_get_xive(struct irq_source *is, uint32_t isn,
 				  uint16_t *server, uint8_t *prio)
 {
-	struct p7ioc *ioc = data;
+	struct p7ioc *ioc = is->data;
 	uint32_t irq = (isn & 0xf);
 	uint32_t fbuid = P7_IRQ_FBUID(isn);
 	uint64_t xive;
@@ -208,10 +208,10 @@ static int64_t p7ioc_rgc_get_xive(void *data, uint32_t isn,
 	return OPAL_SUCCESS;
  }
 
-static int64_t p7ioc_rgc_set_xive(void *data, uint32_t isn,
+static int64_t p7ioc_rgc_set_xive(struct irq_source *is, uint32_t isn,
 				  uint16_t server, uint8_t prio)
 {
-	struct p7ioc *ioc = data;
+	struct p7ioc *ioc = is->data;
 	uint32_t irq = (isn & 0xf);
 	uint32_t fbuid = P7_IRQ_FBUID(isn);
 	uint64_t xive;
@@ -566,9 +566,9 @@ static bool p7ioc_check_GEM(struct p7ioc *ioc)
 	return false;
 }
 
-static void p7ioc_rgc_interrupt(void *data, uint32_t isn)
+static void p7ioc_rgc_interrupt(struct irq_source *is, uint32_t isn)
 {
-	struct p7ioc *ioc = data;
+	struct p7ioc *ioc = is->data;
 
 	printf("Got RGC interrupt 0x%04x\n", isn);
 
@@ -629,7 +629,8 @@ static void p7ioc_create_hub(struct dt_node *np)
 	dt_add_property_cells(np, "ibm,opal-hubid", 0, id);
 
 	/* XXX Fixme: how many RGC interrupts ? */
-	dt_add_property_cells(np, "interrupts", ioc->rgc_buid << 4);
+	dt_add_property_cells(np, "interrupt-parent", get_ics_phandle());
+	dt_add_property_cells(np, "interrupts", ioc->rgc_buid << 4, 1);
 	dt_add_property_cells(np, "interrupt-base", ioc->rgc_buid << 4);
 
 	/* XXX What about ibm,opal-mmio-real ? */
@@ -677,4 +678,5 @@ void probe_p7ioc(void)
 	dt_for_each_compatible(dt_root, np, "ibm,p7ioc")
 		p7ioc_create_hub(np);
 }
+
 

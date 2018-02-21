@@ -123,6 +123,7 @@ enum proc_gen {
 	proc_gen_unknown,
 	proc_gen_p7,		/* P7 and P7+ */
 	proc_gen_p8,
+	proc_gen_p9,
 };
 extern enum proc_gen proc_gen;
 
@@ -174,7 +175,7 @@ extern void start_kernel32(uint64_t entry, void* fdt,
 extern void start_kernel_secondary(uint64_t entry) __noreturn;
 
 /* Get description of machine from HDAT and create device-tree */
-extern void parse_hdat(bool is_opal, uint32_t master_cpu);
+extern int parse_hdat(bool is_opal, uint32_t master_cpu);
 
 /* Root of device tree. */
 extern struct dt_node *dt_root;
@@ -199,10 +200,13 @@ extern void init_replicated_sprs(void);
 /* Various probe routines, to replace with an initcall system */
 extern void probe_p7ioc(void);
 extern void probe_phb3(void);
+extern void probe_phb4(void);
 extern int phb3_preload_capp_ucode(void);
 extern void phb3_preload_vpd(void);
+extern int phb4_preload_capp_ucode(void);
+extern void phb4_preload_vpd(void);
 extern void probe_npu(void);
-extern void uart_init(bool enable_interrupt);
+extern void uart_init(void);
 extern void homer_init(void);
 extern void occ_pstates_init(void);
 extern void slw_init(void);
@@ -227,6 +231,7 @@ extern void nvram_read_complete(bool success);
 /* UART stuff */
 extern void uart_setup_linux_passthrough(void);
 extern void uart_setup_opal_console(void);
+extern bool uart_enabled(void);
 
 /* OCC interrupt */
 extern void occ_interrupt(uint32_t chip_id);
@@ -250,7 +255,7 @@ extern void prd_init(void);
 extern void prd_register_reserved_memory(void);
 
 /* Flatten device-tree */
-extern void *create_dtb(const struct dt_node *root);
+extern void *create_dtb(const struct dt_node *root, bool exclusive);
 
 /* SLW reinit function for switching core settings */
 extern int64_t slw_reinit(uint64_t flags);

@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2016 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@
 #include <sbe_xip_image.h>
 
 #define MAX_RESET_PATCH_SIZE	64
+
 static uint32_t slw_saved_reset[MAX_RESET_PATCH_SIZE];
 
 static bool slw_current_le = false;
@@ -396,47 +397,31 @@ struct cpu_idle_states {
 	char name[MAX_NAME_LEN];
 	u32 latency_ns;
 	u32 residency_ns;
+	/*
+	 * Register value/mask used to select different idle states.
+	 * PMICR in POWER8 and PSSCR in POWER9
+	 */
+	u64 pm_ctrl_reg_val;
+	u64 pm_ctrl_reg_mask;
 	u32 flags;
-	u64 pmicr;
-	u64 pmicr_mask;
 };
-
-/* Flag definitions */
-/* Set bits to avoid misinterpretation even if kernel has endian bugs */
-
-#define IDLE_DEC_STOP		0x00000001 /* Decrementer would stop */
-#define IDLE_TB_STOP		0x00000002 /* Timebase would stop */
-#define IDLE_LOSE_USER_CONTEXT	0x00001000 /* Restore GPRs like nap */
-#define IDLE_LOSE_HYP_CONTEXT	0x00002000 /* Restore hypervisor resource
-					      from PACA pointer */
-#define IDLE_LOSE_FULL_CONTEXT	0x00004000 /* Restore hypervisor resource
-					      by searching PACA */
-#define IDLE_USE_PMICR		0x00800000 /* Use SPR PMICR instruction */
-
-#define IDLE_FASTSLEEP_PMICR	0x0000002000000000UL
-#define IDLE_DEEPSLEEP_PMICR	0x0000003000000000UL
-#define IDLE_SLEEP_PMICR_MASK	0x0000003000000000UL
-
-#define IDLE_FASTWINKLE_PMICR	0x0000000000200000UL
-#define IDLE_DEEPWINKLE_PMICR	0x0000000000300000UL
-#define IDLE_WINKLE_PMICR_MASK	0x0000000000300000UL
 
 static struct cpu_idle_states power7_cpu_idle_states[] = {
 	{ /* nap */
 		.name = "nap",
 		.latency_ns = 4000,
 		.residency_ns = 100000,
-		.flags = 0*IDLE_DEC_STOP \
-		       | 0*IDLE_TB_STOP  \
-		       | 1*IDLE_LOSE_USER_CONTEXT \
-		       | 0*IDLE_LOSE_HYP_CONTEXT \
-		       | 0*IDLE_LOSE_FULL_CONTEXT \
+		.flags = 0*OPAL_PM_DEC_STOP \
+		       | 0*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 0*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 0*OPAL_PM_LOSE_FULL_CONTEXT \
 		       | 1*OPAL_PM_NAP_ENABLED \
 		       | 0*OPAL_PM_SLEEP_ENABLED \
 		       | 0*OPAL_PM_WINKLE_ENABLED \
-		       | 0*IDLE_USE_PMICR,
-		.pmicr = 0,
-		.pmicr_mask = 0 },
+		       | 0*OPAL_USE_PMICR,
+		.pm_ctrl_reg_val = 0,
+		.pm_ctrl_reg_mask = 0 },
 };
 
 static struct cpu_idle_states power8_cpu_idle_states[] = {
@@ -444,29 +429,29 @@ static struct cpu_idle_states power8_cpu_idle_states[] = {
 		.name = "nap",
 		.latency_ns = 4000,
 		.residency_ns = 100000,
-		.flags = 0*IDLE_DEC_STOP \
-		       | 0*IDLE_TB_STOP  \
-		       | 1*IDLE_LOSE_USER_CONTEXT \
-		       | 0*IDLE_LOSE_HYP_CONTEXT \
-		       | 0*IDLE_LOSE_FULL_CONTEXT \
+		.flags = 0*OPAL_PM_DEC_STOP \
+		       | 0*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 0*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 0*OPAL_PM_LOSE_FULL_CONTEXT \
 		       | 1*OPAL_PM_NAP_ENABLED \
-		       | 0*IDLE_USE_PMICR,
-		.pmicr = 0,
-		.pmicr_mask = 0 },
+		       | 0*OPAL_USE_PMICR,
+		.pm_ctrl_reg_val = 0,
+		.pm_ctrl_reg_mask = 0 },
 	{ /* fast sleep (with workaround) */
 		.name = "fastsleep_",
 		.latency_ns = 40000,
 		.residency_ns = 300000000,
-		.flags = 1*IDLE_DEC_STOP \
-		       | 1*IDLE_TB_STOP  \
-		       | 1*IDLE_LOSE_USER_CONTEXT \
-		       | 0*IDLE_LOSE_HYP_CONTEXT \
-		       | 0*IDLE_LOSE_FULL_CONTEXT \
+		.flags = 1*OPAL_PM_DEC_STOP \
+		       | 1*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 0*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 0*OPAL_PM_LOSE_FULL_CONTEXT \
 		       | 1*OPAL_PM_SLEEP_ENABLED_ER1 \
-		       | 0*IDLE_USE_PMICR, /* Not enabled until deep
+		       | 0*OPAL_USE_PMICR, /* Not enabled until deep
 						states are available */
-		.pmicr = IDLE_FASTSLEEP_PMICR,
-		.pmicr_mask = IDLE_SLEEP_PMICR_MASK },
+		.pm_ctrl_reg_val = OPAL_PM_FASTSLEEP_PMICR,
+		.pm_ctrl_reg_mask = OPAL_PM_SLEEP_PMICR_MASK },
 	{ /* Winkle */
 		.name = "winkle",
 		.latency_ns = 10000000,
@@ -477,18 +462,102 @@ static struct cpu_idle_states power8_cpu_idle_states[] = {
 					     * However, this should be roughly
 					     * accurate for when linux does
 					     * use it. */
-		.flags = 1*IDLE_DEC_STOP \
-		       | 1*IDLE_TB_STOP  \
-		       | 1*IDLE_LOSE_USER_CONTEXT \
-		       | 1*IDLE_LOSE_HYP_CONTEXT \
-		       | 1*IDLE_LOSE_FULL_CONTEXT \
+		.flags = 1*OPAL_PM_DEC_STOP \
+		       | 1*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 1*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 1*OPAL_PM_LOSE_FULL_CONTEXT \
 		       | 1*OPAL_PM_WINKLE_ENABLED \
-		       | 0*IDLE_USE_PMICR, /* Currently choosing deep vs
+		       | 0*OPAL_USE_PMICR, /* Currently choosing deep vs
 						fast via EX_PM_GP1 reg */
-		.pmicr = 0,
-		.pmicr_mask = 0 },
+		.pm_ctrl_reg_val = 0,
+		.pm_ctrl_reg_mask = 0 },
 };
 
+/*
+ * cpu_idle_states for key idle states of POWER9 that we want to
+ * exploit.
+ * Note latency_ns and residency_ns are estimated values for now.
+ */
+static struct cpu_idle_states power9_cpu_idle_states[] = {
+	{
+		.name = "stop0",
+		.latency_ns = 300,
+		.residency_ns = 3000,
+		.flags = 0*OPAL_PM_DEC_STOP \
+		       | 0*OPAL_PM_TIMEBASE_STOP  \
+		       | 0*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 0*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 0*OPAL_PM_LOSE_FULL_CONTEXT \
+		       | 1*OPAL_PM_STOP_INST_FAST,
+		.pm_ctrl_reg_val = 0,
+		.pm_ctrl_reg_mask = 0xF },
+	{
+		.name = "stop1",
+		.latency_ns = 5000,
+		.residency_ns = 50000,
+		.flags = 0*OPAL_PM_DEC_STOP \
+		       | 0*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 0*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 0*OPAL_PM_LOSE_FULL_CONTEXT \
+		       | 1*OPAL_PM_STOP_INST_FAST,
+		.pm_ctrl_reg_val = 1,
+		.pm_ctrl_reg_mask = 0xF },
+	{
+		.name = "stop2",
+		.latency_ns = 10000,
+		.residency_ns = 100000,
+		.flags = 0*OPAL_PM_DEC_STOP \
+		       | 0*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 0*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 0*OPAL_PM_LOSE_FULL_CONTEXT \
+		       | 1*OPAL_PM_STOP_INST_FAST,
+		.pm_ctrl_reg_val = 2,
+		.pm_ctrl_reg_mask = 0xF },
+
+	{
+		.name = "stop4",
+		.latency_ns = 100000,
+		.residency_ns = 1000000,
+		.flags = 1*OPAL_PM_DEC_STOP \
+		       | 1*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 1*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 1*OPAL_PM_LOSE_FULL_CONTEXT \
+		       | 1*OPAL_PM_STOP_INST_DEEP,
+		.pm_ctrl_reg_val = 4,
+		.pm_ctrl_reg_mask = 0xF },
+
+	{
+		.name = "stop8",
+		.latency_ns = 2000000,
+		.residency_ns = 20000000,
+		.flags = 1*OPAL_PM_DEC_STOP \
+		       | 1*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 1*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 1*OPAL_PM_LOSE_FULL_CONTEXT \
+		       | 1*OPAL_PM_STOP_INST_DEEP,
+		.pm_ctrl_reg_val = 0x8,
+		.pm_ctrl_reg_mask = 0xF },
+
+
+	{
+		.name = "stop11",
+		.latency_ns = 10000000,
+		.residency_ns = 100000000,
+		.flags = 1*OPAL_PM_DEC_STOP \
+		       | 1*OPAL_PM_TIMEBASE_STOP  \
+		       | 1*OPAL_PM_LOSE_USER_CONTEXT \
+		       | 1*OPAL_PM_LOSE_HYP_CONTEXT \
+		       | 1*OPAL_PM_LOSE_FULL_CONTEXT \
+		       | 1*OPAL_PM_STOP_INST_DEEP,
+		.pm_ctrl_reg_val = 0xB,
+		.pm_ctrl_reg_mask = 0xF },
+
+};
 /* Add device tree properties to describe idle states */
 void add_cpu_idle_state_properties(void)
 {
@@ -497,35 +566,40 @@ void add_cpu_idle_state_properties(void)
 	struct proc_chip *chip;
 	int nr_states;
 
-	bool can_sleep = true, can_winkle = true;
+	bool can_sleep = true;
+	bool has_slw = true;
+	bool has_stop_inst = false;
 	u8 i;
+
+	u64 *pm_ctrl_reg_val_buf;
+	u64 *pm_ctrl_reg_mask_buf;
+	u32 supported_states_mask;
+
+	/* Variables to track buffer length */
+	u8 name_buf_len;
+	u8 num_supported_idle_states;
 
 	/* Buffers to hold idle state properties */
 	char *name_buf, *alloced_name_buf;
 	u32 *latency_ns_buf;
 	u32 *residency_ns_buf;
 	u32 *flags_buf;
-	u64 *pmicr_buf;
-	u64 *pmicr_mask_buf;
 
-	/* Variables to track buffer length */
-	u8 name_buf_len;
-	u8 num_supported_idle_states;
 
 	prlog(PR_DEBUG, "CPU idle state device tree init\n");
 
 	/* Create /ibm,opal/power-mgt */
 	power_mgt = dt_new(opal_node, "power-mgt");
 	if (!power_mgt) {
+		/**
+		 * @fwts-label CreateDTPowerMgtNodeFail
+		 * @fwts-advice OPAL failed to add the power-mgt device tree
+		 * node. This could mean that firmware ran out of memory,
+		 * or there's a bug somewhere.
+		 */
 		prlog(PR_ERR, "creating dt node /ibm,opal/power-mgt failed\n");
 		return;
 	}
-
-	/* Mambo currently misbehaves in nap mode vs. timebase, so let's
-	 * disable idle states
-	 */
-	if (chip_quirk(QUIRK_DISABLE_NAP))
-		return;
 
 	/*
 	 * Chose the right state table for the chip
@@ -535,7 +609,12 @@ void add_cpu_idle_state_properties(void)
 	 */
 	chip = next_chip(NULL);
 	assert(chip);
-	if (chip->type == PROC_CHIP_P8_MURANO ||
+	if (chip->type == PROC_CHIP_P9_NIMBUS ||
+	    chip->type == PROC_CHIP_P9_CUMULUS) {
+		states = power9_cpu_idle_states;
+		nr_states = ARRAY_SIZE(power9_cpu_idle_states);
+		has_stop_inst = true;
+	} else if (chip->type == PROC_CHIP_P8_MURANO ||
 	    chip->type == PROC_CHIP_P8_VENICE ||
 	    chip->type == PROC_CHIP_P8_NAPLES) {
 		const struct dt_property *p;
@@ -567,8 +646,8 @@ void add_cpu_idle_state_properties(void)
 		nr_states = ARRAY_SIZE(power7_cpu_idle_states);
 	}
 
-	/* Enable winkle only if slw image is intact */
-	can_winkle = (chip->slw_base && chip->slw_bar_size &&
+	/* Enable deep idle states only if slw image is intact */
+	has_slw = (chip->slw_base && chip->slw_bar_size &&
 			chip->slw_image_size);
 
 	/*
@@ -578,49 +657,67 @@ void add_cpu_idle_state_properties(void)
 	 */
 
 	/* Allocate memory to idle state property buffers. */
-	alloced_name_buf= (char *) malloc(nr_states * sizeof(char) * MAX_NAME_LEN);
+	alloced_name_buf= malloc(nr_states * sizeof(char) * MAX_NAME_LEN);
 	name_buf = alloced_name_buf;
-	latency_ns_buf	=  (u32 *) malloc(nr_states * sizeof(u32));
-	residency_ns_buf=  (u32 *) malloc(nr_states * sizeof(u32));
-	flags_buf	=  (u32 *) malloc(nr_states * sizeof(u32));
-	pmicr_buf	=  (u64 *) malloc(nr_states * sizeof(u64));
-	pmicr_mask_buf	=  (u64 *) malloc(nr_states * sizeof(u64));
+	latency_ns_buf	= malloc(nr_states * sizeof(u32));
+	residency_ns_buf= malloc(nr_states * sizeof(u32));
+	flags_buf	= malloc(nr_states * sizeof(u32));
+	pm_ctrl_reg_val_buf	= malloc(nr_states * sizeof(u64));
+	pm_ctrl_reg_mask_buf	= malloc(nr_states * sizeof(u64));
 
 	name_buf_len = 0;
 	num_supported_idle_states = 0;
 
+	/*
+	 * Create a mask with the flags of all supported idle states
+	 * set. Use this to only add supported idle states to the
+	 * device-tree
+	 */
+	if (has_stop_inst) {
+		/* Power 9 / POWER ISA 3.0 */
+		supported_states_mask = OPAL_PM_STOP_INST_FAST;
+		if (has_slw)
+			supported_states_mask |= OPAL_PM_STOP_INST_DEEP;
+	} else {
+		/* Power 7 and Power 8 */
+		supported_states_mask = OPAL_PM_NAP_ENABLED;
+		if (can_sleep)
+			supported_states_mask |= OPAL_PM_SLEEP_ENABLED |
+						OPAL_PM_SLEEP_ENABLED_ER1;
+		if (has_slw)
+			supported_states_mask |= OPAL_PM_WINKLE_ENABLED;
+	}
 	for (i = 0; i < nr_states; i++) {
 		/* For each state, check if it is one of the supported states. */
-		if( (states[i].flags & OPAL_PM_NAP_ENABLED) ||
-		   ((states[i].flags & OPAL_PM_SLEEP_ENABLED) && can_sleep) ||
-		   ((states[i].flags & OPAL_PM_SLEEP_ENABLED_ER1) && can_sleep) ||
-		   ((states[i].flags & OPAL_PM_WINKLE_ENABLED) && can_winkle) ) {
-			/*
-			 * If a state is supported add each of its property
-			 * to its corresponding property buffer.
-			 */
-			strcpy(name_buf, states[i].name);
-			name_buf = name_buf + strlen(states[i].name) + 1;
+		if (!(states[i].flags & supported_states_mask))
+			continue;
 
-			*latency_ns_buf = cpu_to_fdt32(states[i].latency_ns);
-			latency_ns_buf++;
+		/*
+		 * If a state is supported add each of its property
+		 * to its corresponding property buffer.
+		 */
+		strncpy(name_buf, states[i].name, MAX_NAME_LEN);
+		name_buf = name_buf + strlen(states[i].name) + 1;
 
-			*residency_ns_buf = cpu_to_fdt32(states[i].residency_ns);
-			residency_ns_buf++;
+		*latency_ns_buf = cpu_to_fdt32(states[i].latency_ns);
+		latency_ns_buf++;
 
-			*flags_buf = cpu_to_fdt32(states[i].flags);
-			flags_buf++;
+		*residency_ns_buf = cpu_to_fdt32(states[i].residency_ns);
+		residency_ns_buf++;
 
-			*pmicr_buf = cpu_to_fdt64(states[i].pmicr);
-			pmicr_buf++;
+		*flags_buf = cpu_to_fdt32(states[i].flags);
+		flags_buf++;
 
-			*pmicr_mask_buf = cpu_to_fdt64(states[i].pmicr);
-			pmicr_mask_buf++;
+		*pm_ctrl_reg_val_buf = cpu_to_fdt64(states[i].pm_ctrl_reg_val);
+		pm_ctrl_reg_val_buf++;
 
-			/* Increment buffer length trackers */
-			name_buf_len += strlen(states[i].name) + 1;
-			num_supported_idle_states++;
-		}
+		*pm_ctrl_reg_mask_buf = cpu_to_fdt64(states[i].pm_ctrl_reg_mask);
+		pm_ctrl_reg_mask_buf++;
+
+		/* Increment buffer length trackers */
+		name_buf_len += strlen(states[i].name) + 1;
+		num_supported_idle_states++;
+
 	}
 
 	/* Point buffer pointers back to beginning of the buffer */
@@ -628,9 +725,8 @@ void add_cpu_idle_state_properties(void)
 	latency_ns_buf -= num_supported_idle_states;
 	residency_ns_buf -= num_supported_idle_states;
 	flags_buf -= num_supported_idle_states;
-	pmicr_buf -= num_supported_idle_states;
-	pmicr_mask_buf -= num_supported_idle_states;
-
+	pm_ctrl_reg_val_buf -= num_supported_idle_states;
+	pm_ctrl_reg_mask_buf -= num_supported_idle_states;
 	/* Create dt properties with the buffer content */
 	dt_add_property(power_mgt, "ibm,cpu-idle-state-names", name_buf,
 			name_buf_len* sizeof(char));
@@ -640,18 +736,29 @@ void add_cpu_idle_state_properties(void)
 			residency_ns_buf, num_supported_idle_states * sizeof(u32));
 	dt_add_property(power_mgt, "ibm,cpu-idle-state-flags", flags_buf,
 			num_supported_idle_states * sizeof(u32));
-	dt_add_property(power_mgt, "ibm,cpu-idle-state-pmicr", pmicr_buf,
-			num_supported_idle_states * sizeof(u64));
-	dt_add_property(power_mgt, "ibm,cpu-idle-state-pmicr-mask",
-			pmicr_mask_buf, num_supported_idle_states * sizeof(u64));
 
+	if (has_stop_inst) {
+		dt_add_property(power_mgt, "ibm,cpu-idle-state-psscr",
+				pm_ctrl_reg_val_buf,
+				num_supported_idle_states * sizeof(u64));
+		dt_add_property(power_mgt, "ibm,cpu-idle-state-psscr-mask",
+				pm_ctrl_reg_mask_buf,
+				num_supported_idle_states * sizeof(u64));
+	} else {
+		dt_add_property(power_mgt, "ibm,cpu-idle-state-pmicr",
+				pm_ctrl_reg_val_buf,
+				num_supported_idle_states * sizeof(u64));
+		dt_add_property(power_mgt, "ibm,cpu-idle-state-pmicr-mask",
+				pm_ctrl_reg_mask_buf,
+				num_supported_idle_states * sizeof(u64));
+	}
 	assert(alloced_name_buf == name_buf);
 	free(alloced_name_buf);
 	free(latency_ns_buf);
 	free(residency_ns_buf);
 	free(flags_buf);
-	free(pmicr_buf);
-	free(pmicr_mask_buf);
+	free(pm_ctrl_reg_val_buf);
+	free(pm_ctrl_reg_mask_buf);
 }
 
 #ifdef __HAVE_LIBPORE__
@@ -1083,6 +1190,13 @@ static void slw_dump_timer_ffdc(void)
 		0x50038, 0x50039, 0x5003a, 0x5003b
 	};
 
+	/**
+	 * @fwts-label SLWRegisterDump
+	 * @fwts-advice An error condition occured in sleep/winkle
+	 * engines timer state machine. Dumping debug information to
+	 * root-cause. OPAL/skiboot may be stuck on some operation that
+	 * requires SLW timer state machine (e.g. core powersaving)
+	 */
 	prlog(PR_ERR, "SLW: Register state:\n");
 
 	for (i = 0; i < ARRAY_SIZE(dump_regs); i++) {

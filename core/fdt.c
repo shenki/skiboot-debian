@@ -27,15 +27,17 @@
 #include <ccan/str/str.h>
 
 static int fdt_error;
-static void *fdt;
 
 #undef DEBUG_FDT
+#ifdef DEBUG_FDT
+#define FDT_DBG(fmt, a...)	prlog(PR_DEBUG, "FDT: " fmt, ##a)
+#else
+#define FDT_DBG(fmt, a...)
+#endif
 
 static void __save_err(int err, const char *str)
 {
-#ifdef DEBUG_FDT
-	printf("FDT: rc: %d from \"%s\"\n", err, str);
-#endif
+	FDT_DBG("rc: %d from \"%s\"\n", err, str);
 	if (err && !fdt_error) {
 		prerror("FDT: Error %d from \"%s\"\n", err, str);
 		fdt_error = err;
@@ -44,57 +46,52 @@ static void __save_err(int err, const char *str)
 
 #define save_err(...) __save_err(__VA_ARGS__, #__VA_ARGS__)
 
-static void dt_property_cell(const char *name, u32 cell)
+static void dt_property_cell(void *fdt, const char *name, u32 cell)
 {
 	save_err(fdt_property_cell(fdt, name, cell));
 }
 
-static void dt_begin_node(const char *name, uint32_t phandle)
+static void dt_begin_node(void *fdt, const struct dt_node *dn)
 {
-	save_err(fdt_begin_node(fdt, name));
+	save_err(fdt_begin_node(fdt, dn->name));
 
-	/*
-	 * We add both the new style "phandle" and the legacy
-	 * "linux,phandle" properties
-	 */
-	dt_property_cell("linux,phandle", phandle);
-	dt_property_cell("phandle", phandle);
+	dt_property_cell(fdt, "phandle", dn->phandle);
 }
 
-static void dt_property(const char *name, const void *val, size_t size)
+static void dt_property(void *fdt, const struct dt_property *p)
 {
-	save_err(fdt_property(fdt, name, val, size));
+	save_err(fdt_property(fdt, p->name, p->prop, p->len));
 }
 
-static void dt_end_node(void)
+static void dt_end_node(void *fdt)
 {
 	save_err(fdt_end_node(fdt));
 }
 
-static void dump_fdt(void)
-{
 #ifdef DEBUG_FDT
+static void dump_fdt(void *fdt)
+{
 	int i, off, depth, err;
 
-	printf("Device tree %u@%p\n", fdt_totalsize(fdt), fdt);
-
+	prlog(PR_INFO, "Device tree %u@%p\n", fdt_totalsize(fdt), fdt);
 	err = fdt_check_header(fdt);
 	if (err) {
 		prerror("fdt_check_header: %s\n", fdt_strerror(err));
 		return;
 	}
-	printf("fdt_check_header passed\n");
+	prlog(PR_INFO, "fdt_check_header passed\n");
 
-	printf("fdt_num_mem_rsv = %u\n", fdt_num_mem_rsv(fdt));
+	prlog(PR_INFO, "fdt_num_mem_rsv = %u\n", fdt_num_mem_rsv(fdt));
 	for (i = 0; i < fdt_num_mem_rsv(fdt); i++) {
 		u64 addr, size;
 
 		err = fdt_get_mem_rsv(fdt, i, &addr, &size);
 		if (err) {
-			printf(" ERR %s\n", fdt_strerror(err));
+			prlog(PR_INFO, " ERR %s\n", fdt_strerror(err));
 			return;
 		}
-		printf("  mem_rsv[%i] = %lu@%#lx\n", i, (long)addr, (long)size);
+		prlog(PR_INFO, "  mem_rsv[%i] = %lu@%#lx\n",
+		      i, (long)addr, (long)size);
 	}
 
 	for (off = fdt_next_node(fdt, 0, &depth);
@@ -108,37 +105,45 @@ static void dump_fdt(void)
 			prerror("fdt: offset %i no name!\n", off);
 			return;
 		}
-		printf("name: %s [%u]\n", name, off);
+		prlog(PR_INFO, "name: %s [%u]\n", name, off);
 	}
-#endif
 }
+#else
+static inline void dump_fdt(void *fdt __unused) { }
+#endif
 
-static void flatten_dt_node(const struct dt_node *root)
+static void flatten_dt_properties(void *fdt, const struct dt_node *dn)
 {
-	const struct dt_node *i;
 	const struct dt_property *p;
 
-#ifdef DEBUG_FDT
-	printf("FDT: node: %s\n", root->name);
-#endif
-
-	list_for_each(&root->properties, p, list) {
+	list_for_each(&dn->properties, p, list) {
 		if (strstarts(p->name, DT_PRIVATE))
 			continue;
-#ifdef DEBUG_FDT
-		printf("FDT:   prop: %s size: %ld\n", p->name, p->len);
-#endif
-		dt_property(p->name, p->prop, p->len);
-	}
 
-	list_for_each(&root->children, i, list) {
-		dt_begin_node(i->name, i->phandle);
-		flatten_dt_node(i);
-		dt_end_node();
+		FDT_DBG("  prop: %s size: %ld\n", p->name, p->len);
+		dt_property(fdt, p);
 	}
 }
 
-static void create_dtb_reservemap(const struct dt_node *root)
+static void flatten_dt_node(void *fdt, const struct dt_node *root,
+			    bool exclusive)
+{
+	const struct dt_node *i;
+
+	if (!exclusive) {
+		FDT_DBG("node: %s\n", root->name);
+		dt_begin_node(fdt, root);
+		flatten_dt_properties(fdt, root);
+	}
+
+	list_for_each(&root->children, i, list)
+		flatten_dt_node(fdt, i, false);
+
+	if (!exclusive)
+		dt_end_node(fdt);
+}
+
+static void create_dtb_reservemap(void *fdt, const struct dt_node *root)
 {
 	uint64_t base, size;
 	const uint64_t *ranges;
@@ -160,14 +165,33 @@ static void create_dtb_reservemap(const struct dt_node *root)
 	save_err(fdt_finish_reservemap(fdt));
 }
 
-void *create_dtb(const struct dt_node *root)
+static int __create_dtb(void *fdt, size_t len,
+			const struct dt_node *root,
+			bool exclusive)
 {
+	fdt_create(fdt, len);
+	if (root == dt_root && !exclusive)
+		create_dtb_reservemap(fdt, root);
+	flatten_dt_node(fdt, root, exclusive);
+
+	save_err(fdt_finish(fdt));
+	if (fdt_error) {
+		prerror("dtb: error %s\n", fdt_strerror(fdt_error));
+		return fdt_error;
+	}
+
+	dump_fdt(fdt);
+	return 0;
+}
+
+void *create_dtb(const struct dt_node *root, bool exclusive)
+{
+	void *fdt = NULL;
 	size_t len = DEVICE_TREE_MAX_SIZE;
 	uint32_t old_last_phandle = last_phandle;
+	int ret;
 
 	do {
-		if (fdt)
-			free(fdt);
 		last_phandle = old_last_phandle;
 		fdt_error = 0;
 		fdt = malloc(len);
@@ -176,32 +200,54 @@ void *create_dtb(const struct dt_node *root)
 			return NULL;
 		}
 
-		fdt_create(fdt, len);
-
-		create_dtb_reservemap(root);
-
-		/* Open root node */
-		dt_begin_node(root->name, root->phandle);
-
-		/* Unflatten our live tree */
-		flatten_dt_node(root);
-
-		/* Close root node */
-		dt_end_node();
-
-		save_err(fdt_finish(fdt));
-
-		if (!fdt_error)
-			break;
+		ret = __create_dtb(fdt, len, root, exclusive);
+		if (ret) {
+			free(fdt);
+			fdt = NULL;
+		}
 
 		len *= 2;
-	} while (fdt_error == -FDT_ERR_NOSPACE);
+	} while (ret == -FDT_ERR_NOSPACE);
 
-	dump_fdt();
-
-	if (fdt_error) {
-		prerror("dtb: error %s\n", fdt_strerror(fdt_error));
-		return NULL;
-	}
 	return fdt;
 }
+
+static int64_t opal_get_device_tree(uint32_t phandle,
+				    uint64_t buf, uint64_t len)
+{
+	struct dt_node *root;
+	void *fdt = (void *)buf;
+	uint32_t old_last_phandle;
+	int64_t totalsize;
+	int ret;
+
+	root = dt_find_by_phandle(dt_root, phandle);
+	if (!root)
+		return OPAL_PARAMETER;
+
+	if (!fdt) {
+		fdt = create_dtb(root, true);
+		if (!fdt)
+			return OPAL_INTERNAL_ERROR;
+		totalsize = fdt_totalsize(fdt);
+		free(fdt);
+		return totalsize;
+	}
+
+	if (!len)
+		return OPAL_PARAMETER;
+
+	fdt_error = 0;
+	old_last_phandle = last_phandle;
+	ret = __create_dtb(fdt, len, root, true);
+	if (ret) {
+		last_phandle = old_last_phandle;
+		if (ret == -FDT_ERR_NOSPACE)
+			return OPAL_NO_MEM;
+
+		return OPAL_EMPTY;
+	}
+
+	return OPAL_SUCCESS;
+}
+opal_call(OPAL_GET_DEVICE_TREE, opal_get_device_tree, 3);

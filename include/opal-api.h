@@ -163,17 +163,53 @@
 #define OPAL_LEDS_SET_INDICATOR			115
 #define OPAL_CEC_REBOOT2			116
 #define OPAL_CONSOLE_FLUSH			117
-#define OPAL_LAST				117
+#define OPAL_GET_DEVICE_TREE			118
+#define OPAL_PCI_GET_PRESENCE_STATE		119
+#define OPAL_PCI_GET_POWER_STATE		120
+#define OPAL_PCI_SET_POWER_STATE		121
+#define OPAL_INT_GET_XIRR			122
+#define	OPAL_INT_SET_CPPR			123
+#define OPAL_INT_EOI				124
+#define OPAL_INT_SET_MFRR			125
+#define OPAL_PCI_TCE_KILL			126
+#define OPAL_LAST				126
 
 /* Device tree flags */
 
-/* Flags set in power-mgmt nodes in device tree if
- * respective idle states are supported in the platform.
+/*
+ * Flags set in power-mgmt nodes in device tree describing
+ * idle states that are supported in the platform.
  */
+#define OPAL_PM_DEC_STOP		0x00000001 /* Decrementer would stop */
+#define OPAL_PM_TIMEBASE_STOP		0x00000002 /* Needs timebase restore */
+#define OPAL_PM_LOSE_USER_CONTEXT	0x00001000 /* Restore GPRs like nap */
+#define OPAL_PM_LOSE_HYP_CONTEXT	0x00002000 /* Restore hypervisor
+						  resource from PACA pointer */
+#define OPAL_PM_LOSE_FULL_CONTEXT	0x00004000
 #define OPAL_PM_NAP_ENABLED		0x00010000
 #define OPAL_PM_SLEEP_ENABLED		0x00020000
 #define OPAL_PM_WINKLE_ENABLED		0x00040000
 #define OPAL_PM_SLEEP_ENABLED_ER1	0x00080000 /* with workaround */
+#define OPAL_USE_PMICR			0x00800000 /* Use SPR PMICR instruction */
+
+#define OPAL_PM_FASTSLEEP_PMICR		0x0000002000000000UL
+#define OPAL_PM_DEEPSLEEP_PMICR		0x0000003000000000UL
+#define OPAL_PM_SLEEP_PMICR_MASK	0x0000003000000000UL
+
+#define OPAL_PM_FASTWINKLE_PMICR	0x0000000000200000UL
+#define OPAL_PM_DEEPWINKLE_PMICR	0x0000000000300000UL
+#define OPAL_PM_WINKLE_PMICR_MASK	0x0000000000300000UL
+
+
+/*
+ * Flags for stop states. Use 2 bits to distinguish between
+ * deep and fast states. Deep states result in full context
+ * loss thereby requiring slw to partially restore state
+ * whereas fast state can function without the presence of
+ * slw.
+ */
+#define OPAL_PM_STOP_INST_FAST		0x00100000
+#define OPAL_PM_STOP_INST_DEEP		0x00200000
 
 #ifndef __ASSEMBLY__
 
@@ -375,6 +411,18 @@ enum OpalPciMaskAction {
 	OPAL_MASK_ERROR_TYPE = 1
 };
 
+enum OpalPciSlotPresence {
+	OPAL_PCI_SLOT_EMPTY	= 0,
+	OPAL_PCI_SLOT_PRESENT	= 1
+};
+
+enum OpalPciSlotPower {
+	OPAL_PCI_SLOT_POWER_OFF	= 0,
+	OPAL_PCI_SLOT_POWER_ON	= 1,
+	OPAL_PCI_SLOT_OFFLINE	= 2,
+	OPAL_PCI_SLOT_ONLINE	= 3
+};
+
 enum OpalSlotLedType {
 	OPAL_SLOT_LED_TYPE_ID = 0,	/* IDENTIFY LED */
 	OPAL_SLOT_LED_TYPE_FAULT = 1,	/* FAULT LED */
@@ -455,7 +503,7 @@ struct opal_ipmi_msg {
  * with individual elements being 16 bits wide to fetch the system
  * wide EPOW status. Each element in the buffer will contain the
  * EPOW status in it's bit representation for a particular EPOW sub
- * class as defiend here. So multiple detailed EPOW status bits
+ * class as defined here. So multiple detailed EPOW status bits
  * specific for any sub class can be represented in a single buffer
  * element as it's bit representation.
  */
@@ -705,7 +753,8 @@ enum {
 
 enum {
 	OPAL_PHB_ERROR_DATA_TYPE_P7IOC = 1,
-	OPAL_PHB_ERROR_DATA_TYPE_PHB3 = 2
+	OPAL_PHB_ERROR_DATA_TYPE_PHB3 = 2,
+	OPAL_PHB_ERROR_DATA_TYPE_PHB4 = 3
 };
 
 enum {
@@ -840,6 +889,11 @@ struct OpalIoPhb3ErrorData {
 	__be64 pestB[OPAL_PHB3_NUM_PEST_REGS];
 };
 
+struct OpalIoPhb4ErrorData {
+	struct OpalIoPhbErrorCommon common;
+	// FIXME add phb4 specific stuff
+};
+
 enum {
 	OPAL_REINIT_CPUS_HILE_BE	= (1 << 0),
 	OPAL_REINIT_CPUS_HILE_LE	= (1 << 1),
@@ -951,6 +1005,7 @@ enum {
 	OPAL_PHB_CAPI_MODE_CAPI		= 1,
 	OPAL_PHB_CAPI_MODE_SNOOP_OFF    = 2,
 	OPAL_PHB_CAPI_MODE_SNOOP_ON	= 3,
+	OPAL_PHB_CAPI_MODE_DMA		= 4,
 };
 
 /* CAPI feature flags (in device-tree) */
@@ -979,6 +1034,13 @@ struct opal_i2c_request {
 enum {
 	OPAL_REBOOT_NORMAL = 0,
 	OPAL_REBOOT_PLATFORM_ERROR,
+};
+
+/* Argument to OPAL_PCI_TCE_KILL */
+enum {
+	OPAL_PCI_TCE_KILL_PAGES,
+	OPAL_PCI_TCE_KILL_PE,
+	OPAL_PCI_TCE_KILL_ALL,
 };
 
 #endif /* __ASSEMBLY__ */

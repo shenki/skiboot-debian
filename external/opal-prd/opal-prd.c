@@ -221,6 +221,24 @@ static void pr_log_daemon_init(void)
 	}
 }
 
+/**
+ * ABI check that we can't perform at build-time: we want to ensure that the
+ * layout of struct host_interfaces matches that defined in the thunk.
+ */
+static void check_abi(void)
+{
+	extern unsigned char __hinterface_start, __hinterface_pad,
+	       __hinterface_end;
+
+	/* ensure our struct size matches the thunk definition */
+	assert((&__hinterface_end - &__hinterface_start)
+			== sizeof(struct host_interfaces));
+
+	/* ensure the padding layout is as expected */
+	assert((void *)&__hinterface_start == (void *)&hinterface);
+	assert((void *)&__hinterface_pad == (void *)&hinterface.reserved);
+}
+
 /* HBRT init wrappers */
 extern struct runtime_interfaces *call_hbrt_init(struct host_interfaces *);
 
@@ -1150,7 +1168,7 @@ static int handle_msg_occ_error(struct opal_prd_ctx *ctx,
 
 	proc = be64toh(msg->occ_error.chip);
 
-	pr_debug("FW: firmware signalled OCC error for proc 0x%x", proc);
+	pr_debug("FW: firmware signaled OCC error for proc 0x%x", proc);
 
 	if (!hservice_runtime->process_occ_error) {
 		pr_log_nocall("process_occ_error");
@@ -1618,7 +1636,7 @@ static int run_prd_daemon(struct opal_prd_ctx *ctx)
 	pr_debug("HBRT: calling hservices_init");
 	rc = hservices_init(ctx, ctx->code_addr);
 	if (rc) {
-		pr_log(LOG_ERR, "HBRT: Can't initiliase HBRT");
+		pr_log(LOG_ERR, "HBRT: Can't initialise HBRT");
 		goto out_close;
 	}
 	pr_debug("HBRT: hservices_init done");
@@ -1959,6 +1977,8 @@ int main(int argc, char *argv[])
 	struct opal_prd_ctx _ctx;
 	enum action action;
 	int rc;
+
+	check_abi();
 
 	ctx = &_ctx;
 	memset(ctx, 0, sizeof(*ctx));

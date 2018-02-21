@@ -243,7 +243,7 @@ fi
 
 
 # pull in the relevant config file and set things up
-source $(dirname $0)/${method}_support.sh
+source $(dirname $(readlink -f $0))/${method}_support.sh
 IPMI_COMMAND="ipmitool -I lanplus -H $target $IPMI_AUTH"
 
 msg "Running sanity test"
@@ -259,6 +259,8 @@ if ! is_off; then
 	error "$target is not turned off";
     fi
 fi
+
+force_primary_side # ensure we're booting from side we flash.
 
 # run the boot test
 echo "$target: Boot testing $target";
