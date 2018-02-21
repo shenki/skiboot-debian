@@ -1,7 +1,7 @@
 Source: skiboot
 Section: admin
 Priority: optional
-Maintainer: Frederic Bonnard <frediz@linux.vnet.ibm.com>
+Maintainer: Frédéric Bonnard <frediz@debian.org>
 Build-Depends: debhelper (>= 9), dh-systemd
 Standards-Version: 3.9.8
 Homepage: http://github.com/open-power/skiboot/

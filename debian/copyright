@@ -8,7 +8,7 @@ License: Apache-2.0
 
 Files: debian/*
 Copyright: 2015 Jeremy Kerr <jk@ozlabs.org>
-           2016 Frederic Bonnard <frediz@linux.vnet.ibm.com>
+           2016-2018 Frédéric Bonnard <frediz@debian.org>
 License: GPL-2+
 
 Files: ccan/*
