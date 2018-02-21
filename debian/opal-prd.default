@@ -6,8 +6,6 @@
 # This is a POSIX shell fragment
 #
 
-PNOR_DEVICE=/dev/mtd0
-
 # Additional options that are passed to the Daemon.
 DAEMON_OPTS=""
 
