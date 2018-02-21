@@ -1,7 +1,6 @@
 #!/usr/bin/make -f
-# -*- makefile -*-
 
-UPSTREAM_VERSION := $(shell dpkg-parsechangelog -S Version | sed 's/-.*//')
+include /usr/share/dpkg/default.mk
 
 # Uncomment this to turn on verbose mode.
 export DH_VERBOSE=1
@@ -17,10 +16,10 @@ export DEB_LDFLAGS_MAINT_APPEND = -no-pie
 	dh $@ --with systemd
 
 override_dh_auto_build:
-	OPAL_PRD_VERSION=opal-prd-$(UPSTREAM_VERSION) make V=1 -C external/opal-prd/
-	GARD_VERSION=gard-$(UPSTREAM_VERSION) make V=1 -C external/gard/
-	PFLASH_VERSION=pflash-$(UPSTREAM_VERSION) make V=1 -C external/pflash
-	XSCOM_VERSION=xcom-$(UPSTREAM_VERSION) make V=1 -C external/xscom-utils
+	OPAL_PRD_VERSION=opal-prd-$(DEB_VERSION_UPSTREAM) make V=1 -C external/opal-prd/
+	GARD_VERSION=gard-$(DEB_VERSION_UPSTREAM) make V=1 -C external/gard/
+	PFLASH_VERSION=pflash-$(DEB_VERSION_UPSTREAM) make V=1 -C external/pflash
+	XSCOM_VERSION=xcom-$(DEB_VERSION_UPSTREAM) make V=1 -C external/xscom-utils
 
 override_dh_auto_install:
 	make -C external/opal-prd/ prefix=/usr DESTDIR=../../debian/tmp/ install
