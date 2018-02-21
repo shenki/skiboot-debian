@@ -11,6 +11,7 @@ Vcs-Browser: https://salsa.debian.org/debian/skiboot
 Package: opal-prd
 Architecture: ppc64el ppc64
 Depends: ${misc:Depends}, ${shlibs:Depends}, lsb-base
+Suggests: rsyslog
 Description: OPAL Processor Recovery Diagnostics daemon
  This package provides a daemon to load and run the OpenPower firmware's
  Processor Recovery Diagnostics binary. This is responsible for runtime
