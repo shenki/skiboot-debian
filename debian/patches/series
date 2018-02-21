@@ -1,4 +1,1 @@
-direct-systemd-to-always-restart-opal-prd.patch
-opal-prd-service-file-improvements.patch
-uninitialized_uses.patch
-fix-distclean-for-gard-and-xscom-utils.patch
+0001-Resolve-merge-conflict-by-incorporating-both-suggest.patch

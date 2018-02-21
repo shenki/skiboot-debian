@@ -1,13 +1,13 @@
-From: Frederic Bonnard <frediz@linux.vnet.ibm.com>
-Date: Wed, 21 Feb 2018 15:36:39 +0100
-Subject: opal-prd-service-file-improvements
+From: =?utf-8?q?Fr=C3=A9d=C3=A9ric_Bonnard?= <frediz@debian.org>
+Date: Wed, 21 Feb 2018 17:23:10 +0100
+Subject: Resolve merge conflict by incorporating both suggestions
 
 ---
  external/opal-prd/opal-prd.service | 4 +++-
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/external/opal-prd/opal-prd.service b/external/opal-prd/opal-prd.service
-index a53d8d9..d3dc4b9 100644
+index dce0dd2..bb38786 100644
 --- a/external/opal-prd/opal-prd.service
 +++ b/external/opal-prd/opal-prd.service
 @@ -2,9 +2,11 @@
@@ -17,9 +17,9 @@ index a53d8d9..d3dc4b9 100644
 +Documentation=man:opal-prd(8)
  
  [Service]
--ExecStart=/usr/sbin/opal-prd --pnor /dev/mtd0
+-ExecStart=/usr/sbin/opal-prd
 +EnvironmentFile=/etc/default/opal-prd
-+ExecStart=/usr/sbin/opal-prd --pnor $PNOR_DEVICE $DAEMON_OPTS
++ExecStart=/usr/sbin/opal-prd $DAEMON_OPTS
  Restart=always
  
  [Install]
