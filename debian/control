@@ -5,6 +5,8 @@ Maintainer: Frédéric Bonnard <frediz@debian.org>
 Build-Depends: debhelper (>= 9), dh-systemd
 Standards-Version: 3.9.8
 Homepage: https://github.com/open-power/skiboot/
+Vcs-Git: https://salsa.debian.org/debian/skiboot.git                                
+Vcs-Browser: https://salsa.debian.org/debian/skiboot                                
 
 Package: opal-prd
 Architecture: ppc64el ppc64
