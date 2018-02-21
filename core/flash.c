@@ -19,18 +19,20 @@
 #include <lock.h>
 #include <opal.h>
 #include <opal-msg.h>
+#include <platform.h>
 #include <device.h>
 #include <libflash/libflash.h>
 #include <libflash/libffs.h>
 #include <libflash/blocklevel.h>
 #include <libflash/ecc.h>
-#include <libstb/stb.h>
-#include <libstb/container.h>
+#include <libstb/secureboot.h>
+#include <libstb/trustedboot.h>
 #include <elf.h>
 
 struct flash {
 	struct list_node	list;
 	bool			busy;
+	bool			no_erase;
 	struct blocklevel_device *bl;
 	uint64_t		size;
 	uint32_t		block_size;
@@ -46,6 +48,10 @@ static struct lock flash_lock;
 /* nvram-on-flash support */
 static struct flash *nvram_flash;
 static u32 nvram_offset, nvram_size;
+
+/* ibm,firmware-versions support */
+static char *version_buf;
+static size_t version_buf_size = 0x1000;
 
 bool flash_reserve(void)
 {
@@ -148,6 +154,129 @@ out:
 	return rc;
 }
 
+static void __flash_dt_add_fw_version(struct dt_node *fw_version, char* data)
+{
+	static bool first = true;
+	char *prop;
+	int version_len, i;
+	int len = strlen(data);
+	const char * version_str[] = {"open-power", "buildroot", "skiboot",
+				      "hostboot-binaries", "hostboot", "linux",
+				      "petitboot", "occ", "capp-ucode", "sbe",
+				      "machine-xml"};
+
+	if (first) {
+		first = false;
+
+		/* Increment past "key-" */
+		if (memcmp(data, "open-power", strlen("open-power")) == 0)
+			prop = data + strlen("open-power");
+		else
+			prop = strchr(data, '-');
+		if (!prop) {
+			prlog(PR_DEBUG,
+			      "FLASH: Invalid fw version format (%s)\n", data);
+			return;
+		}
+		prop++;
+
+		dt_add_property_string(fw_version, "version", prop);
+		return;
+	}
+
+	/*
+	 * PNOR version strings are not easily consumable. Split them into
+	 * property, value.
+	 *
+	 * Example input from PNOR :
+	 *   "open-power-firestone-v1.8"
+	 *   "linux-4.4.6-openpower1-8420e0f"
+	 *
+	 * Desired output in device tree:
+	 *   open-power = "firestone-v1.8";
+	 *   linux = "4.4.6-openpower1-8420e0f";
+	 */
+	for(i = 0; i < ARRAY_SIZE(version_str); i++)
+	{
+		version_len = strlen(version_str[i]);
+		if (len < version_len)
+			continue;
+
+		if (memcmp(data, version_str[i], version_len) != 0)
+			continue;
+
+		/* Found a match, add property */
+		if (dt_find_property(fw_version, version_str[i]))
+			continue;
+
+		/* Increment past "key-" */
+		prop = data + version_len + 1;
+		dt_add_property_string(fw_version, version_str[i], prop);
+	}
+}
+
+void flash_dt_add_fw_version(void)
+{
+	uint8_t version_data[80];
+	int rc;
+	int numbytes = 0, i = 0;
+	struct dt_node *fw_version;
+
+	if (version_buf == NULL)
+		return;
+
+	rc = wait_for_resource_loaded(RESOURCE_ID_VERSION, RESOURCE_SUBID_NONE);
+	if (rc != OPAL_SUCCESS) {
+		prlog(PR_WARNING, "FLASH: Failed to load VERSION data\n");
+		free(version_buf);
+		return;
+	}
+
+	fw_version = dt_new(dt_root, "ibm,firmware-versions");
+	assert(fw_version);
+
+	for ( ; (numbytes < version_buf_size) && version_buf[numbytes]; numbytes++) {
+		if (version_buf[numbytes] == '\n') {
+			version_data[i] = '\0';
+			__flash_dt_add_fw_version(fw_version, version_data);
+			memset(version_data, 0, sizeof(version_data));
+			i = 0;
+			continue;
+		} else if (version_buf[numbytes] == '\t') {
+			continue; /* skip tabs */
+		}
+
+		version_data[i++] = version_buf[numbytes];
+	}
+
+	free(version_buf);
+}
+
+void flash_fw_version_preload(void)
+{
+	int rc;
+
+	if (proc_gen < proc_gen_p9)
+		return;
+
+	prlog(PR_INFO, "FLASH: Loading VERSION section\n");
+
+	version_buf = malloc(version_buf_size);
+	if (!version_buf) {
+		prlog(PR_WARNING, "FLASH: Failed to allocate memory\n");
+		return;
+	}
+
+	rc = start_preload_resource(RESOURCE_ID_VERSION, RESOURCE_SUBID_NONE,
+				    version_buf, &version_buf_size);
+	if (rc != OPAL_SUCCESS) {
+		prlog(PR_WARNING,
+		      "FLASH: Failed to start loading VERSION data\n");
+		free(version_buf);
+		version_buf = NULL;
+	}
+}
+
 static int flash_nvram_probe(struct flash *flash, struct ffs_handle *ffs)
 {
 	uint32_t start, size, part;
@@ -199,6 +328,8 @@ static struct dt_node *flash_add_dt_node(struct flash *flash, int id)
 	dt_add_property_u64(flash_node, "reg", flash->size);
 	dt_add_property_cells(flash_node, "ibm,flash-block-size",
 			flash->block_size);
+	if (flash->no_erase)
+		dt_add_property(flash_node, "no-erase", NULL, 0);
 
 	/* we fix to 32-bits */
 	dt_add_property_cells(flash_node, "#address-cells", 1);
@@ -281,6 +412,7 @@ int flash_register(struct blocklevel_device *bl)
 
 	flash->busy = false;
 	flash->bl = bl;
+	flash->no_erase = !(bl->flags & WRITE_NEED_ERASE);
 	flash->size = size;
 	flash->block_size = block_size;
 	flash->id = num_flashes();
@@ -421,8 +553,20 @@ static struct {
 	{ RESOURCE_ID_KERNEL,	RESOURCE_SUBID_NONE,		"BOOTKERNEL" },
 	{ RESOURCE_ID_INITRAMFS,RESOURCE_SUBID_NONE,		"ROOTFS" },
 	{ RESOURCE_ID_CAPP,	RESOURCE_SUBID_SUPPORTED,	"CAPP" },
+	{ RESOURCE_ID_IMA_CATALOG,  RESOURCE_SUBID_SUPPORTED,	"IMA_CATALOG" },
+	{ RESOURCE_ID_VERSION,	RESOURCE_SUBID_NONE,		"VERSION" },
 };
 
+const char *flash_map_resource_name(enum resource_id id)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(part_name_map); i++) {
+		if (part_name_map[i].id == id)
+			return part_name_map[i].name;
+	}
+	return NULL;
+}
 
 static size_t sizeof_elf_from_hdr(void *buf)
 {
@@ -437,8 +581,8 @@ static size_t sizeof_elf_from_hdr(void *buf)
 		if (elf->ei_class == ELF_CLASS_64) {
 			struct elf64_hdr *elf64 = (struct elf64_hdr*) buf;
 			sz = le64_to_cpu(elf64->e_shoff) +
-				(le16_to_cpu(elf64->e_shentsize) *
-				 le16_to_cpu(elf64->e_shnum));
+				((uint32_t)le16_to_cpu(elf64->e_shentsize) *
+				 (uint32_t)le16_to_cpu(elf64->e_shnum));
 		} else if (elf->ei_class == ELF_CLASS_32) {
 			struct elf32_hdr *elf32 = (struct elf32_hdr*) buf;
 			sz = le32_to_cpu(elf32->e_shoff) +
@@ -524,7 +668,10 @@ static int flash_load_resource(enum resource_id id, uint32_t subid,
 
 	rc = ffs_lookup_part(ffs, name, &ffs_part_num);
 	if (rc) {
-		prerror("FLASH: No %s partition\n", name);
+		/* This is not an error per-se, some partitions
+		 * are purposefully absent, don't spam the logs
+		 */
+	        prlog(PR_DEBUG, "FLASH: No %s partition\n", name);
 		goto out_free_ffs;
 	}
 	rc = ffs_part_info(ffs, ffs_part_num, NULL,
@@ -570,6 +717,7 @@ static int flash_load_resource(enum resource_id id, uint32_t subid,
 
 		if (content_size > bufsz) {
 			prerror("FLASH: content size > buffer size\n");
+			rc = OPAL_PARAMETER;
 			goto out_free_ffs;
 		}
 
@@ -603,15 +751,28 @@ static int flash_load_resource(enum resource_id id, uint32_t subid,
 		 * Back to the old way of doing things, no STB header.
 		 */
 		if (subid == RESOURCE_SUBID_NONE) {
-			/*
-			 * Because actualSize is a lie, we compute the size
-			 * of the BOOTKERNEL based on what the ELF headers
-			 * say. Otherwise we end up reading more than we should
-			 */
-			content_size = sizeof_elf_from_hdr(buf);
-			if (!content_size) {
-				prerror("FLASH: Invalid ELF header part %s\n",
-					name);
+			if (id == RESOURCE_ID_KERNEL) {
+				/*
+				 * Because actualSize is a lie, we compute the
+				 * size of the BOOTKERNEL based on what the ELF
+				 * headers say. Otherwise we end up reading more
+				 * than we should
+				 */
+				content_size = sizeof_elf_from_hdr(buf);
+				if (!content_size) {
+					prerror("FLASH: Invalid ELF header part"
+						" %s\n", name);
+					rc = OPAL_RESOURCE;
+					goto out_free_ffs;
+				}
+			} else {
+				content_size = ffs_part_size;
+			}
+			if (content_size > bufsz) {
+				prerror("FLASH: %s content size %d > "
+					" buffer size %lu\n", name,
+					content_size, bufsz);
+				rc = OPAL_PARAMETER;
 				goto out_free_ffs;
 			}
 			prlog(PR_DEBUG, "FLASH: computed %s size %u\n",
@@ -658,8 +819,8 @@ done_reading:
 	 * Verify and measure the retrieved PNOR partition as part of the
 	 * secure boot and trusted boot requirements
 	 */
-	sb_verify(id, buf, *len);
-	tb_measure(id, buf, *len);
+	secureboot_verify(id, buf, *len);
+	trustedboot_measure(id, buf, *len);
 
 	/* Find subpartition */
 	if (subid != RESOURCE_SUBID_NONE) {
@@ -776,7 +937,8 @@ int flash_start_preload_resource(enum resource_id id, uint32_t subid,
 	r->len = len;
 	r->result = OPAL_EMPTY;
 
-	printf("FLASH: Queueing preload of %x/%x\n", r->id, r->subid);
+	prlog(PR_DEBUG, "FLASH: Queueing preload of %x/%x\n",
+	      r->id, r->subid);
 
 	lock(&flash_load_resource_lock);
 	if (list_empty(&flash_load_resource_queue)) {

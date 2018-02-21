@@ -193,6 +193,7 @@ static void i2c_add_bus(uint32_t chip, uint32_t engine, uint32_t port,
 	if (asprintf(&dn, "/dev/%s", devname) < 0) {
 		pr_log(LOG_ERR, "I2C: Error creating devpath for %s: %m",
 			devname);
+		free(b);
 		return;
 	}
 
@@ -210,7 +211,7 @@ void i2c_init(void)
 #define SYSFS	"/sys"	/* XXX Find it ? */
 	DIR *devsdir;
 	struct dirent *devent;
-	char dpath[NAME_MAX];
+	char dpath[PATH_MAX];
 	char busname[256];
 	char *s;
 	FILE *f;

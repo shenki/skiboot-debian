@@ -23,6 +23,7 @@
 #include <device.h>
 #include <opal.h>
 #include <stack.h>
+#include <timer.h>
 
 /*
  * cpu_thread is our internal structure representing each
@@ -43,26 +44,27 @@ enum cpu_thread_state {
 struct cpu_job;
 struct xive_cpu_state;
 
-enum cpu_wake_cause {
-	cpu_wake_on_job,
-	cpu_wake_on_dec,
-};
-
 struct cpu_thread {
+	/*
+	 * "stack_guard" must be at offset 0 to match the
+	 * -mstack-protector-guard-offset=0 statement in the Makefile
+	 */
+	uint64_t			stack_guard;
 	uint32_t			pir;
 	uint32_t			server_no;
 	uint32_t			chip_id;
 	bool				is_secondary;
-	bool				current_hile;
 	struct cpu_thread		*primary;
 	enum cpu_thread_state		state;
 	struct dt_node			*node;
 	struct trace_info		*trace;
 	uint64_t			save_r1;
 	void				*icp_regs;
-	uint32_t			lock_depth;
+	uint32_t			in_opal_call;
 	uint32_t			con_suspend;
+	struct list_head		locks_held;
 	bool				con_need_flush;
+	bool				quiesce_opal_call;
 	bool				in_mcount;
 	bool				in_poller;
 	bool				in_reinit;
@@ -101,6 +103,23 @@ struct cpu_thread {
 
 	/* For use by XICS emulation on XIVE */
 	struct xive_cpu_state		*xstate;
+
+	/*
+	 * For direct controls scoms, including special wakeup.
+	 */
+	struct lock			dctl_lock; /* primary only */
+	bool				dctl_stopped; /* per thread */
+	uint32_t			special_wakeup_count; /* primary */
+
+	/*
+	 * For reading DTS sensors async
+	 */
+	struct lock			dts_lock;
+	struct timer			dts_timer;
+	u64				*sensor_data;
+	u32				sensor_attr;
+	u32				token;
+	bool				dts_read_in_progress;
 };
 
 /* This global is set to 1 to allow secondaries to callin,
@@ -121,8 +140,7 @@ extern struct cpu_thread *boot_cpu;
 static inline void __nomcount cpu_relax(void)
 {
 	/* Relax a bit to give sibling threads some breathing space */
-	smt_low();
-	smt_very_low();
+	smt_lowest();
 	asm volatile("nop; nop; nop; nop;\n"
 		     "nop; nop; nop; nop;\n"
 		     "nop; nop; nop; nop;\n"
@@ -135,7 +153,6 @@ static inline void __nomcount cpu_relax(void)
 void pre_init_boot_cpu(void);
 void init_boot_cpu(void);
 void init_all_cpus(void);
-void init_hid(void);
 
 /* This brings up our secondaries */
 extern void cpu_bringup(void);
@@ -165,6 +182,11 @@ extern struct cpu_thread *next_cpu(struct cpu_thread *cpu);
  *          this API standpoint.
  */
 
+static inline bool cpu_is_present(struct cpu_thread *cpu)
+{
+	return cpu->state >= cpu_state_present;
+}
+
 static inline bool cpu_is_available(struct cpu_thread *cpu)
 {
 	return cpu->state == cpu_state_active ||
@@ -173,12 +195,27 @@ static inline bool cpu_is_available(struct cpu_thread *cpu)
 
 extern struct cpu_thread *first_available_cpu(void);
 extern struct cpu_thread *next_available_cpu(struct cpu_thread *cpu);
+extern struct cpu_thread *first_present_cpu(void);
+extern struct cpu_thread *next_present_cpu(struct cpu_thread *cpu);
+extern struct cpu_thread *first_ungarded_cpu(void);
+extern struct cpu_thread *next_ungarded_cpu(struct cpu_thread *cpu);
+extern struct cpu_thread *first_ungarded_primary(void);
+extern struct cpu_thread *next_ungarded_primary(struct cpu_thread *cpu);
 
 #define for_each_cpu(cpu)	\
 	for (cpu = first_cpu(); cpu; cpu = next_cpu(cpu))
 
 #define for_each_available_cpu(cpu)	\
 	for (cpu = first_available_cpu(); cpu; cpu = next_available_cpu(cpu))
+
+#define for_each_present_cpu(cpu)	\
+	for (cpu = first_present_cpu(); cpu; cpu = next_present_cpu(cpu))
+
+#define for_each_ungarded_cpu(cpu)				\
+	for (cpu = first_ungarded_cpu(); cpu; cpu = next_ungarded_cpu(cpu))
+
+#define for_each_ungarded_primary(cpu)				\
+	for (cpu = first_ungarded_primary(); cpu; cpu = next_ungarded_primary(cpu))
 
 extern struct cpu_thread *first_available_core_in_chip(u32 chip_id);
 extern struct cpu_thread *next_available_core_in_chip(struct cpu_thread *cpu, u32 chip_id);
@@ -254,8 +291,12 @@ extern void cpu_process_jobs(void);
 extern void cpu_process_local_jobs(void);
 /* Check if there's any job pending */
 bool cpu_check_jobs(struct cpu_thread *cpu);
-/* Enable/disable PM */
-void cpu_set_pm_enable(bool pm_enabled);
+
+/* OPAL sreset vector in place at 0x100 */
+void cpu_set_sreset_enable(bool sreset_enabled);
+
+/* IPI for PM modes is enabled */
+void cpu_set_ipi_enable(bool sreset_enabled);
 
 static inline void cpu_give_self_os(void)
 {
@@ -265,6 +306,14 @@ static inline void cpu_give_self_os(void)
 extern unsigned long __attrconst cpu_stack_bottom(unsigned int pir);
 extern unsigned long __attrconst cpu_stack_top(unsigned int pir);
 
-extern void cpu_idle(enum cpu_wake_cause wake_on);
+extern void cpu_idle_job(void);
+extern void cpu_idle_delay(unsigned long delay);
+
+extern void cpu_set_radix_mode(void);
+extern void cpu_fast_reboot_complete(void);
+
+int dctl_set_special_wakeup(struct cpu_thread *t);
+int dctl_clear_special_wakeup(struct cpu_thread *t);
+int dctl_core_is_gated(struct cpu_thread *t);
 
 #endif /* __CPU_H */

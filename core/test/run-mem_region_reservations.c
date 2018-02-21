@@ -57,8 +57,9 @@ static void real_free(void *p)
 #include <assert.h>
 #include <stdio.h>
 
-void lock(struct lock *l)
+void lock_caller(struct lock *l, const char *caller)
 {
+	(void)caller;
 	assert(!l->lock_val);
 	l->lock_val++;
 }
@@ -74,7 +75,7 @@ bool lock_held_by_me(struct lock *l)
 	return l->lock_val;
 }
 
-#define TEST_HEAP_ORDER 12
+#define TEST_HEAP_ORDER 14
 #define TEST_HEAP_SIZE (1ULL << TEST_HEAP_ORDER)
 
 static void add_mem_node(uint64_t start, uint64_t len)
@@ -118,6 +119,7 @@ static void check_property_reservations(void)
 	unsigned int i, l;
 	const char *name;
 	uint64_t *rangep;
+	const char *at;
 
 	/* check dt properties */
 	names = dt_find_property(dt_root, "reserved-names");
@@ -136,7 +138,9 @@ static void check_property_reservations(void)
 		l = strlen(name) + 1;
 
 		for (i = 0; i < ARRAY_SIZE(test_regions); i++) {
-			if (strcmp(test_regions[i].name, name))
+			at = strchr(name, '@');
+			if (strncmp(test_regions[i].name, name,
+				    at ? at-name: strlen(name)))
 				continue;
 			assert(test_regions[i].addr == addr);
 			assert(!test_regions[i].found);
@@ -203,13 +207,16 @@ int main(void)
 	buf = real_malloc(1024*1024);
 	add_mem_node((unsigned long)buf, 1024*1024);
 
+	/* add pre-init reservations */
+	for (i = 0; i < ARRAY_SIZE(test_regions); i++)
+		mem_reserve_fw(test_regions[i].name,
+				test_regions[i].addr, 0x1000);
+
 	/* Now convert. */
 	mem_region_init();
 
-	/* create our reservations */
-	for (i = 0; i < ARRAY_SIZE(test_regions); i++)
-		mem_reserve_hw(test_regions[i].name,
-				test_regions[i].addr, 0x1000);
+	/* add a post-init reservation */
+	mem_reserve_fw("test.4", 0x5000, 0x1000);
 
 	/* release unused */
 	mem_region_release_unused();
@@ -218,7 +225,7 @@ int main(void)
 	mem_region_add_dt_reserved();
 
 	/* ensure we can't create further reservations */
-	r = new_region("test.4", 0x5000, 0x1000, NULL, REGION_RESERVED);
+	r = new_region("test.5", 0x5000, 0x1000, NULL, REGION_RESERVED);
 	assert(!add_region(r));
 
 	/* check old property-style reservations */

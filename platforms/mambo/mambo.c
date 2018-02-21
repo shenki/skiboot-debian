@@ -19,10 +19,13 @@
 #include <device.h>
 #include <console.h>
 #include <chip.h>
+#include <cpu.h>
 #include <opal-api.h>
 #include <opal-internal.h>
 #include <time-utils.h>
 #include <time.h>
+
+#include "mambo.h"
 
 static bool mambo_probe(void)
 {
@@ -32,35 +35,6 @@ static bool mambo_probe(void)
 	return true;
 }
 
-static inline unsigned long callthru0(int command)
-{
-	register uint64_t c asm("r3") = command;
-	asm volatile (".long 0x000eaeb0":"=r" (c):"r"(c));
-	return (c);
-}
-
-static inline unsigned long callthru2(int command, unsigned long arg1,
-				      unsigned long arg2)
-{
-	register unsigned long c asm("r3") = command;
-	register unsigned long a1 asm("r4") = arg1;
-	register unsigned long a2 asm("r5") = arg2;
-	asm volatile (".long 0x000eaeb0":"=r" (c):"r"(c), "r"(a1), "r"(a2));
-	return (c);
-}
-
-static inline unsigned long callthru3(int command, unsigned long arg1,
-				      unsigned long arg2, unsigned long arg3)
-{
-	register unsigned long c asm("r3") = command;
-	register unsigned long a1 asm("r4") = arg1;
-	register unsigned long a2 asm("r5") = arg2;
-	register unsigned long a3 asm("r6") = arg3;
-	asm volatile (".long 0x000eaeb0":"=r" (c):"r"(c), "r"(a1), "r"(a2),
-		      "r"(a3));
-	return (c);
-}
-
 #define BD_INFO_SYNC		0
 #define BD_INFO_STATUS		1
 #define BD_INFO_BLKSZ		2
@@ -68,16 +42,6 @@ static inline unsigned long callthru3(int command, unsigned long arg1,
 #define BD_INFO_CHANGE		4
 
 #define BD_SECT_SZ		512
-
-/* Mambo callthru commands */
-#define SIM_WRITE_CONSOLE_CODE	0
-#define SIM_EXIT_CODE		31
-#define SIM_READ_CONSOLE_CODE	60
-#define SIM_GET_TIME_CODE	70
-#define SIM_CALL_TCL		86
-#define SIM_BOGUS_DISK_READ	116
-#define SIM_BOGUS_DISK_WRITE	117
-#define SIM_BOGUS_DISK_INFO	118
 
 static inline int callthru_disk_read(int id, void *buf, unsigned long sect,
 				     unsigned long nrsect)
@@ -248,19 +212,59 @@ static void mambo_rtc_init(void)
 	opal_register(OPAL_RTC_READ, mambo_rtc_read, 2);
 }
 
-int mambo_console_read(void)
+static void mambo_system_reset_cpu(struct cpu_thread *cpu)
 {
-	return callthru0(SIM_READ_CONSOLE_CODE);
+	uint32_t core_id;
+	uint32_t thread_id;
+	char tcl_cmd[50];
+
+	core_id = pir_to_core_id(cpu->pir);
+	thread_id = pir_to_thread_id(cpu->pir);
+
+	snprintf(tcl_cmd, sizeof(tcl_cmd), "mysim cpu %i:%i interrupt SystemReset", core_id, thread_id);
+	callthru_tcl(tcl_cmd, strlen(tcl_cmd));
 }
 
-void mambo_console_write(const char *buf, size_t count)
+#define SYS_RESET_ALL		-1
+#define SYS_RESET_ALL_OTHERS	-2
+
+static int64_t mambo_signal_system_reset(int32_t cpu_nr)
 {
-	callthru2(SIM_WRITE_CONSOLE_CODE, (unsigned long)buf, count);
+	struct cpu_thread *cpu;
+
+	if (cpu_nr < 0) {
+		if (cpu_nr < SYS_RESET_ALL_OTHERS)
+			return OPAL_PARAMETER;
+
+		for_each_cpu(cpu) {
+			if (cpu == this_cpu())
+				continue;
+			mambo_system_reset_cpu(cpu);
+
+		}
+		if (cpu_nr == SYS_RESET_ALL)
+			mambo_system_reset_cpu(this_cpu());
+
+		return OPAL_SUCCESS;
+
+	} else {
+		cpu = find_cpu_by_server(cpu_nr);
+		if (!cpu)
+			return OPAL_PARAMETER;
+
+		mambo_system_reset_cpu(cpu);
+		return OPAL_SUCCESS;
+	}
+}
+
+static void mambo_sreset_init(void)
+{
+	opal_register(OPAL_SIGNAL_SYSTEM_RESET, mambo_signal_system_reset, 1);
 }
 
 static void mambo_platform_init(void)
 {
-	force_dummy_console();
+	mambo_sreset_init();
 	mambo_rtc_init();
 	bogus_disk_flash_init();
 }
@@ -281,21 +285,6 @@ static void __attribute__((noreturn)) mambo_terminate(const char *msg __unused)
 	for (;;) ;
 }
 
-static int mambo_nvram_info(uint32_t *total_size)
-{
-	*total_size = 0x100000;
-	return OPAL_SUCCESS;
-}
-
-static int mambo_nvram_start_read(void *dst, uint32_t src, uint32_t len)
-{
-	memset(dst+src, 0, len);
-
-	nvram_read_complete(true);
-
-	return OPAL_SUCCESS;
-}
-
 static int mambo_heartbeat_time(void)
 {
 	/*
@@ -311,9 +300,10 @@ DECLARE_PLATFORM(mambo) = {
 	.init		= mambo_platform_init,
 	.cec_power_down = mambo_cec_power_down,
 	.terminate	= mambo_terminate,
-	.nvram_info		= mambo_nvram_info,
-	.nvram_start_read	= mambo_nvram_start_read,
 	.start_preload_resource	= flash_start_preload_resource,
 	.resource_loaded	= flash_resource_loaded,
 	.heartbeat_time		= mambo_heartbeat_time,
+	.nvram_info		= fake_nvram_info,
+	.nvram_start_read	= fake_nvram_start_read,
+	.nvram_write		= fake_nvram_write,
 };

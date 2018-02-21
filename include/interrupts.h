@@ -266,6 +266,9 @@ struct irq_source;
  * though we might expose it at some point in XIVE native mode for
  * interrupts that require special EOI operations such as possibly
  * the LPC interrupts on P9 that need a latch cleared in the LPCHC.
+ *
+ * The "name" callback returns a name for the interrupt in a new
+ * malloc()'ed block. The caller will free() it. NULL is acceptable.
  */
 struct irq_source_ops {
 	int64_t (*set_xive)(struct irq_source *is, uint32_t isn,
@@ -281,6 +284,7 @@ struct irq_source_ops {
 #define IRQ_ATTR_TARGET_FREQUENT	0x2
 	void (*interrupt)(struct irq_source *is, uint32_t isn);
 	void (*eoi)(struct irq_source *is, uint32_t isn);
+	char *(*name)(struct irq_source *is, uint32_t isn);
 };
 
 struct irq_source {
@@ -291,11 +295,17 @@ struct irq_source {
 	struct list_node		link;
 };
 
-extern void __register_irq_source(struct irq_source *is);
+extern void __register_irq_source(struct irq_source *is, bool secondary);
 extern void register_irq_source(const struct irq_source_ops *ops, void *data,
 				uint32_t start, uint32_t count);
 extern void unregister_irq_source(uint32_t start, uint32_t count);
-extern void adjust_irq_source(struct irq_source *is, uint32_t new_count);
+extern struct irq_source *irq_find_source(uint32_t isn);
+
+/* Warning: callback is called with internal source lock held
+ * so don't call back into any of our irq_ APIs from it
+ */
+extern void irq_for_each_source(void (*cb)(struct irq_source *, void *),
+				void *data);
 
 extern uint32_t get_psi_interrupt(uint32_t chip_id);
 
@@ -306,6 +316,7 @@ extern uint32_t get_ics_phandle(void);
 struct cpu_thread;
 
 extern void reset_cpu_icp(void);
+extern void reset_cpu_xive(void);
 extern void icp_send_eoi(uint32_t interrupt);
 extern void icp_prep_for_pm(void);
 extern void icp_kick_cpu(struct cpu_thread *cpu);
@@ -313,6 +324,7 @@ extern void icp_kick_cpu(struct cpu_thread *cpu);
 extern void init_interrupts(void);
 
 extern bool irq_source_eoi(uint32_t isn);
+extern bool __irq_source_eoi(struct irq_source *is, uint32_t isn);
 
 
 #endif /* __INTERRUPTS_H */

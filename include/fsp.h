@@ -350,6 +350,7 @@
 #define FSP_CMD_HYP_MDST_TABLE	0x1ce2600 /* HV->FSP: Sapphire MDST table */
 #define FSP_CMD_TPO_READ	0x1ce4201 /* FSP->HV */
 #define FSP_CMD_TPO_WRITE	0x1ce4301 /* HV->FSP */
+#define FSP_CMD_TPO_DISABLE	0x1ce4400 /* HV->FSP */
 #define FSP_CMD_STATUS_REQ	0x1ce4800 /* HV->FSP: Request normal panel status */
 #define FSP_CMD_STATUS_EX1_REQ	0x1ce4802 /* HV->FSP: Request extended 1 panel status */
 #define FSP_CMD_STATUS_EX2_REQ	0x1ce4803 /* HV->FSP: Request extended 2 panel status */
@@ -368,6 +369,10 @@
 #define FSP_CMD_DEEP_REBOOT	0x1ce4e04 /* HV->FSP: Deep IPL */
 #define FSP_CMD_INIT_DPO	0x0ce5b00 /* FSP->HV: Initialize Delayed Power Off */
 #define FSP_RSP_INIT_DPO	0x0cedb00 /* HV->FSP: Response for DPO init command */
+#define FSP_CMD_GET_HIR_PLID	0x0ce0900 /* FSP->HV: Get Platform Log ID with
+					   * reason for Host Initiated Reset.
+					   */
+#define FSP_RSP_GET_HIR_PLID	0x0ce8900 /* HV->FSP: Reply with PLID */
 #define FSP_CMD_PANELSTATUS	0x0ce5c00 /* FSP->HV */
 #define FSP_CMD_PANELSTATUS_EX1	0x0ce5c02 /* FSP->HV */
 #define FSP_CMD_PANELSTATUS_EX2	0x0ce5c03 /* FSP->HV */
@@ -771,7 +776,6 @@ extern void fsp_used_by_console(void);
 extern int fsp_nvram_info(uint32_t *total_size);
 extern int fsp_nvram_start_read(void *dst, uint32_t src, uint32_t len);
 extern int fsp_nvram_write(uint32_t offset, void *src, uint32_t size);
-extern void fsp_nvram_wait_open(void);
 
 /* RTC */
 extern void fsp_rtc_init(void);
@@ -808,8 +812,9 @@ extern void fsp_ipmi_init(void);
 
 /* Reset/Reload */
 extern void fsp_reinit_fsp(void);
-extern void fsp_trigger_reset(void);
+extern void fsp_trigger_reset(uint32_t plid);
 extern void fsp_reset_links(void);
+extern bool fsp_in_rr(void);
 
 /* FSP memory errors */
 extern void fsp_memory_err_init(void);
@@ -817,7 +822,7 @@ extern void fsp_memory_err_init(void);
 /* Sensor */
 extern void fsp_init_sensor(void);
 extern int64_t fsp_opal_read_sensor(uint32_t sensor_hndl, int token,
-			uint32_t *sensor_data);
+			uint64_t *sensor_data);
 
 /* Diagnostic */
 extern void fsp_init_diag(void);
@@ -831,7 +836,6 @@ extern void fsp_epow_init(void);
 
 /* DPO */
 extern void fsp_dpo_init(void);
-extern bool fsp_dpo_pending;
 
 /* Chiptod */
 extern void fsp_chiptod_init(void);

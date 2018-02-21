@@ -60,8 +60,9 @@ static inline void __free(void *p, const char *location __attribute__((unused)))
 #include <assert.h>
 #include <stdio.h>
 
-void lock(struct lock *l)
+void lock_caller(struct lock *l, const char *caller)
 {
+	(void)caller;
 	l->lock_val++;
 }
 
@@ -99,7 +100,7 @@ static void add_mem_node(uint64_t start, uint64_t len)
 	free(name);
 }
 
-void add_chip_dev_associativity(struct dt_node *dev __attribute__((unused)))
+void __attrconst add_chip_dev_associativity(struct dt_node *dev __attribute__((unused)))
 {
 }
 
@@ -110,9 +111,10 @@ int main(void)
 	const char *last;
 
 	/* Use malloc for the heap, so valgrind can find issues. */
-	skiboot_heap.start = (unsigned long)malloc(TEST_HEAP_SIZE);
+	skiboot_heap.start = 0;
 	skiboot_heap.len = TEST_HEAP_SIZE;
-	skiboot_os_reserve.len = skiboot_heap.start;
+	skiboot_os_reserve.start = 0;
+	skiboot_os_reserve.len = 0;
 
 	dt_root = dt_new_root("");
 	dt_add_property_cells(dt_root, "#address-cells", 2);
@@ -163,6 +165,5 @@ int main(void)
 	}
 
 	dt_free(dt_root);
-	free((void *)(long)skiboot_heap.start);
 	return 0;
 }

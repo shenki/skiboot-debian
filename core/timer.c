@@ -45,7 +45,10 @@ static void __sync_timer(struct timer *t)
 
 	while (t->running) {
 		unlock(&timer_lock);
-		cpu_relax();
+		smt_lowest();
+		while (t->running)
+			barrier();
+		smt_medium();
 		/* Should we call the pollers here ? */
 		lock(&timer_lock);
 	}
@@ -220,7 +223,6 @@ static void __check_timers(uint64_t now)
 
 void check_timers(bool from_interrupt)
 {
-	struct timer *t;
 	uint64_t now = mftb();
 
 	/* This is the polling variant, the SLW interrupt path, when it
@@ -228,9 +230,11 @@ void check_timers(bool from_interrupt)
 	 * the pollers
 	 */
 
-	/* Lockless "peek", a bit racy but shouldn't be a problem */
-	t = list_top(&timer_list, struct timer, link);
-	if (list_empty_nocheck(&timer_poll_list) && (!t || t->target > now))
+	/* Lockless "peek", a bit racy but shouldn't be a problem as
+	 * we are only looking at whether the list is empty
+	 */
+	if (list_empty_nocheck(&timer_poll_list) &&
+	    list_empty_nocheck(&timer_list))
 		return;
 
 	/* Take lock and try again */

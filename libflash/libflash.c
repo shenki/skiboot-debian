@@ -23,10 +23,6 @@
 #include "ecc.h"
 #include "blocklevel.h"
 
-#ifndef MIN
-#define MIN(a, b)	((a) < (b) ? (a) : (b))
-#endif
-
 static const struct flash_info flash_info[] = {
 	{ 0xc22018, 0x01000000, FL_ERASE_ALL | FL_CAN_4B, "Macronix MXxxL12835F"},
 	{ 0xc22019, 0x02000000, FL_ERASE_ALL | FL_CAN_4B, "Macronix MXxxL25635F"},
@@ -367,8 +363,6 @@ static int flash_write(struct blocklevel_device *bl, uint32_t dst, const void *s
 
 		/* Handle misaligned start */
 		chunk = 0x100 - (d & 0xff);
-		if (chunk > 0x100)
-			chunk = 0x100;
 		if (chunk > todo)
 			chunk = todo;
 
@@ -865,8 +859,11 @@ bail:
 void flash_exit(struct blocklevel_device *bl)
 {
 	/* XXX Make sure we are idle etc... */
-	if (bl)
-		free(container_of(bl, struct flash_chip, bl));
+	if (bl) {
+		struct flash_chip *c = container_of(bl, struct flash_chip, bl);
+		free(c->smart_buf);
+		free(c);
+	}
 }
 
 void flash_exit_close(struct blocklevel_device *bl, void (*close)(struct spi_flash_ctrl *ctrl))

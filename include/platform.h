@@ -27,6 +27,8 @@ enum resource_id {
 	RESOURCE_ID_KERNEL,
 	RESOURCE_ID_INITRAMFS,
 	RESOURCE_ID_CAPP,
+	RESOURCE_ID_IMA_CATALOG,
+	RESOURCE_ID_VERSION,
 };
 #define RESOURCE_SUBID_NONE 0
 #define RESOURCE_SUBID_SUPPORTED 1
@@ -100,6 +102,11 @@ struct platform {
 	 */
 	void		(*pci_setup_phb)(struct phb *phb, unsigned int index);
 
+	/*
+	 * This is called before resetting the PHBs (lift PERST) and
+	 * probing the devices. The PHBs have already been initialized.
+	 */
+	void		(*pre_pci_fixup)(void);
 	/*
 	 * Called during PCI scan for each device. For bridges, this is
 	 * called before its children are probed. This is called for
@@ -176,7 +183,7 @@ struct platform {
 	 * Read a sensor value
 	 */
 	int64_t		(*sensor_read)(uint32_t sensor_hndl, int token,
-				       uint32_t *sensor_data);
+				       uint64_t *sensor_data);
 	/*
 	 * Return the heartbeat time
 	 */

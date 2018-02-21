@@ -3,10 +3,12 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
+=====================
+SkiBoot Documentation
+=====================
+
 Overview
 ========
-
-Contents:
 
 .. toctree::
    :maxdepth: 2
@@ -31,6 +33,8 @@ Developer Guide and Internals
    pci
    pci-slot
    xscom-node-bindings
+   xive
+   imc
 
 
 OPAL ABI
@@ -52,10 +56,12 @@ skiboot Release Notes
 
    release-notes/index
 
-Indices and tables
-==================
+.. only:: latex
 
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
+    Indices and tables
+    ==================
+
+    * :ref:`genindex`
+    * :ref:`modindex`
+    * :ref:`search`
 

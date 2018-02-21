@@ -20,10 +20,8 @@ endif
 #
 DEBUG ?= 0
 
-#
-# Set to enable SLW bits
-#
-PORE ?= 1
+# Run tests under valgrind?
+USE_VALGRIND ?= 1
 
 #
 # Optional location of embedded linux kernel file
@@ -36,6 +34,16 @@ KERNEL ?=
 # Optional build with advanced stack checking
 #
 STACK_CHECK ?= $(DEBUG)
+
+#
+# Experimental (unsupported) build options
+#
+# Little-endian does not yet build. Include it here to set ELF ABI.
+LITTLE_ENDIAN ?= 0
+# ELF v2 ABI is more efficient and compact
+ELF_ABI_v2 ?= $(LITTLE_ENDIAN)
+# Discard unreferenced code and data at link-time
+DEAD_CODE_ELIMINATION ?= 0
 
 #
 # Where is the source directory, must be a full path (no ~)

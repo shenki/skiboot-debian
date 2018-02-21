@@ -20,28 +20,22 @@
 #include <dts.h>
 #include <skiboot.h>
 #include <opal-api.h>
-
-/* Per core Digital Thermal Sensors */
-#define EX_THERM_DTS_RESULT0	0x10050000
-#define EX_THERM_DTS_RESULT1	0x10050001
-
-/* Per core Digital Thermal Sensors control registers */
-#define EX_THERM_MODE_REG	0x1005000F
-#define EX_THERM_CONTROL_REG	0x10050012
-#define EX_THERM_ERR_STATUS_REG	0x10050013
-
-/* Per memory controller Digital Thermal Sensors */
-#define THERM_MEM_DTS_RESULT0	0x2050000
-
-/* Per memory controller Digital Thermal Sensors control registers */
-#define THERM_MEM_MODE_REG	0x205000F
-#define THERM_MEM_CONTROL_REG	0x2050012
-#define THERM_MEM_ERR_STATUS_REG	0x2050013
+#include <opal-msg.h>
+#include <timer.h>
+#include <timebase.h>
 
 struct dts {
 	uint8_t		valid;
 	uint8_t		trip;
 	int16_t		temp;
+};
+
+/*
+ * Attributes for the core temperature sensor
+ */
+enum {
+	SENSOR_DTS_ATTR_TEMP_MAX,
+	SENSOR_DTS_ATTR_TEMP_TRIP
 };
 
 /* Different sensor locations */
@@ -132,6 +126,28 @@ static void dts_decode_one_dts(uint16_t raw, struct dts *dts)
 	}
 }
 
+static void dts_keep_max(struct dts *temps, int n, struct dts *dts)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		int16_t t = temps[i].temp;
+
+		if (!temps[i].valid)
+			continue;
+
+		if (t > dts->temp)
+			dts->temp = t;
+
+		dts->valid++;
+		dts->trip |= temps[i].trip;
+	}
+}
+
+/* Per core Digital Thermal Sensors */
+#define EX_THERM_DTS_RESULT0	0x10050000
+#define EX_THERM_DTS_RESULT1	0x10050001
+
 /* Different sensor locations */
 #define P8_CT_ZONE_LSU	0
 #define P8_CT_ZONE_ISU	1
@@ -149,7 +165,6 @@ static int dts_read_core_temp_p8(uint32_t pir, struct dts *dts)
 	int32_t core = pir_to_core_id(pir);
 	uint64_t dts0, dts1;
 	struct dts temps[P8_CT_ZONES];
-	int i;
 	int rc;
 
 	rc = xscom_read(chip_id, XSCOM_ADDR_P8_EX(core, EX_THERM_DTS_RESULT0),
@@ -167,19 +182,7 @@ static int dts_read_core_temp_p8(uint32_t pir, struct dts *dts)
 	dts_decode_one_dts(dts0 >> 16, &temps[P8_CT_ZONE_FXU]);
 	dts_decode_one_dts(dts1 >> 48, &temps[P8_CT_ZONE_L3C]);
 
-	for (i = 0; i < P8_CT_ZONES; i++) {
-		int16_t t = temps[i].temp;
-
-		if (!temps[i].valid)
-			continue;
-
-		/* keep the max temperature of all 4 sensors */
-		if (t > dts->temp)
-			dts->temp = t;
-
-		dts->valid++;
-		dts->trip |= temps[i].trip;
-	}
+	dts_keep_max(temps, P8_CT_ZONES, dts);
 
 	prlog(PR_TRACE, "DTS: Chip %x Core %x temp:%dC trip:%x\n",
 	      chip_id, core, dts->temp, dts->trip);
@@ -192,8 +195,107 @@ static int dts_read_core_temp_p8(uint32_t pir, struct dts *dts)
 	return 0;
 }
 
-static int dts_read_core_temp(uint32_t pir, struct dts *dts)
+/* Per core Digital Thermal Sensors */
+#define EC_THERM_P9_DTS_RESULT0	0x050000
+
+/* Different sensor locations */
+#define P9_CORE_DTS0	0
+#define P9_CORE_DTS1	1
+#define P9_CORE_ZONES	2
+
+/*
+ * Returns the temperature as the max of all zones and a global trip
+ * attribute.
+ */
+static int dts_read_core_temp_p9(uint32_t pir, struct dts *dts)
 {
+	int32_t chip_id = pir_to_chip_id(pir);
+	int32_t core = pir_to_core_id(pir);
+	uint64_t dts0;
+	struct dts temps[P9_CORE_ZONES];
+	int rc;
+
+	rc = xscom_read(chip_id, XSCOM_ADDR_P9_EC(core, EC_THERM_P9_DTS_RESULT0),
+			&dts0);
+	if (rc)
+		return rc;
+
+	dts_decode_one_dts(dts0 >> 48, &temps[P9_CORE_DTS0]);
+	dts_decode_one_dts(dts0 >> 32, &temps[P9_CORE_DTS1]);
+
+	dts_keep_max(temps, P9_CORE_ZONES, dts);
+
+	prlog(PR_TRACE, "DTS: Chip %x Core %x temp:%dC trip:%x\n",
+	      chip_id, core, dts->temp, dts->trip);
+
+	/*
+	 * FIXME: The trip bits are always set ?! Just discard
+	 * them for the moment until we understand why.
+	 */
+	dts->trip = 0;
+	return 0;
+}
+
+static int dts_wakeup_core(struct cpu_thread *cpu)
+{
+	int retries = 10;
+	int rc;
+
+	while (retries-- > 0) {
+		rc = dctl_set_special_wakeup(cpu);
+		if (rc) {
+			prerror("Failed to set special wakeup on %d (%d)\n",
+				cpu->pir, rc);
+			return rc;
+		}
+
+		if (!dctl_core_is_gated(cpu))
+			break;
+
+		prlog(PR_NOTICE, "Retrying special wakeup on %d\n", cpu->pir);
+		rc = dctl_clear_special_wakeup(cpu);
+		if (rc) {
+			prerror("Failed to clear special wakeup on %d (%d)\n",
+				cpu->pir, rc);
+			return rc;
+		}
+	}
+
+	return rc;
+}
+
+static void dts_async_read_temp(struct timer *t __unused, void *data,
+				u64 now __unused)
+{
+	struct dts dts;
+	int rc, swkup_rc;
+	struct cpu_thread *cpu = data;
+
+	swkup_rc = dts_wakeup_core(cpu);
+
+	rc = dts_read_core_temp_p9(cpu->pir, &dts);
+	if (!rc) {
+		if (cpu->sensor_attr == SENSOR_DTS_ATTR_TEMP_MAX)
+			*cpu->sensor_data = dts.temp;
+		else if (cpu->sensor_attr == SENSOR_DTS_ATTR_TEMP_TRIP)
+			*cpu->sensor_data = dts.trip;
+	}
+
+	if (!swkup_rc)
+		dctl_clear_special_wakeup(cpu);
+
+	check_sensor_read(cpu->token);
+	rc = opal_queue_msg(OPAL_MSG_ASYNC_COMP, NULL, NULL, cpu->token, rc);
+	if (rc)
+		prerror("Failed to queue async message\n");
+
+	cpu->dts_read_in_progress = false;
+}
+
+static int dts_read_core_temp(u32 pir, struct dts *dts, u8 attr,
+			      int token, u64 *sensor_data)
+{
+	struct cpu_thread *cpu;
 	int rc;
 
 	switch (proc_gen) {
@@ -203,12 +305,31 @@ static int dts_read_core_temp(uint32_t pir, struct dts *dts)
 	case proc_gen_p8:
 		rc = dts_read_core_temp_p8(pir, dts);
 		break;
+	case proc_gen_p9: /* Asynchronus read */
+		cpu = find_cpu_by_pir(pir);
+		if (!cpu)
+			return OPAL_PARAMETER;
+		lock(&cpu->dts_lock);
+		if (cpu->dts_read_in_progress) {
+			unlock(&cpu->dts_lock);
+			return OPAL_BUSY;
+		}
+		cpu->dts_read_in_progress = true;
+		cpu->sensor_attr = attr;
+		cpu->sensor_data = sensor_data;
+		cpu->token = token;
+		schedule_timer(&cpu->dts_timer, 0);
+		rc = OPAL_ASYNC_COMPLETION;
+		unlock(&cpu->dts_lock);
+		break;
 	default:
-		assert(false);
+		rc = OPAL_UNSUPPORTED;
 	}
 	return rc;
 }
 
+/* Per memory controller Digital Thermal Sensors */
+#define THERM_MEM_DTS_RESULT0	0x2050000
 
 /* Different sensor locations */
 #define P8_MEM_DTS0	0
@@ -265,20 +386,12 @@ enum sensor_dts_class {
 };
 
 /*
- * Attributes for the core temperature sensor
- */
-enum {
-	SENSOR_DTS_ATTR_TEMP_MAX,
-	SENSOR_DTS_ATTR_TEMP_TRIP
-};
-
-/*
  * Extract the centaur chip id which was truncated to fit in the
  * resource identifier field of the sensor handler
  */
 #define centaur_get_id(rid) (0x80000000 | ((rid) & 0x3ff))
 
-int64_t dts_sensor_read(uint32_t sensor_hndl, uint32_t *sensor_data)
+int64_t dts_sensor_read(u32 sensor_hndl, int token, u64 *sensor_data)
 {
 	uint8_t	attr = sensor_get_attr(sensor_hndl);
 	uint32_t rid = sensor_get_rid(sensor_hndl);
@@ -290,9 +403,9 @@ int64_t dts_sensor_read(uint32_t sensor_hndl, uint32_t *sensor_data)
 
 	memset(&dts, 0, sizeof(struct dts));
 
-	switch (sensor_get_frc(sensor_hndl) & ~SENSOR_DTS) {
+	switch (sensor_get_frc(sensor_hndl)) {
 	case SENSOR_DTS_CORE_TEMP:
-		rc = dts_read_core_temp(rid, &dts);
+		rc = dts_read_core_temp(rid, &dts, attr, token, sensor_data);
 		break;
 	case SENSOR_DTS_MEM_TEMP:
 		rc = dts_read_mem_temp(centaur_get_id(rid), &dts);
@@ -326,11 +439,11 @@ int64_t dts_sensor_read(uint32_t sensor_hndl, uint32_t *sensor_data)
 	(((chip_id) & 0x3ff) | ((dimm_id) << 10))
 
 #define core_handler(core_id, attr_id)					\
-	sensor_make_handler(SENSOR_DTS_CORE_TEMP | SENSOR_DTS,		\
+	sensor_make_handler(SENSOR_DTS, SENSOR_DTS_CORE_TEMP,		\
 			    core_id, attr_id)
 
 #define cen_handler(cen_id, attr_id)					\
-	sensor_make_handler(SENSOR_DTS_MEM_TEMP|SENSOR_DTS,		\
+	sensor_make_handler(SENSOR_DTS, SENSOR_DTS_MEM_TEMP,		\
 			    centaur_make_id(chip_id, 0), attr_id)
 
 bool dts_sensor_create_nodes(struct dt_node *sensors)
@@ -364,7 +477,10 @@ bool dts_sensor_create_nodes(struct dt_node *sensors)
 			dt_add_property_cells(node, "sensor-status", handler);
 			dt_add_property_string(node, "sensor-type", "temp");
 			dt_add_property_cells(node, "ibm,pir", c->pir);
+			dt_add_property_cells(node, "reg", handler);
 			dt_add_property_string(node, "label", "Core");
+			init_timer(&c->dts_timer, dts_async_read_temp, c);
+			c->dts_read_in_progress = false;
 		}
 	}
 
@@ -390,6 +506,7 @@ bool dts_sensor_create_nodes(struct dt_node *sensors)
 		dt_add_property_cells(node, "sensor-status", handler);
 		dt_add_property_string(node, "sensor-type", "temp");
 		dt_add_property_cells(node, "ibm,chip-id", chip_id);
+		dt_add_property_cells(node, "reg", handler);
 		dt_add_property_string(node, "label", "Centaur");
 	}
 

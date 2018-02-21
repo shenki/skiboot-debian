@@ -1,6 +1,6 @@
 #! /bin/sh
 
-# Copyright 2013-2014 IBM Corp.
+# Copyright 2013-2017 IBM Corp.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,9 +26,11 @@ run_binary() {
 }
 
 fail_test() {
-	rm -rf "$STDERR_OUT";
-	rm -rf "$STDOUT_OUT";
 	echo "$0 ($CUR_TEST): test failed";
+	echo "Test directory preserved:"
+	echo "  DATA_DIR = $DATA_DIR"
+	echo "  STDOUT = $STDOUT_OUT"
+	echo "  STDERR = $STDERR_OUT"
 	exit ${1:-1};
 }
 
@@ -38,8 +40,8 @@ pass_test() {
 
 strip_version_from_result() {
 	VERSION=$(./make_version.sh $1)
-	sed -i "s/${VERSION}/VERSION/" $STDERR_OUT
-	sed -i "s/${VERSION}/VERSION/" $STDOUT_OUT
+	sed -i "s/${VERSION}/VERSION/;s/^Open-Power \(.*\) tool .*/Open-Power \\1 tool VERSION/" $STDERR_OUT
+	sed -i "s/${VERSION}/VERSION/;s/^Open-Power \(.*\) tool .*/Open-Power \\1 tool VERSION/" $STDOUT_OUT
 }
 
 diff_with_result() {
@@ -50,18 +52,23 @@ diff_with_result() {
 		fi
 	# Otherwise just diff result.out with stdout and result.err with stderr
 	else
-		if ! diff -u "${RESULT}.out" "$STDOUT_OUT" ; then
+		#Strip carriage returns, useful for pflash which does fancy
+		#'progress bars'. The main reason for this is is that email
+		#doesn't barf at really really long lines
+		if ! cat "$STDOUT_OUT" | tr '\r' '\n' | \
+			diff -u	"${RESULT}.out" - ; then
 			fail_test;
 		fi
-		if ! diff -u "${RESULT}.err" "$STDERR_OUT" ; then
+		if ! cat "$STDERR_OUT" | tr '\r' '\n' | \
+			diff -u "${RESULT}.err" - ; then
 			fail_test;
 		fi
 	fi
 }
 
 run_tests() {
-	if [ $# -ne 2 ] ; then
-		echo "Usage run_tests test_dir result_dir";
+	if [ $# -lt 2 ] ; then
+		echo "Usage run_tests test_dir result_dir [data_dir]";
 		exit 1;
 	fi
 
@@ -73,13 +80,18 @@ run_tests() {
 		exit 1;
 	fi
 
-	export STDERR_OUT=$(mktemp --tmpdir external-test-stderr.XXXXXX);
-	export STDOUT_OUT=$(mktemp --tmpdir external-test-stdout.XXXXXX);
+	export DATA_DIR=$(mktemp --tmpdir -d external-test-datadir.XXXXXX);
+	export STDERR_OUT="$DATA_DIR/stderr"
+	export STDOUT_OUT="$DATA_DIR/stdout"
+	if [ $# -eq 3 ] ; then
+		cp -r $3/* "$DATA_DIR"
+	fi
 
 
 	for the_test in $all_tests; do
 		export CUR_TEST=$(basename $the_test)
 		export RESULT="$res_path/$CUR_TEST"
+		echo "running $the_test"
 
 		. "$the_test";
 		R="$?"
@@ -93,6 +105,7 @@ run_tests() {
 
 	rm -rf $STDERR_OUT;
 	rm -rf $STDOUT_OUT;
+	rm -rf $DATA_DIR;
 
 	echo "$0 tests passed"
 

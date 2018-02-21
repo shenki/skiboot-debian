@@ -4,10 +4,15 @@ override CFLAGS  += -O2 -Wall -I.
 LIBFLASH_FILES	:= libflash.c libffs.c ecc.c blocklevel.c file.c
 LIBFLASH_OBJS	:= $(addprefix libflash-, $(LIBFLASH_FILES:.c=.o))
 LIBFLASH_SRC	:= $(addprefix libflash/,$(LIBFLASH_FILES))
+CCAN_FILES	:= list.c
+CCAN_OBJS	:= $(addprefix ccan-list-, $(CCAN_FILES:.c=.o))
+CCAN_SRC	:= $(addprefix ccan/list/,$(CCAN_FILES))
 PFLASH_OBJS	:= pflash.o progress.o version.o common-arch_flash.o
-OBJS		:= $(PFLASH_OBJS) $(LIBFLASH_OBJS)
+OBJS		:= $(PFLASH_OBJS) $(LIBFLASH_OBJS) $(CCAN_OBJS)
 EXE     	:= pflash
-sbindir		?= /usr/sbin
+sbindir		= $(prefix)/sbin
+datadir		= $(prefix)/share
+mandir		= $(datadir)/man
 
 PFLASH_VERSION	?= $(shell ../../make_version.sh $(EXE))
 LINKAGE		?= static
@@ -32,12 +37,17 @@ version.c: .version
 	echo "const char version[] = \"$(PFLASH_VERSION)\";" ;\
 	fi) > $@
 
-%.o : %.c
+%.o : %.c | links
 	$(Q_CC)$(CC) $(CFLAGS) -c $< -o $@
 
 $(LIBFLASH_SRC): | links
 
-$(LIBFLASH_OBJS): libflash-%.o : libflash/%.c
+$(CCAN_SRC): | links
+
+$(LIBFLASH_OBJS): libflash-%.o : libflash/%.c | links
+	$(Q_CC)$(CC) $(CFLAGS) -c $< -o $@
+
+$(CCAN_OBJS): ccan-list-%.o: ccan/list/%.c | links
 	$(Q_CC)$(CC) $(CFLAGS) -c $< -o $@
 
 $(EXE): $(OBJS)

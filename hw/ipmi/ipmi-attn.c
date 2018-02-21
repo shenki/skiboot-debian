@@ -33,7 +33,7 @@ DEFINE_LOG_ENTRY(OPAL_RC_ATTN, OPAL_PLATFORM_ERR_EVT,
 static char ti_buffer[IPMI_TI_BUFFER_SIZE];
 
 #define STACK_BUF_ENTRIES       20
-struct bt_entry bt_buf[STACK_BUF_ENTRIES];
+static struct bt_entry bt_buf[STACK_BUF_ENTRIES];
 
 /* Log eSEL event with OPAL backtrace */
 static void ipmi_log_terminate_event(const char *msg)
@@ -67,7 +67,7 @@ void __attribute__((noreturn)) ipmi_terminate(const char *msg)
 {
 	/* Terminate called before initializing IPMI (early abort) */
 	if (!ipmi_present()) {
-		if (platform.cec_reboot())
+		if (platform.cec_reboot)
 			platform.cec_reboot();
 		goto out;
 	}
@@ -76,7 +76,7 @@ void __attribute__((noreturn)) ipmi_terminate(const char *msg)
 	ipmi_log_terminate_event(msg);
 
 	/* Reboot call */
-	if (platform.cec_reboot())
+	if (platform.cec_reboot)
 		platform.cec_reboot();
 
 out:

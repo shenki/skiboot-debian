@@ -50,6 +50,8 @@
 #include <opal-api.h>
 #include <types.h>
 
+#include <ccan/list/list.h>
+
 #include "opal-prd.h"
 #include "hostboot-interface.h"
 #include "module.h"
@@ -63,6 +65,11 @@ struct prd_range {
 	void			*buf;
 	bool			multiple;
 	uint32_t		instance;
+};
+
+struct prd_msgq_item {
+	struct list_node	list;
+	struct opal_prd_msg	msg;
 };
 
 struct opal_prd_ctx {
@@ -80,6 +87,9 @@ struct opal_prd_ctx {
 	char			*hbrt_file_name;
 	bool			use_syslog;
 	bool			expert_mode;
+	struct list_head	msgq;
+	struct opal_prd_msg	*msg;
+	size_t			msg_alloc_len;
 	void			(*vlog)(int, const char *, va_list);
 };
 
@@ -96,9 +106,20 @@ enum control_msg_type {
 struct control_msg {
 	enum control_msg_type	type;
 	int			response;
-	uint32_t		argc;
-	uint32_t		data_len;
-	uint8_t			data[];
+	union {
+		struct {
+			unsigned int	argc;
+		} run_cmd;
+		struct {
+			uint64_t	chip;
+		} occ_reset;
+		struct {
+			uint64_t	chip;
+		} occ_error;
+	};
+	unsigned int		data_len;
+	unsigned char		data[];
+
 };
 
 #define MAX_CONTROL_MSG_BUF	4096
@@ -109,7 +130,9 @@ static const char *opal_prd_devnode = "/dev/opal-prd";
 static const char *opal_prd_socket = "/run/opal-prd-control";
 static const char *hbrt_code_region_name = "ibm,hbrt-code-image";
 static const int opal_prd_version = 1;
-static const uint64_t opal_prd_ipoll = 0xf000000000000000;
+static uint64_t opal_prd_ipoll = 0xf000000000000000;
+
+static const int max_msgq_len = 16;
 
 static const char *ipmi_devnode = "/dev/ipmi0";
 static const int ipmi_timeout_ms = 5000;
@@ -140,6 +163,11 @@ struct func_desc {
 	void *toc;
 } hbrt_entry;
 
+static int nr_chips;
+static u64 chips[256];
+
+static int read_prd_msg(struct opal_prd_ctx *ctx);
+
 static struct prd_range *find_range(const char *name, uint32_t instance)
 {
 	struct prd_range *range;
@@ -167,6 +195,9 @@ static void pr_log_stdio(int priority, const char *fmt, va_list ap)
 
 	vprintf(fmt, ap);
 	printf("\n");
+
+	if (ctx->debug)
+		fflush(stdout);
 }
 
 /* standard logging prefixes:
@@ -178,7 +209,7 @@ static void pr_log_stdio(int priority, const char *fmt, va_list ap)
  * IPMI:  IPMI interface
  * PNOR:  PNOR interface
  * I2C:   i2c interface
- * OCC:   OCC interface
+ * PM:    PM/OCC interface
  * CTRL:  User-triggered control events
  * KMOD:   Kernel module functions
  */
@@ -221,6 +252,21 @@ static void pr_log_daemon_init(void)
 	}
 }
 
+/* Check service processor type */
+static bool is_fsp_system(void)
+{
+	char *path;
+	int rc;
+
+	rc = asprintf(&path, "%s/fsps", devicetree_base);
+	if (rc < 0) {
+		pr_log(LOG_ERR, "FW: error creating '/fsps' path %m");
+		return false;
+	}
+
+	return access(path, F_OK) ? false : true;
+}
+
 /**
  * ABI check that we can't perform at build-time: we want to ensure that the
  * layout of struct host_interfaces matches that defined in the thunk.
@@ -256,10 +302,34 @@ extern int call_mfg_htmgt_pass_thru(uint16_t i_cmdLength, uint8_t *i_cmdData,
 				uint16_t *o_rspLength, uint8_t *o_rspData);
 extern int call_apply_attr_override(uint8_t *i_data, size_t size);
 extern int call_run_command(int argc, const char **argv, char **o_outString);
+extern int call_sbe_message_passing(uint32_t i_chipId);
+extern uint64_t call_get_ipoll_events(void);
+extern int call_firmware_notify(uint64_t len, void *data);
+extern int call_reset_pm_complex(uint64_t chip);
+extern int call_load_pm_complex(u64 chip, u64 homer, u64 occ_common, u32 mode);
+extern int call_start_pm_complex(u64 chip);
 
 void hservice_puts(const char *str)
 {
-	pr_log(LOG_INFO, "HBRT: %s", str);
+	int priority = LOG_INFO;
+
+	/* Interpret the 2-character ERR_MRK/FAIL_MRK/WARN_MRK prefixes that
+	 * may be present on HBRT log messages, and bump the log priority as
+	 * appropriate.
+	 */
+	if (strlen(str) >= 2 && str[1] == '>') {
+		switch (str[0]) {
+		case 'E':
+		case 'F':
+			priority = LOG_ERR;
+			break;
+		case 'W':
+			priority = LOG_WARNING;
+			break;
+		}
+	}
+
+	pr_log(priority, "HBRT: %s", str);
 }
 
 void hservice_assert(void)
@@ -457,6 +527,24 @@ int hservice_i2c_write(uint64_t i_master, uint16_t i_devAddr,
 		HBRT_I2C_MASTER_PORT_SHIFT;
 	return i2c_write(chip_id, engine, port, i_devAddr, i_offsetSize,
 			 i_offset, i_length, i_data);
+}
+
+int hservice_wakeup(u32 core, u32 mode)
+{
+	struct opal_prd_msg msg;
+
+	msg.hdr.type = OPAL_PRD_MSG_TYPE_CORE_SPECIAL_WAKEUP;
+	msg.hdr.size = htobe16(sizeof(msg));
+	msg.spl_wakeup.core = htobe32(core);
+	msg.spl_wakeup.mode = htobe32(mode);
+
+	if (write(ctx->fd, &msg, sizeof(msg)) != sizeof(msg)) {
+		pr_log(LOG_ERR, "FW: Failed to send CORE_SPECIAL_WAKEUP msg %x : %m\n",
+		       core);
+		return -1;
+	}
+
+	return 0;
 }
 
 static void ipmi_init(struct opal_prd_ctx *ctx)
@@ -657,6 +745,102 @@ uint64_t hservice_get_interface_capabilities(uint64_t set)
 		return HBRT_CAPS_OPAL_HAS_XSCOM_RC;
 
 	return 0;
+}
+
+uint64_t hservice_firmware_request(uint64_t req_len, void *req,
+		uint64_t *resp_lenp, void *resp)
+{
+	struct opal_prd_msg *msg = ctx->msg;
+	uint64_t resp_len;
+	size_t size;
+	int rc, n;
+
+	resp_len = be64_to_cpu(*resp_lenp);
+
+	pr_log(LOG_DEBUG,
+			"HBRT: firmware request: %lu bytes req, %lu bytes resp",
+			req_len, resp_len);
+
+	/* sanity check for potential overflows */
+	if (req_len > 0xffff || resp_len > 0xffff)
+		return -1;
+
+	size = sizeof(msg->hdr) + sizeof(msg->token) +
+		sizeof(msg->fw_req) + req_len;
+
+	/* we need the entire message to fit within the 2-byte size field */
+	if (size > 0xffff)
+		return -1;
+
+	/* variable sized message, so we may need to expand our buffer */
+	if (size > ctx->msg_alloc_len) {
+		msg = realloc(ctx->msg, size);
+		if (!msg) {
+			pr_log(LOG_ERR,
+				"FW: failed to expand message buffer: %m");
+			return -1;
+		}
+		ctx->msg = msg;
+		ctx->msg_alloc_len = size;
+	}
+
+	memset(msg, 0, size);
+
+	/* construct request message... */
+	msg->hdr.type = OPAL_PRD_MSG_TYPE_FIRMWARE_REQUEST;
+	msg->hdr.size = htobe16(size);
+	msg->fw_req.req_len = htobe64(req_len);
+	msg->fw_req.resp_len = htobe64(resp_len);
+	memcpy(msg->fw_req.data, req, req_len);
+
+	hexdump((void *)msg, size);
+
+	/* ... and send to firmware */
+	rc = write(ctx->fd, msg, size);
+	if (rc != size) {
+		pr_log(LOG_WARNING,
+			"FW: Failed to send FIRMWARE_REQUEST message: %m");
+		return -1;
+	}
+
+	/* We have an "inner" poll loop here, as we want to ensure that the
+	 * next entry into HBRT is the return from this function. So, only
+	 * read from the prd fd, and queue anything that isn't a response
+	 * to this request
+	 */
+	n = 0;
+	for (;;) {
+		struct prd_msgq_item *item;
+
+		rc = read_prd_msg(ctx);
+		if (rc)
+			return -1;
+
+		msg = ctx->msg;
+		if (msg->hdr.type == OPAL_PRD_MSG_TYPE_FIRMWARE_RESPONSE) {
+			size = be64toh(msg->fw_resp.len);
+			if (size > resp_len)
+				return -1;
+
+			/* success! a valid response that fits into HBRT's
+			 * resp buffer */
+			memcpy(resp, msg->fw_resp.data, size);
+			*resp_lenp = htobe64(size);
+			return 0;
+		}
+
+		/* not a response? queue up for later consumption */
+		if (++n > max_msgq_len) {
+			pr_log(LOG_ERR,
+				"FW: too many messages queued (%d) while "
+				"waiting for FIRMWARE_RESPONSE", n);
+			return -1;
+		}
+		size = be16toh(msg->hdr.size);
+		item = malloc(sizeof(*item) + size);
+		memcpy(&item->msg, msg, size);
+		list_add_tail(&ctx->msgq, &item->list);
+	}
 }
 
 int hservices_init(struct opal_prd_ctx *ctx, void *code)
@@ -1012,6 +1196,52 @@ static void print_ranges(struct opal_prd_ctx *ctx)
 	}
 }
 
+static int chip_init(void)
+{
+	struct dirent *dirent;
+	char *path;
+	DIR *dir;
+	__be32 *chipid;
+	void *buf;
+	int rc, len, i;
+
+	dir = opendir(devicetree_base);
+	if (!dir) {
+		pr_log(LOG_ERR, "FW: Can't open %s", devicetree_base);
+		return  -1;
+	}
+
+	for (;;) {
+		dirent = readdir(dir);
+		if (!dirent)
+			break;
+
+		if (strncmp("xscom", dirent->d_name, 5))
+			continue;
+
+		rc = asprintf(&path, "%s/%s/ibm,chip-id", devicetree_base,
+			      dirent->d_name);
+		if (rc < 0) {
+			pr_log(LOG_ERR, "FW: Failed to create chip-id path");
+			return -1;
+		}
+
+		rc = open_and_read(path, &buf, &len);
+		if (rc) {
+			pr_log(LOG_ERR, "FW; Failed to read chipid");
+			return -1;
+		}
+		chipid = buf;
+		chips[nr_chips++] = be32toh(*chipid);
+	}
+
+	pr_log(LOG_DEBUG, "FW: Chip init");
+	for (i = 0; i < nr_chips; i++)
+		pr_log(LOG_DEBUG, "FW: Chip 0x%lx", chips[i]);
+
+	return 0;
+}
+
 static int prd_init_ranges(struct opal_prd_ctx *ctx)
 {
 	struct dirent *dirent;
@@ -1132,6 +1362,10 @@ static int prd_init(struct opal_prd_ctx *ctx)
 		return -1;
 	}
 
+	rc = chip_init();
+	if (rc)
+		pr_log(LOG_ERR, "FW: Failed to initialize chip IDs");
+
 	return 0;
 }
 
@@ -1189,91 +1423,376 @@ static int handle_msg_occ_error(struct opal_prd_ctx *ctx,
 	return 0;
 }
 
+static int pm_complex_load_start(void)
+{
+	struct prd_range *range;
+	u64 homer, occ_common;
+	int rc = -1, i;
+
+	if (!hservice_runtime->load_pm_complex) {
+		pr_log_nocall("load_pm_complex");
+		return rc;
+	}
+
+	if (!hservice_runtime->start_pm_complex) {
+		pr_log_nocall("start_pm_complex");
+		return rc;
+	}
+
+	range = find_range("ibm,occ-common-area", 0);
+	if (!range) {
+		pr_log(LOG_ERR, "PM: ibm,occ-common-area not found");
+		return rc;
+	}
+	occ_common = range->physaddr;
+
+	for (i = 0; i < nr_chips; i++) {
+		range = find_range("ibm,homer-image", chips[i]);
+		if (!range) {
+			pr_log(LOG_ERR, "PM: ibm,homer-image not found 0x%lx",
+			       chips[i]);
+			return -1;
+		}
+		homer = range->physaddr;
+
+		pr_debug("PM: calling load_pm_complex(0x%lx, 0x%lx, 0x%lx, LOAD)",
+			 chips[i], homer, occ_common);
+		rc = call_load_pm_complex(chips[i], homer, occ_common, 0);
+		if (rc) {
+			pr_log(LOG_ERR, "PM: Failed load_pm_complex(0x%lx) %m",
+			       chips[i]);
+			return rc;
+		}
+	}
+
+	for (i = 0; i < nr_chips; i++) {
+		pr_debug("PM: calling start_pm_complex(0x%lx)", chips[i]);
+		rc = call_start_pm_complex(chips[i]);
+		if (rc) {
+			pr_log(LOG_ERR, "PM: Failed start_pm_complex(0x%lx): %m",
+			       chips[i]);
+			return rc;
+		}
+	}
+
+	return rc;
+}
+
+static int pm_complex_reset(uint64_t chip)
+{
+	int rc;
+
+	/*
+	 * FSP system -> reset_pm_complex
+	 * BMC system -> process_occ_reset
+	 */
+	if (is_fsp_system()) {
+		int i;
+
+		if (!hservice_runtime->reset_pm_complex) {
+			pr_log_nocall("reset_pm_complex");
+			return -1;
+		}
+
+		for (i = 0; i < nr_chips; i++) {
+			pr_debug("PM: calling pm_complex_reset(%ld)", chips[i]);
+			rc = call_reset_pm_complex(chip);
+			if (rc) {
+				pr_log(LOG_ERR, "PM: Failed pm_complex_reset(%ld): %m",
+				       chips[i]);
+				return rc;
+			}
+		}
+
+		rc = pm_complex_load_start();
+	} else {
+		if (!hservice_runtime->process_occ_reset) {
+			pr_log_nocall("process_occ_reset");
+			return -1;
+		}
+
+		pr_debug("PM: calling process_occ_reset(%ld)", chip);
+		call_process_occ_reset(chip);
+		rc = 0;
+	}
+
+	return rc;
+}
+
 static int handle_msg_occ_reset(struct opal_prd_ctx *ctx,
 		struct opal_prd_msg *msg)
 {
 	uint32_t proc;
+	int rc;
 
 	proc = be64toh(msg->occ_reset.chip);
 
 	pr_debug("FW: firmware requested OCC reset for proc 0x%x", proc);
 
-	if (!hservice_runtime->process_occ_reset) {
-		pr_log_nocall("process_occ_reset");
+	rc = pm_complex_reset(proc);
+
+	return rc;
+}
+
+static int handle_msg_firmware_notify(struct opal_prd_ctx *ctx,
+		struct opal_prd_msg *msg)
+{
+	uint64_t len;
+	void *buf;
+
+	len = be64toh(msg->fw_notify.len);
+	buf = msg->fw_notify.data;
+
+	pr_debug("FW: firmware notification, %ld bytes", len);
+
+	if (!hservice_runtime->firmware_notify) {
+		pr_log_nocall("firmware_notify");
 		return -1;
 	}
 
-	call_process_occ_reset(proc);
+	call_firmware_notify(len, buf);
+
 	return 0;
 }
 
-static int handle_prd_msg(struct opal_prd_ctx *ctx)
+static int handle_msg_sbe_passthrough(struct opal_prd_ctx *ctx,
+				      struct opal_prd_msg *msg)
 {
-	struct opal_prd_msg msg;
-	int size;
+	uint32_t proc;
 	int rc;
 
-	rc = read(ctx->fd, &msg, sizeof(msg));
-	if (rc < 0 && errno == EAGAIN)
-		return -1;
+	proc = be64toh(msg->sbe_passthrough.chip);
 
-	if (rc != sizeof(msg)) {
-		pr_log(LOG_WARNING, "FW: Error reading events from OPAL: %m");
-		return -1;
-	}
+	pr_debug("FW: firmware sent SBE pass through command for proc 0x%x\n",
+		 proc);
 
-	size = htobe16(msg.hdr.size);
-	if (size < sizeof(msg)) {
-		pr_log(LOG_ERR, "FW: Mismatched message size "
-				"between opal-prd and firmware "
-				"(%d from FW, %zd expected)",
-				size, sizeof(msg));
+	if (!hservice_runtime->sbe_message_passing) {
+		pr_log_nocall("sbe_message_passing");
 		return -1;
 	}
 
-	switch (msg.hdr.type) {
+	rc = call_sbe_message_passing(proc);
+	return rc;
+}
+
+static int handle_msg_fsp_occ_reset(struct opal_prd_msg *msg)
+{
+	struct opal_prd_msg omsg;
+	int rc = -1, i;
+
+	pr_debug("FW: FSP requested OCC reset");
+
+	if (!hservice_runtime->reset_pm_complex) {
+		pr_log_nocall("reset_pm_complex");
+		return rc;
+	}
+
+	for (i = 0; i < nr_chips; i++) {
+		pr_debug("PM: calling pm_complex_reset(0x%lx)", chips[i]);
+		rc = call_reset_pm_complex(chips[i]);
+		if (rc) {
+			pr_log(LOG_ERR, "PM: Failed pm_complex_reset(0x%lx) %m",
+			       chips[i]);
+			break;
+		}
+	}
+
+	omsg.hdr.type = OPAL_PRD_MSG_TYPE_FSP_OCC_RESET_STATUS;
+	omsg.hdr.size = htobe16(sizeof(omsg));
+	omsg.fsp_occ_reset_status.chip = msg->occ_reset.chip;
+	omsg.fsp_occ_reset_status.status = htobe64(rc);
+
+	if (write(ctx->fd, &omsg, sizeof(omsg)) != sizeof(omsg)) {
+		pr_log(LOG_ERR, "FW: Failed to send FSP_OCC_RESET_STATUS msg: %m");
+		return -1;
+	}
+
+	return rc;
+}
+
+static int handle_msg_fsp_occ_load_start(struct opal_prd_msg *msg)
+{
+	struct opal_prd_msg omsg;
+	int rc;
+
+	pr_debug("FW: FSP requested OCC load/start");
+	rc = pm_complex_load_start();
+
+	omsg.hdr.type = OPAL_PRD_MSG_TYPE_FSP_OCC_LOAD_START_STATUS;
+	omsg.hdr.size = htobe16(sizeof(omsg));
+	omsg.fsp_occ_reset_status.chip = msg->occ_reset.chip;
+	omsg.fsp_occ_reset_status.status = htobe64(rc);
+
+	if (write(ctx->fd, &omsg, sizeof(omsg)) != sizeof(omsg)) {
+		pr_log(LOG_ERR, "FW: Failed to send FSP_OCC_LOAD_START_STATUS msg: %m");
+		return -1;
+	}
+
+	return rc;
+}
+
+static int handle_prd_msg(struct opal_prd_ctx *ctx, struct opal_prd_msg *msg)
+{
+	int rc = -1;
+
+	switch (msg->hdr.type) {
 	case OPAL_PRD_MSG_TYPE_ATTN:
-		rc = handle_msg_attn(ctx, &msg);
+		rc = handle_msg_attn(ctx, msg);
 		break;
 	case OPAL_PRD_MSG_TYPE_OCC_RESET:
-		rc = handle_msg_occ_reset(ctx, &msg);
+		rc = handle_msg_occ_reset(ctx, msg);
 		break;
 	case OPAL_PRD_MSG_TYPE_OCC_ERROR:
-		rc = handle_msg_occ_error(ctx, &msg);
+		rc = handle_msg_occ_error(ctx, msg);
+		break;
+	case OPAL_PRD_MSG_TYPE_FIRMWARE_NOTIFY:
+		rc = handle_msg_firmware_notify(ctx, msg);
+		break;
+	case OPAL_PRD_MSG_TYPE_SBE_PASSTHROUGH:
+		rc = handle_msg_sbe_passthrough(ctx, msg);
+		break;
+	case OPAL_PRD_MSG_TYPE_FSP_OCC_RESET:
+		rc = handle_msg_fsp_occ_reset(msg);
+		break;
+	case OPAL_PRD_MSG_TYPE_FSP_OCC_LOAD_START:
+		rc = handle_msg_fsp_occ_load_start(msg);
 		break;
 	default:
 		pr_log(LOG_WARNING, "Invalid incoming message type 0x%x",
-				msg.hdr.type);
-		return -1;
+				msg->hdr.type);
+	}
+
+	return rc;
+}
+
+#define list_for_each_pop(h, i, type, member) \
+	for (i = list_pop((h), type, member); \
+		i; \
+		i = list_pop((h), type, member))
+
+
+static int process_msgq(struct opal_prd_ctx *ctx)
+{
+	struct prd_msgq_item *item;
+
+	list_for_each_pop(&ctx->msgq, item, struct prd_msgq_item, list) {
+		handle_prd_msg(ctx, &item->msg);
+		free(item);
 	}
 
 	return 0;
 }
 
-static void handle_prd_control_occ_error(struct control_msg *msg)
+static int read_prd_msg(struct opal_prd_ctx *ctx)
 {
+	struct opal_prd_msg *msg;
+	int size;
+	int rc;
+
+	msg = ctx->msg;
+
+	rc = read(ctx->fd, msg, ctx->msg_alloc_len);
+	if (rc < 0 && errno == EAGAIN)
+		return -1;
+
+	/* we need at least enough for the message header... */
+	if (rc < 0) {
+		pr_log(LOG_WARNING, "FW: error reading from firmware: %m");
+		return -1;
+	}
+
+	if (rc < sizeof(msg->hdr)) {
+		pr_log(LOG_WARNING, "FW: short message read from firmware");
+		return -1;
+	}
+
+	/* ... and for the reported message size to be sane */
+	size = htobe16(msg->hdr.size);
+	if (size < sizeof(msg->hdr)) {
+		pr_log(LOG_ERR, "FW: Mismatched message size "
+				"between opal-prd and firmware "
+				"(%d from FW, %zd expected)",
+				size, sizeof(msg->hdr));
+		return -1;
+	}
+
+	/* expand our message buffer if necessary... */
+	if (size > ctx->msg_alloc_len) {
+		msg = realloc(ctx->msg, size);
+		if (!msg) {
+			pr_log(LOG_ERR,
+				"FW: Can't expand PRD message buffer: %m");
+			return -1;
+		}
+		ctx->msg = msg;
+		ctx->msg_alloc_len = size;
+	}
+
+	/* ... and complete the read */
+	if (size > rc) {
+		size_t pos;
+
+		for (pos = rc; pos < size;) {
+			rc = read(ctx->fd, msg + pos, size - pos);
+
+			if (rc < 0 && errno == EAGAIN)
+				continue;
+
+			if (rc <= 0) {
+				pr_log(LOG_WARNING,
+					"FW: error reading from firmware: %m");
+				return -1;
+			}
+
+			pos += rc;
+		}
+	}
+
+	return 0;
+}
+
+static void handle_prd_control_occ_error(struct control_msg *send_msg,
+		struct control_msg *recv_msg)
+{
+	uint64_t chip;
+
 	if (!hservice_runtime->process_occ_error) {
 		pr_log_nocall("process_occ_error");
 		return;
 	}
 
-	pr_debug("CTRL: calling process_occ_error(0)");
-	call_process_occ_error(0);
-	msg->data_len = 0;
-	msg->response = 0;
+	chip = recv_msg->occ_error.chip;
+
+	pr_debug("CTRL: calling process_occ_error(%lu)", chip);
+	call_process_occ_error(chip);
+
+	send_msg->data_len = 0;
+	send_msg->response = 0;
 }
 
-static void handle_prd_control_occ_reset(struct control_msg *msg)
+static void handle_prd_control_occ_reset(struct control_msg *send_msg,
+		struct control_msg *msg)
 {
-	if (!hservice_runtime->process_occ_reset) {
-		pr_log_nocall("process_occ_reset");
-		return;
-	}
+	struct opal_prd_msg omsg;
+	uint64_t chip;
+	int rc;
 
-	pr_debug("CTRL: calling process_occ_reset(0)");
-	call_process_occ_reset(0);
-	msg->data_len = 0;
-	msg->response = 0;
+	/* notify OPAL of the impending reset */
+	memset(&omsg, 0, sizeof(omsg));
+	omsg.hdr.type = OPAL_PRD_MSG_TYPE_OCC_RESET_NOTIFY;
+	omsg.hdr.size = htobe16(sizeof(omsg));
+	rc = write(ctx->fd, &omsg, sizeof(omsg));
+	if (rc != sizeof(omsg))
+		pr_log(LOG_WARNING, "FW: Failed to send OCC_RESET message: %m");
+
+	chip = msg->occ_reset.chip;
+
+	/* do reset */
+	pr_debug("CTRL: Calling OCC reset on chip %ld", chip);
+	pm_complex_reset(chip);
+
+	send_msg->data_len = 0;
+	send_msg->response = 0;
 }
 
 static void handle_prd_control_occ_actuation(struct control_msg *msg,
@@ -1339,7 +1858,7 @@ static void handle_prd_control_run_cmd(struct control_msg *send_msg,
 		return;
 	}
 
-	argc = recv_msg->argc;
+	argc = recv_msg->run_cmd.argc;
 	pr_debug("CTRL: run_command, argc:%d\n", argc);
 
 	argv = malloc(argc * sizeof(*argv));
@@ -1381,7 +1900,6 @@ static void handle_prd_control_run_cmd(struct control_msg *send_msg,
 static void handle_prd_control(struct opal_prd_ctx *ctx, int fd)
 {
 	struct control_msg msg, *recv_msg, *send_msg;
-	struct opal_prd_msg omsg;
 	bool enabled = false;
 	int rc, size;
 
@@ -1434,15 +1952,10 @@ static void handle_prd_control(struct opal_prd_ctx *ctx, int fd)
 		handle_prd_control_occ_actuation(send_msg, enabled);
 		break;
 	case CONTROL_MSG_TEMP_OCC_RESET:
-		omsg.hdr.type = OPAL_PRD_MSG_TYPE_OCC_RESET_NOTIFY;
-		omsg.hdr.size = htobe16(sizeof(omsg));
-		rc = write(ctx->fd, &omsg, sizeof(omsg));
-		if (rc != sizeof(omsg))
-			pr_log(LOG_WARNING, "FW: Failed to send OCC_RESET message: %m");
-		handle_prd_control_occ_reset(send_msg);
+		handle_prd_control_occ_reset(send_msg, recv_msg);
 		break;
 	case CONTROL_MSG_TEMP_OCC_ERROR:
-		handle_prd_control_occ_error(send_msg);
+		handle_prd_control_occ_error(send_msg, recv_msg);
 		break;
 	case CONTROL_MSG_ATTR_OVERRIDE:
 		handle_prd_control_attr_override(send_msg, recv_msg);
@@ -1491,6 +2004,13 @@ static int run_attn_loop(struct opal_prd_ctx *ctx)
 		}
 	}
 
+	if (hservice_runtime->get_ipoll_events) {
+		pr_debug("HBRT: calling get_ipoll_events");
+		opal_prd_ipoll = call_get_ipoll_events();
+	}
+
+	pr_debug("HBRT: enabling IPOLL events 0x%016lx", opal_prd_ipoll);
+
 	/* send init message, to unmask interrupts */
 	msg.hdr.type = OPAL_PRD_MSG_TYPE_INIT;
 	msg.hdr.size = htobe16(sizeof(msg));
@@ -1510,6 +2030,9 @@ static int run_attn_loop(struct opal_prd_ctx *ctx)
 	pollfds[1].events = POLLIN | POLLERR;
 
 	for (;;) {
+		/* run through any pending messages */
+		process_msgq(ctx);
+
 		rc = poll(pollfds, 2, -1);
 		if (rc < 0) {
 			pr_log(LOG_ERR, "FW: event poll failed: %m");
@@ -1519,8 +2042,11 @@ static int run_attn_loop(struct opal_prd_ctx *ctx)
 		if (!rc)
 			continue;
 
-		if (pollfds[0].revents & POLLIN)
-			handle_prd_msg(ctx);
+		if (pollfds[0].revents & POLLIN) {
+			rc = read_prd_msg(ctx);
+			if (!rc)
+				handle_prd_msg(ctx, ctx->msg);
+		}
 
 		if (pollfds[1].revents & POLLIN) {
 			fd = accept(ctx->socket, NULL, NULL);
@@ -1589,6 +2115,17 @@ static int run_prd_daemon(struct opal_prd_ctx *ctx)
 	ctx->fd = -1;
 	ctx->socket = -1;
 
+	/* set up our message buffer */
+	ctx->msg_alloc_len = sizeof(*ctx->msg);
+	ctx->msg = malloc(ctx->msg_alloc_len);
+	if (!ctx->msg) {
+		pr_log(LOG_ERR, "FW: Can't allocate PRD message buffer: %m");
+		return -1;
+	}
+
+
+	list_head_init(&ctx->msgq);
+
 	i2c_init();
 
 #ifdef DEBUG_I2C
@@ -1618,7 +2155,6 @@ static int run_prd_daemon(struct opal_prd_ctx *ctx)
 		goto out_close;
 	}
 
-
 	if (ctx->hbrt_file_name) {
 		rc = map_hbrt_file(ctx, ctx->hbrt_file_name);
 		if (rc) {
@@ -1641,11 +2177,20 @@ static int run_prd_daemon(struct opal_prd_ctx *ctx)
 
 	fixup_hinterface_table();
 
-	rc = pnor_init(&ctx->pnor);
-	if (rc) {
-		pr_log(LOG_ERR, "PNOR: Failed to open pnor: %m");
-		goto out_close;
+	if (pnor_available(&ctx->pnor)) {
+		rc = pnor_init(&ctx->pnor);
+		if (rc) {
+			pr_log(LOG_ERR, "PNOR: Failed to open pnor: %m");
+			goto out_close;
+		}
+	} else {
+		/* Disable PNOR function pointers */
+		hinterface.pnor_read = NULL;
+		hinterface.pnor_write = NULL;
 	}
+
+	if (!is_fsp_system())
+		hinterface.wakeup = NULL;
 
 	ipmi_init(ctx);
 
@@ -1676,6 +2221,8 @@ out_close:
 		close(ctx->fd);
 	if (ctx->socket != -1)
 		close(ctx->socket);
+	if (ctx->msg)
+		free(ctx->msg);
 	return rc;
 }
 
@@ -1738,30 +2285,50 @@ out_close:
 	return rc;
 }
 
-static int send_occ_control(struct opal_prd_ctx *ctx, const char *str)
+static int send_occ_control(struct opal_prd_ctx *ctx, int argc, char *argv[])
 {
 	struct control_msg send_msg, *recv_msg = NULL;
+	unsigned long chip = 0;
+	const char *op;
 	int rc;
+
+	assert(argc >= 1);
+	op = argv[0];
+
+	/* some commands accept a 'chip' argument, so parse it here */
+	if (argc > 1) {
+		char *arg, *end;
+		arg = argv[1];
+		chip = strtoul(arg, &end, 0);
+		if (end == arg) {
+			pr_log(LOG_ERR, "CTRL: invalid argument %s", arg);
+			return -1;
+		}
+	}
 
 	memset(&send_msg, 0, sizeof(send_msg));
 
-	if (!strcmp(str, "enable"))
+	if (!strcmp(op, "enable"))
 		send_msg.type = CONTROL_MSG_ENABLE_OCCS;
-	else if (!strcmp(str, "disable"))
+	else if (!strcmp(op, "disable"))
 		send_msg.type = CONTROL_MSG_DISABLE_OCCS;
-	else if (!strcmp(str, "reset"))
+
+	else if (!strcmp(op, "reset")) {
 		send_msg.type = CONTROL_MSG_TEMP_OCC_RESET;
-	else if (!strcmp(str, "process-error"))
+		send_msg.occ_reset.chip = (uint64_t)chip;
+
+	} else if (!strcmp(op, "process-error")) {
 		send_msg.type = CONTROL_MSG_TEMP_OCC_ERROR;
-	else {
-		pr_log(LOG_ERR, "CTRL: Invalid OCC action '%s'", str);
+		send_msg.occ_error.chip = (uint64_t)chip;
+	} else {
+		pr_log(LOG_ERR, "CTRL: Invalid OCC action '%s'", op);
 		return -1;
 	}
 
 	rc = send_prd_control(&send_msg, &recv_msg);
 	if (recv_msg) {
 		if (recv_msg->response || ctx->debug)
-			pr_debug("CTRL: OCC action %s returned status %d", str,
+			pr_debug("CTRL: OCC action %s returned status %d", op,
 					recv_msg->response);
 		free(recv_msg);
 	}
@@ -1895,7 +2462,7 @@ static int send_run_command(struct opal_prd_ctx *ctx, int argc, char *argv[])
 
 	/* Setup message */
 	send_msg->type = CONTROL_MSG_RUN_CMD;
-	send_msg->argc = argc;
+	send_msg->run_cmd.argc = argc;
 	send_msg->data_len = size;
 	s = (char *)send_msg->data;
 	for (i = 0; i < argc; i++) {
@@ -1923,7 +2490,8 @@ static void usage(const char *progname)
 	printf("Usage:\n");
 	printf("\t%s [--debug] [--file <hbrt-image>] [--pnor <device>]\n",
 			progname);
-	printf("\t%s occ <enable|disable>\n", progname);
+	printf("\t%s occ <enable|disable|reset [chip]>\n", progname);
+	printf("\t%s pm-complex reset [chip]>\n", progname);
 	printf("\t%s htmgt-passthru <bytes...>\n", progname);
 	printf("\t%s override <FILE>\n", progname);
 	printf("\t%s run [arg 0] [arg 1]..[arg n]\n", progname);
@@ -1968,6 +2536,21 @@ static int parse_action(const char *str, enum action *action)
 	if (!strcmp(str, "occ")) {
 		*action = ACTION_OCC_CONTROL;
 		rc = 0;
+
+		if (is_fsp_system()) {
+			pr_log(LOG_ERR, "CTRL: occ commands are not "
+			       "supported on this system");
+			rc = -1;
+		}
+	} else if (!strcmp(str, "pm-complex")) {
+		*action = ACTION_OCC_CONTROL;
+		rc = 0;
+
+		if (!is_fsp_system()) {
+			pr_log(LOG_ERR, "CTRL: pm-complex commands are not "
+			       "supported on this system");
+			rc = -1;
+		}
 	} else if (!strcmp(str, "daemon")) {
 		*action = ACTION_RUN_DAEMON;
 		rc = 0;
@@ -2042,6 +2625,7 @@ int main(int argc, char *argv[])
 		rc = parse_action(argv[optind], &action);
 		if (rc)
 			return EXIT_FAILURE;
+		optind++;
 	} else {
 		action = ACTION_RUN_DAEMON;
 	}
@@ -2057,41 +2641,40 @@ int main(int argc, char *argv[])
 		rc = run_prd_daemon(ctx);
 		break;
 	case ACTION_OCC_CONTROL:
-		if (optind + 1 >= argc) {
+		if (optind >= argc) {
 			pr_log(LOG_ERR, "CTRL: occ command requires "
 					"an argument");
 			return EXIT_FAILURE;
 		}
 
-		rc = send_occ_control(ctx, argv[optind + 1]);
+		rc = send_occ_control(ctx, argc - optind, &argv[optind]);
 		break;
 	case ACTION_ATTR_OVERRIDE:
-		if (optind + 1 >= argc) {
+		if (optind >= argc) {
 			pr_log(LOG_ERR, "CTRL: attribute override command "
 					"requires an argument");
 			return EXIT_FAILURE;
 		}
 
-		rc = send_attr_override(ctx, argc - optind - 1, &argv[optind + 1]);
+		rc = send_attr_override(ctx, argc - optind, &argv[optind]);
 		break;
 	case ACTION_HTMGT_PASSTHRU:
-		if (optind + 1 >= argc) {
+		if (optind >= argc) {
 			pr_log(LOG_ERR, "CTRL: htmgt passthru requires at least "
 					"one argument");
 			return EXIT_FAILURE;
 		}
 
-		rc = send_htmgt_passthru(ctx, argc - optind - 1,
-					 &argv[optind + 1]);
+		rc = send_htmgt_passthru(ctx, argc - optind, &argv[optind]);
 		break;
 	case ACTION_RUN_COMMAND:
-		if (optind + 1 >= argc) {
+		if (optind >= argc) {
 			pr_log(LOG_ERR, "CTRL: run command requires "
 					"argument(s)");
 			return EXIT_FAILURE;
 		}
 
-		rc = send_run_command(ctx, argc - optind - 1, &argv[optind + 1]);
+		rc = send_run_command(ctx, argc - optind, &argv[optind]);
 		break;
 	default:
 		break;

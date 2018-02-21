@@ -26,6 +26,11 @@
 #include <timebase.h>
 #include <device.h>
 #include <fsp-sysparam.h>
+#include <errorlog.h>
+
+DEFINE_LOG_ENTRY(OPAL_RC_CONSOLE_HANG, OPAL_PLATFORM_ERR_EVT, OPAL_CONSOLE,
+		 OPAL_PLATFORM_FIRMWARE,
+		 OPAL_PREDICTIVE_ERR_GENERAL, OPAL_NA);
 
 struct fsp_serbuf_hdr {
 	u16	partition_id;
@@ -56,10 +61,14 @@ struct fsp_serial {
 	struct fsp_msg		*poke_msg;
 	u8			waiting;
 	u64			irq;
+	u16			out_buf_prev_len;
+	u64			out_buf_timeout;
 };
 
 #define SER_BUFFER_SIZE 0x00040000UL
 #define MAX_SERIAL	4
+
+#define SER_BUFFER_OUT_TIMEOUT	10
 
 static struct fsp_serial fsp_serials[MAX_SERIAL];
 static bool got_intf_query;
@@ -87,6 +96,9 @@ static void fsp_console_reinit(void)
 	for (i = 0; i < MAX_SERIAL; i++) {
 		struct fsp_serial *fs = &fsp_serials[i];
 
+		if (!fs->available)
+			continue;
+
 		if (fs->rsrc_id == 0xffff)
 			continue;
 		prlog(PR_DEBUG, "FSP: Reassociating HVSI console %d\n", i);
@@ -112,9 +124,6 @@ static void fsp_close_consoles(void)
 		struct fsp_serial *fs = &fsp_serials[i];
 
 		if (!fs->available)
-			continue;
-
-		if (fs->rsrc_id == 0xffff)	/* Get clarity from benh */
 			continue;
 
 		lock(&fsp_con_lock);
@@ -145,7 +154,6 @@ static void fsp_pokemsg_reclaim(struct fsp_msg *msg)
 		if (fs->out_poke) {
 			if (fsp_queue_msg(fs->poke_msg, fsp_pokemsg_reclaim)) {
 				prerror("FSPCON: failed to queue poke msg\n");
-				fsp_freemsg(msg);
 			} else {
 				fs->out_poke = false;
 			}
@@ -194,7 +202,6 @@ static size_t fsp_write_vserial(struct fsp_serial *fs, const char *buf,
 #ifndef DISABLE_CON_PENDING_EVT
 	opal_update_pending_evt(OPAL_EVENT_CONSOLE_OUTPUT,
 				OPAL_EVENT_CONSOLE_OUTPUT);
-	opal_update_pending_evt(fs->irq, fs->irq);
 #endif
 	return len;
 }
@@ -288,11 +295,16 @@ static void fsp_open_vserial(struct fsp_msg *msg)
 		goto already_open;
 	}
 
-	fs->open = true;
-
 	fs->poke_msg = fsp_mkmsg(FSP_CMD_VSERIAL_OUT, 2,
 				 msg->data.words[0],
 				 msg->data.words[1] & 0xffff);
+	if (fs->poke_msg == NULL) {
+		prerror("FSPCON: Failed to allocate poke_msg\n");
+		unlock(&fsp_con_lock);
+		return;
+	}
+
+	fs->open = true;
 	fs->poke_msg->user_data = fs;
 
 	fs->in_buf->partition_id = fs->out_buf->partition_id = part_id;
@@ -307,6 +319,8 @@ static void fsp_open_vserial(struct fsp_msg *msg)
 	fs->in_buf->flags        = fs->out_buf->flags        = 0;
 	fs->in_buf->reserved     = fs->out_buf->reserved     = 0;
 	fs->in_buf->next_out     = fs->out_buf->next_out     = 0;
+	fs->out_buf_prev_len     = 0;
+	fs->out_buf_timeout      = 0;
 	unlock(&fsp_con_lock);
 
  already_open:
@@ -384,7 +398,7 @@ static void fsp_close_vserial(struct fsp_msg *msg)
 		set_console(NULL);
 	}
 #endif
-	
+
 	lock(&fsp_con_lock);
 	if (fs->open) {
 		fs->open = false;
@@ -598,6 +612,12 @@ static int64_t fsp_console_write(int64_t term_number, int64_t *length,
 		requested = 0x1000;
 	written = fsp_write_vserial(fs, buffer, requested);
 
+	if (written) {
+		/* If we wrote anything, reset timeout */
+		fs->out_buf_prev_len = 0;
+		fs->out_buf_timeout = 0;
+	}
+
 #ifdef OPAL_DEBUG_CONSOLE_IO
 	prlog(PR_TRACE, "OPAL: console write req=%ld written=%ld"
 	      " ni=%d no=%d\n",
@@ -612,12 +632,16 @@ static int64_t fsp_console_write(int64_t term_number, int64_t *length,
 	*length = written;
 	unlock(&fsp_con_lock);
 
-	return written ? OPAL_SUCCESS : OPAL_BUSY_EVENT;
+	if (written)
+		return OPAL_SUCCESS;
+
+	return OPAL_HARDWARE;
 }
 
 static int64_t fsp_console_write_buffer_space(int64_t term_number,
 					      int64_t *length)
 {
+	static bool elog_generated = false;
 	struct fsp_serial *fs;
 	struct fsp_serbuf_hdr *sb;
 
@@ -636,16 +660,51 @@ static int64_t fsp_console_write_buffer_space(int64_t term_number,
 		% SER_BUF_DATA_SIZE;
 	unlock(&fsp_con_lock);
 
-	return OPAL_SUCCESS;
+	/* Console buffer has enough space to write incoming data */
+	if (*length != fs->out_buf_prev_len) {
+		fs->out_buf_prev_len = *length;
+		fs->out_buf_timeout = 0;
+
+		return OPAL_SUCCESS;
+	}
+
+	/*
+	 * Buffer is full, start internal timer. We will continue returning
+	 * SUCCESS until timeout happens, hoping FSP will consume data within
+	 * timeout period.
+	 */
+	if (fs->out_buf_timeout == 0) {
+		fs->out_buf_timeout = mftb() +
+			secs_to_tb(SER_BUFFER_OUT_TIMEOUT);
+	}
+
+	if (tb_compare(mftb(), fs->out_buf_timeout) != TB_AAFTERB)
+		return OPAL_SUCCESS;
+
+	/*
+	 * FSP is still active but not reading console data. Hence
+	 * our console buffer became full. Most likely IPMI daemon
+	 * on FSP is buggy. Lets log error and return OPAL_RESOURCE
+	 * to payload (Linux).
+	 */
+	if (!elog_generated) {
+		elog_generated = true;
+		log_simple_error(&e_info(OPAL_RC_CONSOLE_HANG), "FSPCON: Console "
+				 "buffer is full, dropping console data\n");
+	}
+
+	/* Timeout happened. Lets drop incoming data */
+	return OPAL_RESOURCE;
 }
 
 static int64_t fsp_console_read(int64_t term_number, int64_t *length,
-				uint8_t *buffer __unused)
+				uint8_t *buffer)
 {
 	struct fsp_serial *fs;
 	struct fsp_serbuf_hdr *sb;
 	bool pending = false;
 	uint32_t old_nin, n, i, chunk, req = *length;
+	int rc = OPAL_SUCCESS;
 
 	if (term_number < 0 || term_number >= MAX_SERIAL)
 		return OPAL_PARAMETER;
@@ -654,8 +713,8 @@ static int64_t fsp_console_read(int64_t term_number, int64_t *length,
 		return OPAL_PARAMETER;
 	lock(&fsp_con_lock);
 	if (!fs->open) {
-		unlock(&fsp_con_lock);
-		return OPAL_CLOSED;
+		rc = OPAL_CLOSED;
+		goto clr_flag;
 	}
 	if (fs->waiting)
 		fs->waiting = 0;
@@ -686,6 +745,7 @@ static int64_t fsp_console_read(int64_t term_number, int64_t *length,
 	       buffer[4], buffer[5], buffer[6], buffer[7]);
 #endif /* OPAL_DEBUG_CONSOLE_IO */
 
+clr_flag:
 	/* Might clear the input pending flag */
 	for (i = 0; i < MAX_SERIAL && !pending; i++) {
 		struct fsp_serial *fs = &fsp_serials[i];
@@ -714,7 +774,7 @@ static int64_t fsp_console_read(int64_t term_number, int64_t *length,
 
 	unlock(&fsp_con_lock);
 
-	return OPAL_SUCCESS;
+	return rc;
 }
 
 void fsp_console_poll(void *data __unused)
@@ -747,12 +807,10 @@ void fsp_console_poll(void *data __unused)
 			if (!fs->open)
 				continue;
 			if (sb->next_out == sb->next_in) {
-				opal_update_pending_evt(fs->irq, 0);
 				continue;
 			}
 			if (fs->log_port) {
-				__flush_console(true);
-				opal_update_pending_evt(fs->irq, 0);
+				flush_console();
 			} else {
 #ifdef OPAL_DEBUG_CONSOLE_POLL
 				if (debug < 5) {
@@ -783,11 +841,6 @@ void fsp_console_init(void)
 	if (!fsp_present())
 		return;
 
-	opal_register(OPAL_CONSOLE_READ, fsp_console_read, 3);
-	opal_register(OPAL_CONSOLE_WRITE_BUFFER_SPACE,
-		      fsp_console_write_buffer_space, 2);
-	opal_register(OPAL_CONSOLE_WRITE, fsp_console_write, 3);
-
 	/* Wait until we got the intf query before moving on */
 	while (!got_intf_query)
 		opal_run_pollers();
@@ -816,7 +869,24 @@ void fsp_console_init(void)
 	}
 
 	op_display(OP_LOG, OP_MOD_FSPCON, 0x0005);
+
+	set_opal_console(&fsp_opal_con);
 }
+
+static int64_t fsp_console_flush(int64_t terminal __unused)
+{
+	/* FIXME: There's probably something we can do here... */
+	return OPAL_PARAMETER;
+}
+
+struct opal_con_ops fsp_opal_con = {
+	.name = "FSP OPAL console",
+	.init = NULL, /* all the required setup is done in fsp_console_init() */
+	.read = fsp_console_read,
+	.write = fsp_console_write,
+	.space = fsp_console_write_buffer_space,
+	.flush = fsp_console_flush,
+};
 
 static void flush_all_input(void)
 {
@@ -874,6 +944,10 @@ static void reopen_all_hvsi(void)
 
  	for (i = 0; i < MAX_SERIAL; i++) {
 		struct fsp_serial *fs = &fsp_serials[i];
+
+		if (!fs->available)
+			continue;
+
 		if (fs->rsrc_id == 0xffff)
 			continue;
 		prlog(PR_NOTICE, "FSP: Deassociating HVSI console %d\n", i);
@@ -882,6 +956,10 @@ static void reopen_all_hvsi(void)
 	}
  	for (i = 0; i < MAX_SERIAL; i++) {
 		struct fsp_serial *fs = &fsp_serials[i];
+
+		if (!fs->available)
+			continue;
+
 		if (fs->rsrc_id == 0xffff)
 			continue;
 		prlog(PR_NOTICE, "FSP: Reassociating HVSI console %d\n", i);
@@ -908,8 +986,6 @@ void fsp_console_reset(void)
 		return;
 
 	time_wait_ms(500);
-	
-	flush_all_input();
 
 	reopen_all_hvsi();
 
@@ -917,37 +993,29 @@ void fsp_console_reset(void)
 
 void fsp_console_add_nodes(void)
 {
+	struct dt_node *opal_event;
 	unsigned int i;
-	struct dt_node *consoles, *opal_event;
 
-	consoles = dt_new(opal_node, "consoles");
-	dt_add_property_cells(consoles, "#address-cells", 1);
-	dt_add_property_cells(consoles, "#size-cells", 0);
+	opal_event = dt_find_by_name(opal_node, "event");
+
 	for (i = 0; i < MAX_SERIAL; i++) {
 		struct fsp_serial *fs = &fsp_serials[i];
 		struct dt_node *fs_node;
-		char name[32];
+		const char *type;
 
 		if (fs->log_port || !fs->available)
 			continue;
 
-		snprintf(name, sizeof(name), "serial@%d", i);
-		fs_node = dt_new(consoles, name);
 		if (fs->rsrc_id == 0xffff)
-			dt_add_property_string(fs_node, "compatible",
-					       "ibm,opal-console-raw");
+			type = "raw";
 		else
-			dt_add_property_string(fs_node, "compatible",
-					       "ibm,opal-console-hvsi");
-		dt_add_property_cells(fs_node,
-				     "#write-buffer-size", SER_BUF_DATA_SIZE);
-		dt_add_property_cells(fs_node, "reg", i);
-		dt_add_property_string(fs_node, "device_type", "serial");
+			type = "hvsi";
+
+		fs_node = add_opal_console_node(i, type, SER_BUF_DATA_SIZE);
 
 		fs->irq = opal_dynamic_event_alloc();
 		dt_add_property_cells(fs_node, "interrupts", ilog2(fs->irq));
 
-		opal_event = dt_find_by_name(opal_node, "event");
 		if (opal_event)
 			dt_add_property_cells(fs_node, "interrupt-parent",
 					      opal_event->phandle);

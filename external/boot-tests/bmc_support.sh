@@ -19,6 +19,10 @@ STRIP_CONTROL=0
 # How do we SSH/SCP in?
 SSHCMD="sshpass -e ssh -l $SSHUSER -o LogLevel=quiet -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no $target";
 
+function sshcmd {
+	$SSHCMD $*;
+}
+
 # remotecp file target target_location
 function remotecp {
 	sshpass -e ssh -o User=$SSHUSER -o LogLevel=quiet -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no $2 dd of=$3 < $1;
@@ -132,6 +136,12 @@ function boot_firmware {
 }
 
 function machine_sanity_test {
+    sshcmd true;
+    if [ $? -ne 0 ]; then
+	echo "$target: Failed to SSH to $target..."
+        echo "$target: Command was: $SSHCMD true"
+	error "Try connecting manually to diagnose the issue."
+    fi
     # No further sanity tests for BMC machines.
     true
 }

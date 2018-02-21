@@ -38,14 +38,15 @@ related to the setup of DMA windows.
 Configuration Space Parameters
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-============ =============== =====
-============ =============== =====
-Vendor ID    0x1014          (IBM)
+============ =================== =====
+============ =================== =====
+Vendor ID    0x1014              (IBM)
 Device ID    0x04ea
 Revision ID  0x00
-Class        0x068000        (Bridge Device Other, ProgIf = 0x0)
+Class        0x068000 / 0x068001 (Bridge Device Other, ProgIf = 0x0 / 0x1)
 BAR0/1       TL/DL Registers
-============ =============== =====
+BAR2/3       GEN-ID Registers    (Only for rev-id = 0x1)
+============ =================== =====
 
 TL/DL Registers
 ^^^^^^^^^^^^^^^
@@ -58,6 +59,17 @@ to 64-bit BAR#0 of the emulated PCI device configuration space. ::
  BAR#0 + 64K  +-----------+
       	     | DL (64K)  |
  BAR#0	     +-----------+
+
+Generation Registers (GEN-ID)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+On POWER9 each link has 64K of generation ID registers for the relaxed
+ordering mode syncronisation. Refer to the programming guide for
+details of the register layout in this BAR.
+
+Relaxed ordering mode will be disabled by default as it requires
+device driver support. Device drivers will need to request relaxed
+ordering mode through some yet to be designed mechanism.
 
 Vendor Specific Capabilities
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -106,6 +118,7 @@ Procedure Control Register
     10. Naples NPU - RESET
     11. Naples PHY - PHY preterminate
     12. Naples PHY - PHY terminated
+    13. Witherspoon TL credit validation
 
    Procedure 5 (TX_ZCAL) should only be run once. System firmware will
    ensure this so device drivers may call this procedure mutiple
@@ -134,8 +147,8 @@ Procedure Status Register
 
 PCI Device Flag
 
-   Bit 0 is set only if an actual PCI device was bound to this
-   emulated device.
+   Bit 0 - set if the GPU PCIe device associated with this nvlink was found.
+   bit 1 - set if the DL has been taken out of reset.
 
 Link Number
 

@@ -57,8 +57,9 @@ static void real_free(void *p)
 #include <assert.h>
 #include <stdio.h>
 
-void lock(struct lock *l)
+void lock_caller(struct lock *l, const char *caller)
 {
+	(void)caller;
 	assert(!l->lock_val);
 	l->lock_val++;
 }
@@ -165,7 +166,7 @@ static void run_test(struct test *test)
 
 	/* create our reservations */
 	for (r = test->regions; r->start; r++)
-		mem_reserve_hw("r", r->start, r->end - r->start);
+		mem_reserve_fw("r", r->start, r->end - r->start);
 
 	reserved = mem_range_is_reserved(0x1000, 0x1000);
 

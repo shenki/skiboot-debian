@@ -21,6 +21,7 @@
 #include <stack.h>
 #include <mem_region.h>
 #include <unistd.h>
+#include <lock.h>
 
 #define STACK_BUF_ENTRIES	60
 static struct bt_entry bt_buf[STACK_BUF_ENTRIES];
@@ -58,8 +59,7 @@ void __print_backtrace(unsigned int pir,
 	static char bt_text_buf[4096];
 	int i, l = 0, max;
 	char *buf = out_buf;
-	unsigned long bottom, top, tbot, ttop, saddr = 0;
-	char *sym = NULL, *sym_end = NULL;
+	unsigned long bottom, top, tbot, ttop;
 	char mark;
 
 	if (!out_buf) {
@@ -81,20 +81,12 @@ void __print_backtrace(unsigned int pir,
 			mark = '*';
 		else
 			mark = ' ';
-		if (symbols)
-			saddr = get_symbol(entries->pc, &sym, &sym_end);
-		else
-			saddr = 0;
 		l += snprintf(buf + l, max - l,
 			      " S: %016lx R: %016lx %c ",
 			      entries->sp, entries->pc, mark);
-		while(saddr && sym < sym_end && l < max)
-			buf[l++] = *(sym++);
-		if (sym && l < max)
-			l += snprintf(buf + l, max - l, "+0x%lx\n",
-				      entries->pc - saddr);
-		else
-			l += snprintf(buf + l, max - l, "\n");
+		if (symbols)
+			l += snprintf_symbol(buf + l, max - l, entries->pc);
+		l += snprintf(buf + l, max - l, "\n");
 		entries++;
 	}
 	if (!out_buf)
@@ -104,12 +96,24 @@ void __print_backtrace(unsigned int pir,
 		*len = l;
 }
 
+/*
+ * To ensure that we always get backtrace output we bypass the usual console
+ * locking paths. The downside is that when multiple threads need to print
+ * a backtrace they garble each other. To prevent this we use a seperate
+ * lock to serialise printing of the dumps.
+ */
+struct lock bt_lock = LOCK_UNLOCKED;
+
 void backtrace(void)
 {
 	unsigned int ents = STACK_BUF_ENTRIES;
 
+	lock(&bt_lock);
+
 	__backtrace(bt_buf, &ents);
 	__print_backtrace(mfspr(SPR_PIR), bt_buf, ents, NULL, NULL, true);
+
+	unlock(&bt_lock);
 }
 
 void __nomcount __stack_chk_fail(void);

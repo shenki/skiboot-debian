@@ -63,8 +63,9 @@ static inline char *skiboot_strdup(const char *str)
 #include <assert.h>
 #include <stdio.h>
 
-void lock(struct lock *l)
+void lock_caller(struct lock *l, const char *caller)
 {
+	(void)caller;
 	assert(!l->lock_val);
 	l->lock_val = 1;
 }
@@ -105,7 +106,7 @@ static void add_mem_node(uint64_t start, uint64_t len)
 	free(name);
 }
 
-void add_chip_dev_associativity(struct dt_node *dev __attribute__((unused)))
+void __attrconst add_chip_dev_associativity(struct dt_node *dev __attribute__((unused)))
 {
 }
 

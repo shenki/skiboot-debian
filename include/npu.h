@@ -30,15 +30,6 @@
 #define NPU_BRICK_TL_BAR_SIZE	0x20000
 #define NPU_BRICK_PL_BAR_SIZE	0x200000
 
-/* The config space of NPU device is emulated. We have different
- * bits to represent config register properties: readonly, write-
- * one-to-clear.
- */
-#define NPU_DEV_CFG_NORMAL      0
-#define NPU_DEV_CFG_RDONLY      1
-#define NPU_DEV_CFG_W1CLR       2
-#define NPU_DEV_CFG_MAX         3
-
 /* Bytes of the emulated NPU PCI device config space. We are
  * emulating PCI express device, not legacy one
  */
@@ -72,23 +63,6 @@ struct npu_dev_cap {
 	uint16_t		end;
 	struct npu_dev		*dev;
 	void			(*populate)(struct npu_dev_cap *cap);
-	struct list_node	link;
-};
-
-/* Config space access trap. */
-struct npu_dev_trap {
-	struct npu_dev		*dev;
-	uint32_t		start;
-	uint32_t		end;
-	void			*data;
-	int64_t			(*read)(struct npu_dev_trap *trap,
-					uint32_t offset,
-					uint32_t size,
-					uint32_t *data);
-	int64_t			(*write)(struct npu_dev_trap *trap,
-					 uint32_t offset,
-					 uint32_t size,
-					 uint32_t data);
 	struct list_node	link;
 };
 
@@ -193,6 +167,7 @@ int64_t npu_dev_procedure(void *dev, struct pci_cfg_reg_filter *pcrf,
 			  bool write);
 
 void npu_set_fence_state(struct npu *p, bool fence);
+void npu_dev_procedure_reset(struct npu_dev *dev);
 
 #define NPUDBG(p, fmt, a...)	prlog(PR_DEBUG, "NPU%d: " fmt, \
 				      (p)->phb.opal_id, ##a)

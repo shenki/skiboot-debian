@@ -22,11 +22,15 @@ Each node has a minimum set of properties describing the sensor :
 
 - a "sensor-data" property giving a unique handler for the
   OPAL_SENSOR_READ call to be used by Linux to get the value of
-  a sensor attribute. A sensor handler has the following encoding : ::
+  a sensor attribute. This value is opaque to the OS but is *currently*
+  constructed using the following encoding : ::
 
-		|  Attr. |  Res.  |   Resource     |
-		| Number | Class  |      Id        |
-		|--------|--------|----------------|
+		|  Attr. |Fam|Res. |   Resource     |
+		| Number |ily|Class|      Id        |
+		|--------|---|-----|----------------|
+
+  The sensor family (FSP, DTS, etc) is used to dispatch the call to
+  the appriopriate skiboot component.
 
 - a "sensor-status" property giving the state of the sensor. The
   status bits have the slightly meanings depending on the resource

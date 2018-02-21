@@ -64,6 +64,7 @@ struct i2c_request {
 	void			(*completion)(	/* Completion callback */
 					      int rc, struct i2c_request *req);
 	void			*user_data;	/* Client data */
+	int			retries;
 };
 
 /* Generic i2c */
@@ -106,8 +107,16 @@ static inline int i2c_check_quirk(struct i2c_request *req, int *rc)
 	return 0;
 }
 
+/* I2C synchronous request API */
+int i2c_request_send(int bus_id, int dev_addr, int read_write,
+		     uint32_t offset, uint32_t offset_bytes, void* buf,
+		     size_t buflen, int timeout);
+
 /* P8 implementation details */
 extern void p8_i2c_init(void);
 extern void p8_i2c_interrupt(uint32_t chip_id);
+
+/* P9 I2C Ownership Change OCC interrupt handler */
+extern void p9_i2c_bus_owner_change(u32 chip_id);
 
 #endif /* __I2C_H */

@@ -44,6 +44,8 @@
  */
 #define STACK_WARNING_GAP	2048
 
+#define STACK_CHECK_GUARD_BASE	0xdeadf00dbaad300
+
 #ifndef __ASSEMBLY__
 
 #include <stdint.h>
@@ -84,6 +86,7 @@ struct stack_frame {
 	 */
 	uint32_t	cr;
 	uint32_t	xer;
+	uint32_t	dsisr;
 	uint64_t	ctr;
 	uint64_t	lr;
 	uint64_t	pc;
@@ -92,6 +95,7 @@ struct stack_frame {
 	uint64_t	srr1;
 	uint64_t	hsrr0;
 	uint64_t	hsrr1;
+	uint64_t	dar;
 } __attribute__((aligned(16)));
 
 /* Backtrace */
