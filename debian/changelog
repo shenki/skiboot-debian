@@ -1,3 +1,24 @@
+skiboot (5.10~rc4-1) unstable; urgency=medium
+
+  * New upstream version 5.10~rc4 (Closes: LP: #1744710)
+  * Improve watch file
+  * Add gbp configuration locally
+  * Rediff patches
+  * Update maintainer information
+  * Use https instead of https where available
+  * Add Vcs-* URI on salsa.debian.org
+  * Remove default PNOR device since autodetected now
+  * Remove upstart support
+  * Install man pages from the source
+  * Add getsram utility in the package (Closes: #874386)
+  * Avoid running tests on unsupported platforms
+  * Make use of Debian provided DEB_VERSION_UPSTREAM
+  * Improve logging support
+  * Bump Standards-Version (upstart support dropped)
+  * Bump compatibility level to 11 (dh systemd addon removed)
+
+ -- Frédéric Bonnard <frediz@debian.org>  Thu, 22 Feb 2018 16:09:32 +0100
+
 skiboot (5.4.3-1) unstable; urgency=medium
 
   * New upstream release
