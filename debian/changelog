@@ -1,3 +1,9 @@
+skiboot (5.10~rc4-2) unstable; urgency=medium
+
+  * Fix opal-prd spinning and consuming 100% CPU
+
+ -- Frédéric Bonnard <frediz@debian.org>  Tue, 24 Apr 2018 13:12:19 +0200
+
 skiboot (5.10~rc4-1) unstable; urgency=medium
 
   * New upstream version 5.10~rc4 (Closes: LP: #1744710)
