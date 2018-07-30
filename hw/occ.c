@@ -31,7 +31,7 @@
 #include <powercap.h>
 #include <psr.h>
 #include <sensor.h>
-#include <occ-sensor.h>
+#include <occ.h>
 
 /* OCC Communication Area for PStates */
 
@@ -66,7 +66,7 @@
  *
  * struct occ_pstate_table -	Pstate table layout
  * @valid:			Indicates if data is valid
- * @version:			Layout version
+ * @version:			Layout version [Major/Minor]
  * @v2.throttle:		Reason for limiting the max pstate
  * @v9.occ_role:		OCC role (Master/Slave)
  * @v#.pstate_min:		Minimum pstate ever allowed
@@ -212,6 +212,11 @@ struct occ_response_buffer {
  *
  * struct occ_dynamic_data -	Contains runtime attributes
  * @occ_state:			Current state of OCC
+ * @major_version:		Major version number
+ * @minor_version:		Minor version number (backwards compatible)
+ *				Version 1 indicates GPU presence populated
+ * @gpus_present:		Bitmask of GPUs present (on systems where GPU
+ *				presence is detected through APSS)
  * @cpu_throttle:		Reason for limiting the max pstate
  * @mem_throttle:		Reason for throttling memory
  * @quick_pwr_drop:		Indicates if QPD is asserted
@@ -229,10 +234,10 @@ struct occ_response_buffer {
  */
 struct occ_dynamic_data {
 	u8 occ_state;
+	u8 major_version;
+	u8 minor_version;
+	u8 gpus_present;
 	u8 spare1;
-	u8 spare2;
-	u8 spare3;
-	u8 spare4;
 	u8 cpu_throttle;
 	u8 mem_throttle;
 	u8 quick_pwr_drop;
@@ -488,7 +493,7 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 	int pmax, pmin, pnom;
 	u8 nr_pstates;
 	bool ultra_turbo_supported;
-	int i;
+	int i, major, minor;
 
 	prlog(PR_DEBUG, "OCC: CPU pstate state device tree init\n");
 
@@ -526,12 +531,12 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 	 */
 	ultra_turbo_supported = true;
 
+	major = occ_data->version >> 4;
+	minor = occ_data->version & 0xF;
+
 	/* Parse Pmax, Pmin and Pnominal */
-	switch (occ_data->version) {
-	case 0x01:
-		ultra_turbo_supported = false;
-		/* fallthrough */
-	case 0x02:
+	switch (major) {
+	case 0:
 		if (proc_gen == proc_gen_p9) {
 			/**
 			 * @fwts-label OCCInvalidVersion02
@@ -544,6 +549,8 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 				occ_data->version);
 			return false;
 		}
+		if (minor == 0x1)
+			ultra_turbo_supported = false;
 		pmin = occ_data->v2.pstate_min;
 		pnom = occ_data->v2.pstate_nom;
 		if (ultra_turbo_supported)
@@ -551,7 +558,7 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 		else
 			pmax = occ_data->v2.pstate_turbo;
 		break;
-	case 0x90:
+	case 0x9:
 		if (proc_gen == proc_gen_p8) {
 			/**
 			 * @fwts-label OCCInvalidVersion90
@@ -613,9 +620,8 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 	nr_pstates = labs(pmax - pmin) + 1;
 	prlog(PR_DEBUG, "OCC: Version %x Min %d Nom %d Max %d Nr States %d\n",
 	      occ_data->version, pmin, pnom, pmax, nr_pstates);
-	if ((occ_data->version == 0x90 && (nr_pstates <= 1)) ||
-	    (occ_data->version <= 0x02 &&
-	     (nr_pstates <= 1 || nr_pstates > 128))) {
+	if ((major == 0x9 && nr_pstates <= 1) ||
+	    (major == 0 && (nr_pstates <= 1 || nr_pstates > 128))) {
 		/**
 		 * @fwts-label OCCInvalidPStateRange
 		 * @fwts-advice The number of pstates is outside the valid
@@ -647,13 +653,12 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 	dt_freq = malloc(nr_pstates * sizeof(u32));
 	assert(dt_freq);
 
-	switch (occ_data->version) {
-	case 0x01:
-	case 0x02:
+	switch (major) {
+	case 0:
 		parse_pstates_v2(occ_data, dt_id, dt_freq, nr_pstates,
 				 pmax, pmin);
 		break;
-	case 0x90:
+	case 0x9:
 		parse_pstates_v9(occ_data, dt_id, dt_freq, nr_pstates,
 				 pmax, pmin);
 		break;
@@ -685,14 +690,14 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 
 		dt_cmax = malloc(nr_cores * sizeof(u32));
 		assert(dt_cmax);
-		switch (occ_data->version) {
-		case 0x02:
+		switch (major) {
+		case 0:
 			pturbo = occ_data->v2.pstate_turbo;
 			pultra_turbo = occ_data->v2.pstate_ultra_turbo;
 			for (i = 0; i < nr_cores; i++)
 				dt_cmax[i] = occ_data->v2.core_max[i];
 			break;
-		case 0x90:
+		case 0x9:
 			pturbo = occ_data->v9.pstate_turbo;
 			pultra_turbo = occ_data->v9.pstate_ultra_turbo;
 			for (i = 0; i < nr_cores; i++)
@@ -720,7 +725,7 @@ static bool add_cpu_pstate_properties(int *pstate_nom)
 		free(dt_cmax);
 	}
 
-	if (occ_data->version > 0x02)
+	if (major == 0x9)
 		goto out;
 
 	dt_add_property_cells(power_mgt, "#address-cells", 2);
@@ -862,11 +867,10 @@ static inline u8 get_cpu_throttle(struct proc_chip *chip)
 	struct occ_pstate_table *pdata = get_occ_pstate_table(chip);
 	struct occ_dynamic_data *data;
 
-	switch (pdata->version) {
-	case 0x01:
-	case 0x02:
+	switch (pdata->version >> 4) {
+	case 0:
 		return pdata->v2.throttle;
-	case 0x90:
+	case 0x9:
 		data = get_occ_dynamic_data(chip);
 		return data->cpu_throttle;
 	default:
@@ -1231,6 +1235,23 @@ exit:
 	unlock(&chip->queue_lock);
 }
 
+bool occ_get_gpu_presence(struct proc_chip *chip, int gpu_num)
+{
+	struct occ_dynamic_data *ddata;
+
+	assert(gpu_num <= 2);
+
+	ddata = get_occ_dynamic_data(chip);
+
+	if (ddata->major_version != 0 || ddata->minor_version < 1) {
+		prlog(PR_INFO, "OCC: OCC not reporting GPU slot presence, "
+		      "assuming device is present\n");
+		return true;
+	}
+
+	return (bool)(ddata->gpus_present & 1 << gpu_num);
+}
+
 static void occ_add_powercap_sensors(struct dt_node *power_mgt);
 static void occ_add_psr_sensors(struct dt_node *power_mgt);
 
@@ -1242,9 +1263,16 @@ static void occ_cmd_interface_init(void)
 	struct proc_chip *chip;
 	int i = 0;
 
+	/* Check if the OCC data is valid */
+	for_each_chip(chip) {
+		pdata = get_occ_pstate_table(chip);
+		if (!pdata->valid)
+			return;
+	}
+
 	chip = next_chip(NULL);
 	pdata = get_occ_pstate_table(chip);
-	if (pdata->version != 0x90)
+	if ((pdata->version >> 4) != 0x9)
 		return;
 
 	for_each_chip(chip)
@@ -1364,6 +1392,9 @@ int occ_set_powercap(u32 handle, int token, u32 pcap)
 
 	if (powercap_get_attr(handle) != POWERCAP_OCC_CUR)
 		return OPAL_PERMISSION;
+
+	if (!chips)
+		return OPAL_HARDWARE;
 
 	for (i = 0; i < nr_occs; i++)
 		if (chips[i].occ_role == OCC_ROLE_MASTER)
@@ -1580,13 +1611,13 @@ void occ_add_sensor_groups(struct dt_node *sg, u32 *phandles, u32 *ptype,
 		{ OCC_SENSOR_TYPE_GENERIC, "generic",
 		  OPAL_SENSOR_GROUP_ENABLE
 		},
-		{ OCC_SENSOR_TYPE_CURRENT, "current",
+		{ OCC_SENSOR_TYPE_CURRENT, "curr",
 		  OPAL_SENSOR_GROUP_ENABLE
 		},
-		{ OCC_SENSOR_TYPE_VOLTAGE, "voltage",
+		{ OCC_SENSOR_TYPE_VOLTAGE, "in",
 		  OPAL_SENSOR_GROUP_ENABLE
 		},
-		{ OCC_SENSOR_TYPE_TEMPERATURE, "temperature",
+		{ OCC_SENSOR_TYPE_TEMPERATURE, "temp",
 		  OPAL_SENSOR_GROUP_ENABLE
 		},
 		{ OCC_SENSOR_TYPE_UTILIZATION, "utilization",
@@ -1606,6 +1637,12 @@ void occ_add_sensor_groups(struct dt_node *sg, u32 *phandles, u32 *ptype,
 		},
 	};
 	int i, j;
+
+	/*
+	 * Dont add sensor groups if cmd-interface is not intialized
+	 */
+	if (!chips)
+		return;
 
 	for (i = 0; i < nr_occs; i++)
 		if (chips[i].chip_id == chipid)
@@ -1627,6 +1664,17 @@ void occ_add_sensor_groups(struct dt_node *sg, u32 *phandles, u32 *ptype,
 
 		dt_add_property_cells(node, "sensor-group-id", handle);
 		dt_add_property_string(node, "type", groups[j].str);
+
+		if (groups[j].type == OCC_SENSOR_TYPE_CURRENT ||
+		    groups[j].type == OCC_SENSOR_TYPE_VOLTAGE ||
+		    groups[j].type == OCC_SENSOR_TYPE_TEMPERATURE ||
+		    groups[j].type == OCC_SENSOR_TYPE_POWER) {
+			dt_add_property_string(node, "sensor-type",
+					      groups[j].str);
+			dt_add_property_string(node, "compatible",
+					       "ibm,opal-sensor");
+		}
+
 		dt_add_property_cells(node, "ibm,chip-id", chipid);
 		dt_add_property_cells(node, "reg", handle);
 		if (groups[j].ops == OPAL_SENSOR_GROUP_ENABLE) {
@@ -1640,11 +1688,11 @@ void occ_add_sensor_groups(struct dt_node *sg, u32 *phandles, u32 *ptype,
 					_phandles[pcount++] = phandles[k];
 			if (pcount)
 				dt_add_property(node, "sensors", _phandles,
-						pcount);
+						pcount * sizeof(u32));
 			free(_phandles);
 		} else {
 			dt_add_property(node, "sensors", phandles,
-					nr_phandles);
+					nr_phandles * sizeof(u32));
 		}
 		dt_add_property_cells(node, "ops", groups[j].ops);
 	}
@@ -1664,7 +1712,7 @@ void occ_pstates_init(void)
 		return;
 	/* Handle fast reboots */
 	if (occ_pstates_initialized) {
-		struct dt_node *power_mgt;
+		struct dt_node *power_mgt, *child;
 		int i;
 		const char *props[] = {
 				"ibm,pstate-core-max",
@@ -1680,8 +1728,14 @@ void occ_pstates_init(void)
 				};
 
 		power_mgt = dt_find_by_path(dt_root, "/ibm,opal/power-mgt");
-		for (i = 0; i < ARRAY_SIZE(props); i++)
-			dt_check_del_prop(power_mgt, props[i]);
+		if (power_mgt) {
+			for (i = 0; i < ARRAY_SIZE(props); i++)
+				dt_check_del_prop(power_mgt, props[i]);
+
+			dt_for_each_child(power_mgt, child)
+				if (!strncmp(child->name, "occ", 3))
+					dt_free(child);
+		}
 	}
 
 	switch (proc_gen) {
@@ -1717,14 +1771,11 @@ void occ_pstates_init(void)
 	if (!add_cpu_pstate_properties(&pstate_nom)) {
 		log_simple_error(&e_info(OPAL_RC_OCC_PSTATE_INIT),
 			"Skiping core cpufreq init due to OCC error\n");
-		return;
-	}
-
-	/*
-	 * Setup host based pstates and set nominal frequency only in
-	 * P8.
-	 */
-	if (proc_gen == proc_gen_p8) {
+	} else if (proc_gen == proc_gen_p8) {
+		/*
+		 * Setup host based pstates and set nominal frequency only in
+		 * P8.
+		 */
 		for_each_chip(chip)
 			for_each_available_core_in_chip(c, chip->id)
 				cpu_pstates_prepare_core(chip, c, pstate_nom);

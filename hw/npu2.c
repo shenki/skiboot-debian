@@ -1,4 +1,4 @@
-/* Copyright 2013-2016 IBM Corp.
+/* Copyright 2013-2018 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,111 +64,19 @@
  * configure one particular BAR.
  */
 
-static bool is_p9dd1(void)
-{
-	struct proc_chip *chip = next_chip(NULL);
-
-	return chip &&
-	       (chip->type == PROC_CHIP_P9_NIMBUS ||
-		chip->type == PROC_CHIP_P9_CUMULUS) &&
-	       (chip->ec_level & 0xf0) == 0x10;
-}
-
-/*
- * We use the indirect method because it uses the same addresses as
- * the MMIO offsets (NPU RING)
- */
-static void npu2_scom_set_addr(uint64_t gcid, uint64_t scom_base,
-			       uint64_t addr, uint64_t size)
-{
-	uint64_t isa = is_p9dd1() ? NPU2_DD1_MISC_SCOM_IND_SCOM_ADDR :
-				    NPU2_MISC_SCOM_IND_SCOM_ADDR;
-
-	addr = SETFIELD(NPU2_MISC_DA_ADDR, 0ull, addr);
-	addr = SETFIELD(NPU2_MISC_DA_LEN, addr, size);
-	xscom_write(gcid, scom_base + isa, addr);
-}
-
-static void npu2_scom_write(uint64_t gcid, uint64_t scom_base,
-			    uint64_t reg, uint64_t size,
-			    uint64_t val)
-{
-	uint64_t isd = is_p9dd1() ? NPU2_DD1_MISC_SCOM_IND_SCOM_DATA :
-				    NPU2_MISC_SCOM_IND_SCOM_DATA;
-
-	npu2_scom_set_addr(gcid, scom_base, reg, size);
-	xscom_write(gcid, scom_base + isd, val);
-}
-
-static uint64_t npu2_scom_read(uint64_t gcid, uint64_t scom_base,
-			       uint64_t reg, uint64_t size)
-{
-	uint64_t val;
-	uint64_t isd = is_p9dd1() ? NPU2_DD1_MISC_SCOM_IND_SCOM_DATA :
-				    NPU2_MISC_SCOM_IND_SCOM_DATA;
-
-	npu2_scom_set_addr(gcid, scom_base, reg, size);
-	xscom_read(gcid, scom_base + isd, &val);
-
-	return val;
-}
-
-void npu2_write_4b(struct npu2 *p, uint64_t reg, uint32_t val)
-{
-	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_4B,
-			(uint64_t)val << 32);
-}
-
-uint32_t npu2_read_4b(struct npu2 *p, uint64_t reg)
-{
-	return npu2_scom_read(p->chip_id, p->xscom_base, reg,
-			      NPU2_MISC_DA_LEN_4B) >> 32;
-}
-
-void npu2_write(struct npu2 *p, uint64_t reg, uint64_t val)
-{
-	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_8B, val);
-}
-
-uint64_t npu2_read(struct npu2 *p, uint64_t reg)
-{
-	return npu2_scom_read(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_8B);
-}
-
-void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask)
-{
-	uint64_t new_val;
-
-	new_val = npu2_read(p, reg);
-	new_val &= ~mask;
-	new_val |= val & mask;
-	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_8B, new_val);
-}
-
-void npu2_write_mask_4b(struct npu2 *p, uint64_t reg, uint32_t val, uint32_t mask)
-{
-	uint32_t new_val;
-
-	new_val = npu2_read_4b(p, reg);
-	new_val &= ~mask;
-	new_val |= val & mask;
-	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_4B,
-			(uint64_t)new_val << 32);
-}
-
 /* Set a specific flag in the vendor config space */
 void npu2_set_link_flag(struct npu2_dev *ndev, uint8_t flag)
 {
-	ndev->link_flags |= flag;
-	PCI_VIRT_CFG_INIT_RO(ndev->pvd, VENDOR_CAP_START +
-			     VENDOR_CAP_PCI_DEV_OFFSET, 1, ndev->link_flags);
+	ndev->nvlink.link_flags |= flag;
+	PCI_VIRT_CFG_INIT_RO(ndev->nvlink.pvd, VENDOR_CAP_START +
+			     VENDOR_CAP_PCI_DEV_OFFSET, 1, ndev->nvlink.link_flags);
 }
 
 void npu2_clear_link_flag(struct npu2_dev *ndev, uint8_t flag)
 {
-	ndev->link_flags &= ~flag;
-	PCI_VIRT_CFG_INIT_RO(ndev->pvd, VENDOR_CAP_START +
-			     VENDOR_CAP_PCI_DEV_OFFSET, 1, ndev->link_flags);
+	ndev->nvlink.link_flags &= ~flag;
+	PCI_VIRT_CFG_INIT_RO(ndev->nvlink.pvd, VENDOR_CAP_START +
+			     VENDOR_CAP_PCI_DEV_OFFSET, 1, ndev->nvlink.link_flags);
 }
 
 static inline void npu2_ioda_sel(struct npu2 *p, uint32_t table,
@@ -189,7 +97,7 @@ static struct npu2_dev *npu2_bdf_to_dev(struct npu2 *p,
 	if (bdfn & ~0xff)
 		return NULL;
 
-	pvd = pci_virt_find_device(&p->phb, bdfn);
+	pvd = pci_virt_find_device(&p->phb_nvlink, bdfn);
 	if (pvd)
 		return pvd->data;
 
@@ -224,11 +132,7 @@ static void npu2_read_bar(struct npu2 *p, struct npu2_bar *bar)
 	case NPU2_NTL1_BAR:
 		bar->base = GETFIELD(NPU2_NTL_BAR_ADDR, val) << 16;
 		enabled = GETFIELD(NPU2_NTL_BAR_ENABLE, val);
-
-		if (is_p9dd1())
-			bar->size = 0x20000;
-		else
-			bar->size = 0x10000 << GETFIELD(NPU2_NTL_BAR_SIZE, val);
+		bar->size = 0x10000 << GETFIELD(NPU2_NTL_BAR_SIZE, val);
 		break;
 	case NPU2_GENID_BAR:
 		bar->base = GETFIELD(NPU2_GENID_BAR_ADDR, val) << 16;
@@ -262,9 +166,7 @@ static void npu2_write_bar(struct npu2 *p,
 	case NPU2_NTL1_BAR:
 		val = SETFIELD(NPU2_NTL_BAR_ADDR, 0ul, bar->base >> 16);
 		val = SETFIELD(NPU2_NTL_BAR_ENABLE, val, enable);
-
-		if (!is_p9dd1())
-			val = SETFIELD(NPU2_NTL_BAR_SIZE, val, 1);
+		val = SETFIELD(NPU2_NTL_BAR_SIZE, val, 1);
 		break;
 	case NPU2_GENID_BAR:
 		val = SETFIELD(NPU2_GENID_BAR_ADDR, 0ul, bar->base >> 16);
@@ -362,7 +264,7 @@ static int64_t npu2_cfg_write_bar(struct npu2_dev *dev,
 				  uint32_t offset, uint32_t size,
 				  uint32_t data)
 {
-	struct pci_virt_device *pvd = dev->pvd;
+	struct pci_virt_device *pvd = dev->nvlink.pvd;
 	struct npu2_pcie_bar *bar = (struct npu2_pcie_bar *) pcrf->data;
 	struct npu2_bar old_bar, *npu2_bar = &bar->npu2_bar;
 	uint32_t pci_cmd;
@@ -435,7 +337,7 @@ static int64_t npu2_dev_cfg_exp_devcap(void *dev,
 	if ((size != 2) || (offset & 1)) {
 		/* Short config writes are not supported */
 		prlog(PR_ERR, "NPU%d: Unsupported write to pcie control register\n",
-		      ndev->phb->opal_id);
+		      ndev->nvlink.phb->opal_id);
 		return OPAL_PARAMETER;
 	}
 
@@ -490,18 +392,18 @@ static int __npu2_dev_bind_pci_dev(struct phb *phb __unused,
 
 	/* Find the PCI device's slot location */
 	for (pci_dt_node = pd->dn;
-	     pci_dt_node && !dt_find_property(pci_dt_node, "ibm,slot-label");
+	     pci_dt_node && !dt_find_property(pci_dt_node, "ibm,loc-code");
 	     pci_dt_node = pci_dt_node->parent);
 
 	if (!pci_dt_node)
 		return 0;
 
-	pcislot = (char *)dt_prop_get(pci_dt_node, "ibm,slot-label");
+	pcislot = (char *)dt_prop_get(pci_dt_node, "ibm,loc-code");
 
-	prlog(PR_DEBUG, "NPU2: comparing GPU '%s' and NPU2 '%s'\n",
-	      pcislot, dev->slot_label);
+	NPU2DEVDBG(dev, "Comparing GPU '%s' and NPU2 '%s'\n",
+		   pcislot, dev->nvlink.slot_label);
 
-	if (streq(pcislot, dev->slot_label))
+	if (streq(pcislot, dev->nvlink.slot_label))
 		return 1;
 
 	return 0;
@@ -512,28 +414,28 @@ static void npu2_dev_bind_pci_dev(struct npu2_dev *dev)
 	struct phb *phb;
 	uint32_t i;
 
-	if (dev->pd)
+	if (dev->nvlink.pd)
 		return;
 
 	for (i = 0; i < 64; i++) {
-		if (dev->npu->phb.opal_id == i)
+		if (dev->npu->phb_nvlink.opal_id == i)
 			continue;
 
 		phb = pci_get_phb(i);
 		if (!phb)
 			continue;
 
-		dev->pd = pci_walk_dev(phb, NULL, __npu2_dev_bind_pci_dev, dev);
-		if (dev->pd) {
-			dev->phb = phb;
+		dev->nvlink.pd = pci_walk_dev(phb, NULL, __npu2_dev_bind_pci_dev, dev);
+		if (dev->nvlink.pd) {
+			dev->nvlink.phb = phb;
 			/* Found the device, set the bit in config space */
 			npu2_set_link_flag(dev, NPU2_DEV_PCI_LINKED);
 			return;
 		}
 	}
 
-	prlog(PR_INFO, "%s: No PCI device for NPU2 device %04x:00:%02x.0 to bind to. If you expect a GPU to be there, this is a problem.\n",
-	      __func__, dev->npu->phb.opal_id, dev->index);
+	NPU2DEVINF(dev, "No PCI device found for slot '%s'\n",
+		   dev->nvlink.slot_label);
 }
 
 static struct lock pci_npu_phandle_lock = LOCK_UNLOCKED;
@@ -636,7 +538,7 @@ static int npu2_assign_gmb(struct npu2_dev *ndev)
 	struct npu2 *p = ndev->npu;
 	int peers, mode;
 	uint32_t bdfn;
-	uint64_t base, size, reg, val, old_val, gmb;
+	uint64_t base, size, reg, val, gmb;
 
 	/* Need to work out number of link peers. This amount to
 	 * working out the maximum function number. So work start at
@@ -688,19 +590,11 @@ static int npu2_assign_gmb(struct npu2_dev *ndev)
 	val = SETFIELD(NPU2_MEM_BAR_MODE, val, mode);
 
 	gmb = NPU2_GPU0_MEM_BAR;
-	if (NPU2DEV_BRICK(ndev) && !is_p9dd1())
+	if (NPU2DEV_BRICK(ndev))
 		gmb = NPU2_GPU1_MEM_BAR;
 
 	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
 			      NPU2_BLOCK_SM_0, gmb);
-
-	if (is_p9dd1()) {
-		old_val = npu2_read(p, reg);
-		if (NPU2DEV_BRICK(ndev))
-			val = SETFIELD(PPC_BITMASK(32, 63), old_val, val >> 32);
-		else
-			val = SETFIELD(PPC_BITMASK(0, 31), old_val, val >> 32);
-	}
 
 	npu2_write(p, reg, val);
 	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
@@ -720,14 +614,14 @@ static int npu2_dn_fixup(struct phb *phb,
 			 struct pci_device *pd,
 			 void *data __unused)
 {
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p = phb_to_npu2_nvlink(phb);
 	struct npu2_dev *dev;
 	uint32_t speed;
 	const char *label;
 
 	dev = npu2_bdf_to_dev(p, pd->bdfn);
 	assert(dev);
-	if (dev->phb || dev->pd)
+	if (dev->nvlink.phb || dev->nvlink.pd)
 		return 0;
 
 	npu2_assign_gmb(dev);
@@ -745,29 +639,23 @@ static int npu2_dn_fixup(struct phb *phb,
 		dt_add_property_cells(pd->dn, "ibm,nvlink-speed", speed);
 
 	/*
-	 * NPU2 devices require a slot location to associate with GPUs.
-	 * This can be added via the slot table matching, otherwise we
-	 * read it from the link node.
+	 * NPU2 devices have a slot label that indicates which GPU slot
+	 * this NPU is connected to. Add a location code to the NVlink
+	 * device node based on the slot label.
 	 */
-	label = dt_prop_get_def(pd->dn, "ibm,slot-label", NULL);
-
-	if (!label) {
-		label = dt_prop_get_def(dev->dt_node, "ibm,slot-label", NULL);
-		if (label)
-			dt_add_property_string(pd->dn, "ibm,slot-label", label);
-	}
-
+	label = dt_prop_get_def(dev->dt_node, "ibm,slot-label", NULL);
 	if (!label) {
 		/**
 		 * @fwts-label NPUNoPHBSlotLabel
 		 * @fwts-advice No GPU/NPU2 slot information was found.
 		 * NVLink2 functionality will not work.
 		 */
-		prlog(PR_ERR, "NPU2: Cannot find GPU slot information\n");
+		prlog(PR_ERR, "NPU: Cannot find GPU slot information\n");
 		return 0;
 	}
+	dt_add_property_string(pd->dn, "ibm,loc-code", label);
 
-	dev->slot_label = label;
+	dev->nvlink.slot_label = label;
 
 	/*
 	 * Bind the emulated PCI device with the real one, which can't
@@ -776,22 +664,86 @@ static int npu2_dn_fixup(struct phb *phb,
 	 * for it
 	 */
 	npu2_dev_bind_pci_dev(dev);
-	if (dev->phb && dev->pd && dev->pd->dn) {
-		if (dt_find_property(dev->pd->dn, "ibm,npu"))
-			npu2_append_phandle(dev->pd->dn, pd->dn->phandle);
+	if (dev->nvlink.phb && dev->nvlink.pd && dev->nvlink.pd->dn) {
+		if (dt_find_property(dev->nvlink.pd->dn, "ibm,npu"))
+			npu2_append_phandle(dev->nvlink.pd->dn, pd->dn->phandle);
 		else
-			dt_add_property_cells(dev->pd->dn, "ibm,npu", pd->dn->phandle);
+			dt_add_property_cells(dev->nvlink.pd->dn, "ibm,npu", pd->dn->phandle);
 
-		dt_add_property_cells(pd->dn, "ibm,gpu", dev->pd->dn->phandle);
-		dev->gpu_bdfn = dev->pd->bdfn;
+		dt_add_property_cells(pd->dn, "ibm,gpu", dev->nvlink.pd->dn->phandle);
+		dev->nvlink.gpu_bdfn = dev->nvlink.pd->bdfn;
 	}
 
 	return 0;
 }
 
+static int npu2_links_per_gpu(struct phb *phb,
+			      struct pci_device *pd,
+			      void *data)
+{
+	struct npu2 *p = phb_to_npu2_nvlink(phb);
+	struct npu2_dev *dev;
+	int *nlinks = (int *)data;
+
+	dev = npu2_bdf_to_dev(p, pd->bdfn);
+	assert(dev);
+
+	if (dev->nvlink.phb && dev->nvlink.pd && dev->nvlink.pd->dn) {
+		const struct dt_property *prop;
+		int n;
+
+		/* The link count is the number of phandles in "ibm,npu" */
+		prop = dt_find_property(dev->nvlink.pd->dn, "ibm,npu");
+		if (!prop)
+			return 0;
+
+		/* Count could vary by gpu, so find the max */
+		n = prop->len / sizeof(uint32_t);
+		if (n > *nlinks)
+			*nlinks = n;
+	}
+
+	return 0;
+}
+
+static void npu2_phb_fixup_scominit(struct dt_node *dn, int links_per_gpu)
+{
+	uint32_t gcid = dt_get_chip_id(dn);
+	uint64_t val, mask;
+
+	/*
+	 * MRBSP settings for 2- and 3-link GPU systems. These can improve
+	 * GPU peer-to-peer fully ordered write performance.
+	 */
+	if (links_per_gpu == 3) {
+		val = PPC_BIT(30) | PPC_BIT(34) | PPC_BIT(36) | PPC_BIT(37) |
+		      PPC_BIT(44) | PPC_BIT(45);
+		mask = PPC_BITMASK(28,39) | PPC_BITMASK(44,47);
+	} else if (links_per_gpu == 2) {
+		val = PPC_BIT(46) | PPC_BIT(47);
+		mask = PPC_BITMASK(44,47);
+	} else
+		return;
+
+	xscom_write_mask(gcid, 0x50110c0, val, mask);
+	xscom_write_mask(gcid, 0x50112c0, val, mask);
+	xscom_write_mask(gcid, 0x50114c0, val, mask);
+}
+
 static void npu2_phb_final_fixup(struct phb *phb)
 {
+	int links_per_gpu = 0;
+	struct dt_node *np;
+
 	pci_walk_dev(phb, NULL, npu2_dn_fixup, NULL);
+
+	/*
+	 * Now that the emulated devices are bound to the real ones, we can
+	 * determine links_per_gpu and do some final init.
+	 */
+	pci_walk_dev(phb, NULL, npu2_links_per_gpu, &links_per_gpu);
+	dt_for_each_compatible(dt_root, np, "ibm,power9-npu")
+		npu2_phb_fixup_scominit(np, links_per_gpu);
 }
 
 static void npu2_init_ioda_cache(struct npu2 *p)
@@ -831,7 +783,7 @@ static void npu2_init_ioda_cache(struct npu2 *p)
 
 static int64_t npu2_ioda_reset(struct phb *phb, bool purge)
 {
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p = phb_to_npu2_nvlink(phb);
 	uint32_t i;
 
 	if (purge) {
@@ -906,16 +858,14 @@ static void npu2_hw_init(struct npu2 *p)
 {
 	uint64_t val;
 
-	npu2_ioda_reset(&p->phb, false);
+	npu2_ioda_reset(&p->phb_nvlink, false);
 
 	/* Enable XTS retry mode */
 	val = npu2_read(p, NPU2_XTS_CFG);
 	npu2_write(p, NPU2_XTS_CFG, val | NPU2_XTS_CFG_MMIOSD | NPU2_XTS_CFG_TRY_ATR_RO);
 
-	if (!is_p9dd1()) {
-		val = npu2_read(p, NPU2_XTS_CFG2);
-		npu2_write(p, NPU2_XTS_CFG2, val | NPU2_XTS_CFG2_NO_FLUSH_ENA);
-	}
+	val = npu2_read(p, NPU2_XTS_CFG2);
+	npu2_write(p, NPU2_XTS_CFG2, val | NPU2_XTS_CFG2_NO_FLUSH_ENA);
 
 	/*
 	 * There are three different ways we configure the MCD and memory map.
@@ -973,7 +923,7 @@ static int64_t npu2_map_pe_dma_window_real(struct phb *phb,
 					   uint64_t pci_start_addr __unused,
 					   uint64_t pci_mem_size __unused)
 {
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p = phb_to_npu2_nvlink(phb);
 	uint64_t tve;
 
 	/* Sanity check. Each PE has one corresponding TVE */
@@ -1006,7 +956,7 @@ static int64_t npu2_map_pe_dma_window(struct phb *phb,
 				      uint64_t tce_table_size,
 				      uint64_t tce_page_size)
 {
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p = phb_to_npu2_nvlink(phb);
 	uint64_t tts_encoded;
 	uint64_t data64 = 0;
 
@@ -1075,7 +1025,7 @@ static int64_t npu2_set_pe(struct phb *phb,
 			   uint8_t fcompare,
 			   uint8_t action)
 {
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p;
 	struct npu2_dev *dev;
 	uint64_t reg, val;
 
@@ -1090,15 +1040,20 @@ static int64_t npu2_set_pe(struct phb *phb,
 	    dcompare != OPAL_COMPARE_RID_DEVICE_NUMBER ||
 	    fcompare != OPAL_COMPARE_RID_FUNCTION_NUMBER)
 		return OPAL_UNSUPPORTED;
+	if (phb->phb_type != phb_type_npu_v2)
+		return OPAL_PARAMETER;
 
-	/* Get the NPU2 device */
+	p = phb_to_npu2_nvlink(phb);
+	if (!p)
+		return OPAL_PARAMETER;
+
 	dev = npu2_bdf_to_dev(p, bdfn);
 	if (!dev)
 		return OPAL_PARAMETER;
 
 	val = NPU2_CQ_BRICK_BDF2PE_MAP_ENABLE;
 	val = SETFIELD(NPU2_CQ_BRICK_BDF2PE_MAP_PE, val, pe_num);
-	val = SETFIELD(NPU2_CQ_BRICK_BDF2PE_MAP_BDF, val, dev->gpu_bdfn);
+	val = SETFIELD(NPU2_CQ_BRICK_BDF2PE_MAP_BDF, val, dev->nvlink.gpu_bdfn);
 
 	if (!NPU2DEV_BRICK(dev))
 		reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + dev->index/2,
@@ -1110,7 +1065,7 @@ static int64_t npu2_set_pe(struct phb *phb,
 	npu2_write(p, reg, val);
 	val = NPU2_MISC_BRICK_BDF2PE_MAP_ENABLE;
 	val = SETFIELD(NPU2_MISC_BRICK_BDF2PE_MAP_PE, val, pe_num);
-	val = SETFIELD(NPU2_MISC_BRICK_BDF2PE_MAP_BDF, val, dev->gpu_bdfn);
+	val = SETFIELD(NPU2_MISC_BRICK_BDF2PE_MAP_BDF, val, dev->nvlink.gpu_bdfn);
 	reg = NPU2_REG_OFFSET(NPU2_STACK_MISC, NPU2_BLOCK_MISC,
 			      NPU2_MISC_BRICK0_BDF2PE_MAP0 + (dev->index * 0x18));
 	p->bdf2pe_cache[dev->index] = val;
@@ -1137,6 +1092,20 @@ static int64_t npu2_get_power_state(struct pci_slot *slot __unused, uint8_t *val
 
 static int64_t npu2_hreset(struct pci_slot *slot __unused)
 {
+	struct npu2 *p;
+	int i;
+	struct npu2_dev *ndev;
+
+	p = phb_to_npu2_nvlink(slot->phb);
+	NPU2INF(p, "Hreset PHB state\n");
+
+	for (i = 0; i < p->total_devices; i++) {
+		ndev = &p->devices[i];
+		if (ndev) {
+			NPU2DEVINF(ndev, "Resetting device\n");
+			reset_ntl(ndev);
+		}
+	}
 	return OPAL_SUCCESS;
 }
 
@@ -1151,7 +1120,7 @@ static int64_t npu2_creset(struct pci_slot *slot)
 	int i;
 	struct npu2_dev *ndev;
 
-	p = phb_to_npu2(slot->phb);
+	p = phb_to_npu2_nvlink(slot->phb);
 	NPU2INF(p, "Creset PHB state\n");
 
 	for (i = 0; i < p->total_devices; i++) {
@@ -1190,12 +1159,12 @@ static struct pci_slot *npu2_slot_create(struct phb *phb)
 	return slot;
 }
 
-static int64_t npu2_freeze_status(struct phb *phb __unused,
-				  uint64_t pe_number __unused,
-				  uint8_t *freeze_state,
-				  uint16_t *pci_error_type __unused,
-				  uint16_t *severity __unused,
-				  uint64_t *phb_status __unused)
+int64_t npu2_freeze_status(struct phb *phb __unused,
+			   uint64_t pe_number __unused,
+			   uint8_t *freeze_state,
+			   uint16_t *pci_error_type __unused,
+			   uint16_t *severity __unused,
+			   uint64_t *phb_status __unused)
 {
 	/*
 	 * FIXME: When it's called by skiboot PCI config accessor,
@@ -1212,7 +1181,7 @@ static int64_t npu2_eeh_next_error(struct phb *phb,
 				   uint16_t *pci_error_type,
 				   uint16_t *severity)
 {
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p = phb_to_npu2_nvlink(phb);
 	int i;
 	uint64_t result = 0;
 
@@ -1240,7 +1209,7 @@ static int64_t npu2_tce_kill(struct phb *phb, uint32_t kill_type,
 			     uint64_t pe_number, uint32_t tce_size,
 			     uint64_t dma_addr, uint32_t npages)
 {
-	struct npu2 *npu = phb_to_npu2(phb);
+	struct npu2 *npu = phb_to_npu2_nvlink(phb);
 	uint32_t tce_page_size;
 	uint64_t val;
 
@@ -1350,13 +1319,6 @@ static void assign_mmio_bars(uint64_t gcid, uint32_t scom, uint64_t reg[2], uint
 		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_GENID_BAR) },
 	};
 
-	/* On DD1, stack 2 was used for NPU_REGS, stack 0/1 for NPU_PHY */
-	if (is_p9dd1()) {
-		npu2_bars[0].reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_PHY_BAR);
-		npu2_bars[1].reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0, NPU2_PHY_BAR);
-		npu2_bars[2].reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0, NPU2_PHY_BAR);
-	}
-
 	for (i = 0; i < ARRAY_SIZE(npu2_bars); i++) {
 		bar = &npu2_bars[i];
 		npu2_get_bar(gcid, bar);
@@ -1383,10 +1345,27 @@ static void assign_mmio_bars(uint64_t gcid, uint32_t scom, uint64_t reg[2], uint
 static void npu2_probe_phb(struct dt_node *dn)
 {
 	struct proc_chip *proc_chip;
-	struct dt_node *np;
+	struct dt_node *np, *link;
+	bool ocapi_detected = false, nvlink_detected = false;
 	uint32_t gcid, scom, index, phb_index, links;
-	uint64_t reg[2], mm_win[2];
+	uint64_t reg[2], mm_win[2], val;
 	char *path;
+
+	/* Abort if any OpenCAPI links detected */
+	dt_for_each_compatible(dn, link, "ibm,npu-link") {
+		if (npu2_dt_link_dev_type(link) == NPU2_DEV_TYPE_OPENCAPI)
+			ocapi_detected = true;
+		else
+			nvlink_detected = true;
+	}
+
+	if (ocapi_detected && nvlink_detected) {
+		prlog(PR_ERR, "NPU: NVLink and OpenCAPI devices on same chip not supported\n");
+		assert(false);
+	} else if (ocapi_detected) {
+		prlog(PR_INFO, "NPU: OpenCAPI link configuration detected, not initialising NVLink\n");
+		return;
+	}
 
 	/* Retrieve chip id */
 	path = dt_get_path(dn);
@@ -1394,50 +1373,79 @@ static void npu2_probe_phb(struct dt_node *dn)
 	proc_chip = get_chip(gcid);
 	assert(proc_chip);
 	if ((proc_chip->ec_level & 0xf0) > 0x20) {
-		prerror("NPU2: unsupported ec level on Chip 0x%x!\n", gcid);
+		prerror("NPU: unsupported ec level on Chip 0x%x!\n", gcid);
 		return;
 	}
 
-	if (!is_p9dd1()) {
-		/* TODO: Clean this up with register names, etc. when we get
-		 * time. This just turns NVLink mode on in each brick and should
-		 * get replaced with a patch from ajd once we've worked out how
-		 * things are going to work there.
-		 *
-		 * Obviously if the year is now 2020 that didn't happen and you
-		 * should fix this :-) */
-		xscom_write_mask(gcid, 0x5011000, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011030, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011060, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011090, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011200, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011230, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011260, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011290, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011400, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011430, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011460, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
-		xscom_write_mask(gcid, 0x5011490, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+	/* TODO: Clean this up with register names, etc. when we get
+	 * time. This just turns NVLink mode on in each brick and should
+	 * get replaced with a patch from ajd once we've worked out how
+	 * things are going to work there.
+	 *
+	 * Obviously if the year is now 2020 that didn't happen and you
+	 * should fix this :-) */
+	xscom_write_mask(gcid, 0x5011000, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011030, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011060, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011090, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011200, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011230, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011260, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011290, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011400, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011430, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011460, PPC_BIT(58), PPC_BIT(58));
+	xscom_write_mask(gcid, 0x5011490, PPC_BIT(58), PPC_BIT(58));
 
-		xscom_write_mask(gcid, 0x50110c0, PPC_BIT(53), PPC_BIT(53));
-		xscom_write_mask(gcid, 0x50112c0, PPC_BIT(53), PPC_BIT(53));
-		xscom_write_mask(gcid, 0x50114c0, PPC_BIT(53), PPC_BIT(53));
-		xscom_write_mask(gcid, 0x50110f1, PPC_BIT(41), PPC_BIT(41));
-		xscom_write_mask(gcid, 0x50112f1, PPC_BIT(41), PPC_BIT(41));
-		xscom_write_mask(gcid, 0x50114f1, PPC_BIT(41), PPC_BIT(41));
+	xscom_write_mask(gcid, 0x50110c0, PPC_BIT(53), PPC_BIT(53));
+	xscom_write_mask(gcid, 0x50112c0, PPC_BIT(53), PPC_BIT(53));
+	xscom_write_mask(gcid, 0x50114c0, PPC_BIT(53), PPC_BIT(53));
+	xscom_write_mask(gcid, 0x50110f1, PPC_BIT(41), PPC_BIT(41));
+	xscom_write_mask(gcid, 0x50112f1, PPC_BIT(41), PPC_BIT(41));
+	xscom_write_mask(gcid, 0x50114f1, PPC_BIT(41), PPC_BIT(41));
 
-		xscom_write_mask(gcid, 0x5011110, PPC_BIT(0), PPC_BIT(0));
-		xscom_write_mask(gcid, 0x5011130, PPC_BIT(0), PPC_BIT(0));
-		xscom_write_mask(gcid, 0x5011310, PPC_BIT(0), PPC_BIT(0));
-		xscom_write_mask(gcid, 0x5011330, PPC_BIT(0), PPC_BIT(0));
-		xscom_write_mask(gcid, 0x5011510, PPC_BIT(0), PPC_BIT(0));
-		xscom_write_mask(gcid, 0x5011530, PPC_BIT(0), PPC_BIT(0));
-	}
+	xscom_write_mask(gcid, 0x5011110, PPC_BIT(0), PPC_BIT(0));
+	xscom_write_mask(gcid, 0x5011130, PPC_BIT(0), PPC_BIT(0));
+	xscom_write_mask(gcid, 0x5011310, PPC_BIT(0), PPC_BIT(0));
+	xscom_write_mask(gcid, 0x5011330, PPC_BIT(0), PPC_BIT(0));
+	xscom_write_mask(gcid, 0x5011510, PPC_BIT(0), PPC_BIT(0));
+	xscom_write_mask(gcid, 0x5011530, PPC_BIT(0), PPC_BIT(0));
+
+	/*
+	 * Enable relaxed ordering for peer-to-peer reads
+	 */
+	val = PPC_BIT(5) | PPC_BIT(29);
+	xscom_write_mask(gcid, 0x501100c, val, val);
+	xscom_write_mask(gcid, 0x501103c, val, val);
+	xscom_write_mask(gcid, 0x501106c, val, val);
+	xscom_write_mask(gcid, 0x501109c, val, val);
+	xscom_write_mask(gcid, 0x501120c, val, val);
+	xscom_write_mask(gcid, 0x501123c, val, val);
+	xscom_write_mask(gcid, 0x501126c, val, val);
+	xscom_write_mask(gcid, 0x501129c, val, val);
+	xscom_write_mask(gcid, 0x501140c, val, val);
+	xscom_write_mask(gcid, 0x501143c, val, val);
+	xscom_write_mask(gcid, 0x501146c, val, val);
+	xscom_write_mask(gcid, 0x501149c, val, val);
+
+	val = PPC_BIT(6) | PPC_BIT(7) | PPC_BIT(11);
+	xscom_write_mask(gcid, 0x5011009, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011039, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011069, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011099, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011209, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011239, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011269, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011299, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011409, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011439, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011469, val, PPC_BITMASK(6,11));
+	xscom_write_mask(gcid, 0x5011499, val, PPC_BITMASK(6,11));
 
 	index = dt_prop_get_u32(dn, "ibm,npu-index");
 	phb_index = dt_prop_get_u32(dn, "ibm,phb-index");
 	links = dt_prop_get_u32(dn, "ibm,npu-links");
-	prlog(PR_INFO, "NPU2: Chip %d Found NPU2#%d (%d links) at %s\n",
+	prlog(PR_INFO, "NPU: Chip %d Found NPU2#%d (%d links) at %s\n",
 	      gcid, index, links, path);
 	free(path);
 
@@ -1471,13 +1479,16 @@ static void npu2_probe_phb(struct dt_node *dn)
 	dt_add_property_cells(np, "ibm,links", links);
 	dt_add_property(np, "ibm,mmio-window", mm_win, sizeof(mm_win));
 	dt_add_property_cells(np, "ibm,phb-diag-data-size", 0);
+
+	/* Disable fast reboot - not currently supported */
+	disable_fast_reboot("NVLink device enabled");
 }
 
 static uint32_t npu2_populate_pcie_cap(struct npu2_dev *dev,
 				       uint32_t start,
 				       uint32_t prev_cap)
 {
-	struct pci_virt_device *pvd = dev->pvd;
+	struct pci_virt_device *pvd = dev->nvlink.pvd;
 	uint32_t val;
 
 	/* Add capability list */
@@ -1559,12 +1570,12 @@ static uint32_t npu2_populate_vendor_cap(struct npu2_dev *dev,
 					 uint32_t start,
 					 uint32_t prev_cap)
 {
-	struct pci_virt_device *pvd = dev->pvd;
+	struct pci_virt_device *pvd = dev->nvlink.pvd;
 
 	/* Capbility list */
 	PCI_VIRT_CFG_INIT_RO(pvd, prev_cap, 1, start);
 	PCI_VIRT_CFG_INIT_RO(pvd, start, 1, PCI_CFG_CAP_ID_VENDOR);
-	dev->vendor_cap = start;
+	dev->nvlink.vendor_cap = start;
 
 	/* Length and version */
 	PCI_VIRT_CFG_INIT_RO(pvd, start + 2, 1, VENDOR_CAP_LEN);
@@ -1591,7 +1602,7 @@ static uint32_t npu2_populate_vendor_cap(struct npu2_dev *dev,
 
 static void npu2_populate_cfg(struct npu2_dev *dev)
 {
-	struct pci_virt_device *pvd = dev->pvd;
+	struct pci_virt_device *pvd = dev->nvlink.pvd;
 	struct npu2_pcie_bar *bar;
 	uint32_t pos;
 
@@ -1699,12 +1710,13 @@ static void npu2_populate_devices(struct npu2 *p,
 
 	/* Walk the link@x nodes to initialize devices */
 	p->total_devices = 0;
-	p->phb.scan_map = 0;
+	p->phb_nvlink.scan_map = 0;
 	dt_for_each_compatible(npu2_dn, link, "ibm,npu-link") {
 		uint32_t group_id;
 		struct npu2_bar *npu2_bar;
 
 		dev = &p->devices[index];
+		dev->type = NPU2_DEV_TYPE_NVLINK;
 		dev->npu = p;
 		dev->dt_node = link;
 		dev->index = dt_prop_get_u32(link, "ibm,npu-link-index");
@@ -1715,7 +1727,7 @@ static void npu2_populate_devices(struct npu2 *p,
 		/* This must be done after calling
 		 * npu_allocate_bdfn() */
 		p->total_devices++;
-		p->phb.scan_map |= 0x1 << ((dev->bdfn & 0xf8) >> 3);
+		p->phb_nvlink.scan_map |= 0x1 << ((dev->bdfn & 0xf8) >> 3);
 
 		dev->pl_xscom_base = dt_prop_get_u64(link, "ibm,npu-phy");
 		dev->lane_mask = dt_prop_get_u32(link, "ibm,npu-lane-mask");
@@ -1746,10 +1758,10 @@ static void npu2_populate_devices(struct npu2 *p,
 		dev->bars[1].flags = PCI_CFG_BAR_TYPE_MEM | PCI_CFG_BAR_MEM64;
 
 		/* Initialize PCI virtual device */
-		dev->pvd = pci_virt_add_device(&p->phb, dev->bdfn, 0x100, dev);
-		if (dev->pvd) {
-			p->phb.scan_map |=
-				0x1 << ((dev->pvd->bdfn & 0xf8) >> 3);
+		dev->nvlink.pvd = pci_virt_add_device(&p->phb_nvlink, dev->bdfn, 0x100, dev);
+		if (dev->nvlink.pvd) {
+			p->phb_nvlink.scan_map |=
+				0x1 << ((dev->nvlink.pvd->bdfn & 0xf8) >> 3);
 			npu2_populate_cfg(dev);
 		}
 
@@ -1767,8 +1779,8 @@ static void npu2_add_interrupt_map(struct npu2 *p,
 	size_t map_size;
 	uint32_t mask[] = {0xff00, 0x0, 0x0, 0x7};
 
-	assert(p->phb.dt_node);
-	phb_dn = p->phb.dt_node;
+	assert(p->phb_nvlink.dt_node);
+	phb_dn = p->phb_nvlink.dt_node;
 
 	npu2_phandle = dt_prop_get_u32(dn, "ibm,npcq");
 	npu2_dn = dt_find_by_phandle(dt_root, npu2_phandle);
@@ -1795,7 +1807,7 @@ static void npu2_add_interrupt_map(struct npu2 *p,
 
 static void npu2_add_phb_properties(struct npu2 *p)
 {
-	struct dt_node *np = p->phb.dt_node;
+	struct dt_node *np = p->phb_nvlink.dt_node;
 	uint32_t icsp = get_ics_phandle();
 	uint64_t mm_base, mm_size, mmio_atsd;
 
@@ -1844,7 +1856,7 @@ static uint64_t npu2_ipi_attributes(struct irq_source *is __unused, uint32_t isn
 
 	if (idx == 18)
 		/* TCE Interrupt - used to detect a frozen PE */
-		return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_RARE;
+		return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_RARE | IRQ_ATTR_TYPE_MSI;
 	else
 		return IRQ_ATTR_TARGET_LINUX;
 }
@@ -1911,7 +1923,7 @@ static void npu2_setup_irqs(struct npu2 *p)
 
 	p->base_lsi = xive_alloc_ipi_irqs(p->chip_id, NPU2_N_DL_IRQS, NPU2_N_DL_IRQS_ALIGN);
 	if (p->base_lsi == XIVE_IRQ_ERROR) {
-		prlog(PR_ERR, "NPU2: Failed to allocate interrupt sources, IRQs for NDL No-stall events will not be available.\n");
+		prlog(PR_ERR, "NPU: Failed to allocate interrupt sources, IRQs for NDL No-stall events will not be available.\n");
 		return;
 	}
 	xive_register_ipi_source(p->base_lsi, NPU2_N_DL_IRQS, p, &npu2_ipi_ops );
@@ -1959,20 +1971,20 @@ static void npu2_create_phb(struct dt_node *dn)
 	p->devices = pmem + sizeof(struct npu2);
 
 	/* Generic PHB */
-	p->phb.dt_node = dn;
-	p->phb.ops = &npu_ops;
-	p->phb.phb_type = phb_type_npu_v2;
+	p->phb_nvlink.dt_node = dn;
+	p->phb_nvlink.ops = &npu_ops;
+	p->phb_nvlink.phb_type = phb_type_npu_v2;
 	init_lock(&p->lock);
-	init_lock(&p->phb.lock);
-	list_head_init(&p->phb.devices);
-	list_head_init(&p->phb.virt_devices);
+	init_lock(&p->phb_nvlink.lock);
+	list_head_init(&p->phb_nvlink.devices);
+	list_head_init(&p->phb_nvlink.virt_devices);
 
 	npu2_setup_irqs(p);
 	npu2_populate_devices(p, dn);
 	npu2_add_interrupt_map(p, dn);
 	npu2_add_phb_properties(p);
 
-	slot = npu2_slot_create(&p->phb);
+	slot = npu2_slot_create(&p->phb_nvlink);
 	if (!slot)
 	{
 		/**
@@ -1980,10 +1992,10 @@ static void npu2_create_phb(struct dt_node *dn)
 		 * @fwts-advice Firmware probably ran out of memory creating
 		 * NPU2 slot. NVLink functionality could be broken.
 		 */
-		prlog(PR_ERR, "NPU2: Cannot create PHB slot\n");
+		prlog(PR_ERR, "NPU: Cannot create PHB slot\n");
 	}
 
-	pci_register_phb(&p->phb, OPAL_DYNAMIC_PHB_ID);
+	pci_register_phb(&p->phb_nvlink, OPAL_DYNAMIC_PHB_ID);
 
 	npu2_init_ioda_cache(p);
 	npu2_hw_init(p);
@@ -1991,14 +2003,24 @@ static void npu2_create_phb(struct dt_node *dn)
 
 void probe_npu2(void)
 {
+	struct proc_chip *chip = next_chip(NULL);
 	struct dt_node *np;
 	const char *zcal;
+
+	/* Abort if we're running on DD1 */
+	if (chip &&
+	    (chip->type == PROC_CHIP_P9_NIMBUS ||
+	     chip->type == PROC_CHIP_P9_CUMULUS) &&
+	    (chip->ec_level & 0xf0) == 0x10) {
+		prlog(PR_INFO, "NPU: DD1 not supported\n");
+		return;
+	}
 
 	/* Check for a zcal override */
 	zcal = nvram_query("nv_zcal_override");
 	if (zcal) {
 		nv_zcal_nominal = atoi(zcal);
-		prlog(PR_WARNING, "NPU2: Using ZCAL impedance override = %d\n", nv_zcal_nominal);
+		prlog(PR_WARNING, "NPU: Using ZCAL impedance override = %d\n", nv_zcal_nominal);
 	}
 
 	/* Scan NPU2 XSCOM nodes */
@@ -2039,13 +2061,13 @@ static int npu_table_search(struct npu2 *p, uint64_t table_addr, int stride,
  * allocated.
  */
 #define NPU2_VALID_ATS_MSR_BITS (MSR_DR | MSR_HV | MSR_PR | MSR_SF)
-static int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
-				     uint64_t bdf)
+static int64_t opal_npu_init_context(uint64_t phb_id, int pasid __unused,
+				     uint64_t msr, uint64_t bdf)
 {
 	struct phb *phb = pci_get_phb(phb_id);
-	struct npu2 *p = phb_to_npu2(phb);
-	uint64_t xts_bdf, xts_bdf_pid = 0;
-	int id, lparshort;
+	struct npu2 *p;
+	uint64_t xts_bdf, old_xts_bdf_pid, xts_bdf_pid;
+	int id;
 
 	if (!phb || phb->phb_type != phb_type_npu_v2)
 		return OPAL_PARAMETER;
@@ -2060,6 +2082,7 @@ static int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
 	/*
 	 * Need to get LPARSHORT.
 	 */
+	p = phb_to_npu2_nvlink(phb);
 	lock(&p->lock);
 	xts_bdf = SETFIELD(NPU2_XTS_BDF_MAP_BDF, 0ul, bdf);
 	if (npu_table_search(p, NPU2_XTS_BDF_MAP, 8, NPU2_XTS_BDF_MAP_SIZE,
@@ -2069,20 +2092,8 @@ static int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
 		goto out;
 	}
 
-	lparshort = GETFIELD(NPU2_XTS_BDF_MAP_LPARSHORT, xts_bdf);
-	NPU2DBG(p, "Found LPARSHORT = 0x%x for BDF = 0x%03llx\n", lparshort,
-		bdf);
-
-	/*
-	 * Need to find a free context.
-	 */
-	id = npu_table_search(p, NPU2_XTS_PID_MAP, 0x20, NPU2_XTS_PID_MAP_SIZE,
-			      &xts_bdf_pid, -1UL);
-	if (id < 0) {
-		NPU2ERR(p, "No XTS contexts available\n");
-		id = OPAL_RESOURCE;
-		goto out;
-	}
+	id = GETFIELD(NPU2_XTS_BDF_MAP_LPARSHORT, xts_bdf);
+	NPU2DBG(p, "Found LPARSHORT = 0x%x for BDF = 0x%03llx\n", id, bdf);
 
 	/* Enable this mapping for both real and virtual addresses */
 	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_VALID_ATRGPA0, 0UL, 1);
@@ -2090,8 +2101,7 @@ static int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
 
 	/* Enables TLBIE/MMIOSD forwarding for this entry */
 	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_VALID_ATSD, xts_bdf_pid, 1);
-	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_LPARSHORT, xts_bdf_pid,
-			       lparshort);
+	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_LPARSHORT, xts_bdf_pid, id);
 
 	/* Set the relevant MSR bits */
 	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_MSR_DR, xts_bdf_pid,
@@ -2105,12 +2115,29 @@ static int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
 	 * it here */
 	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_MSR_SF, xts_bdf_pid, 1);
 
-	/* Finally set the PID/PASID */
-	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_PASID, xts_bdf_pid, pasid);
+	/*
+	 * Throw an error if the wildcard entry for this bdf is already set
+	 * with different msr bits.
+	 */
+	old_xts_bdf_pid = npu2_read(p, NPU2_XTS_PID_MAP + id*0x20);
+	if (old_xts_bdf_pid) {
+		if (GETFIELD(NPU2_XTS_PID_MAP_MSR, old_xts_bdf_pid) !=
+		    GETFIELD(NPU2_XTS_PID_MAP_MSR, xts_bdf_pid)) {
+			NPU2ERR(p, "%s: Unexpected MSR value\n", __func__);
+			id = OPAL_PARAMETER;
+		}
+
+		goto out;
+	}
 
 	/* Write the entry */
 	NPU2DBG(p, "XTS_PID_MAP[%03d] = 0x%08llx\n", id, xts_bdf_pid);
 	npu2_write(p, NPU2_XTS_PID_MAP + id*0x20, xts_bdf_pid);
+
+	if (!GETFIELD(NPU2_XTS_BDF_MAP_VALID, xts_bdf)) {
+		xts_bdf = SETFIELD(NPU2_XTS_BDF_MAP_VALID, xts_bdf, 1);
+		npu2_write(p, NPU2_XTS_BDF_MAP + id*8, xts_bdf);
+	}
 
 out:
 	unlock(&p->lock);
@@ -2118,17 +2145,18 @@ out:
 }
 opal_call(OPAL_NPU_INIT_CONTEXT, opal_npu_init_context, 4);
 
-static int opal_npu_destroy_context(uint64_t phb_id, uint64_t pid, uint64_t bdf)
+static int opal_npu_destroy_context(uint64_t phb_id, uint64_t pid __unused,
+				    uint64_t bdf)
 {
 	struct phb *phb = pci_get_phb(phb_id);
-	struct npu2 *p = phb_to_npu2(phb);
-	uint64_t xts_bdf, xts_bdf_pid;
-	uint64_t lparshort;
-	int id, rc = 0;
+	struct npu2 *p;
+	uint64_t xts_bdf;
+	int rc = 0;
 
 	if (!phb || phb->phb_type != phb_type_npu_v2)
 		return OPAL_PARAMETER;
 
+	p = phb_to_npu2_nvlink(phb);
 	lock(&p->lock);
 
 	/* Need to find lparshort for this bdf */
@@ -2137,26 +2165,13 @@ static int opal_npu_destroy_context(uint64_t phb_id, uint64_t pid, uint64_t bdf)
 			     &xts_bdf, NPU2_XTS_BDF_MAP_BDF) < 0) {
 		NPU2ERR(p, "LPARID not associated with any GPU\n");
 		rc = OPAL_PARAMETER;
-		goto out;
 	}
 
-	lparshort = GETFIELD(NPU2_XTS_BDF_MAP_LPARSHORT, xts_bdf);
-	NPU2DBG(p, "Found LPARSHORT = 0x%llx destroy context for BDF = 0x%03llx PID = 0x%llx\n",
-		lparshort, bdf, pid);
+	/*
+	 * The bdf/pid table only contains wildcard entries, so we don't
+	 * need to remove anything here.
+	 */
 
-	/* Now find the entry in the bdf/pid table */
-	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_LPARSHORT, 0ul, lparshort);
-	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_PASID, xts_bdf_pid, pid);
-	id = npu_table_search(p, NPU2_XTS_PID_MAP, 0x20, NPU2_XTS_PID_MAP_SIZE, &xts_bdf_pid,
-			      NPU2_XTS_PID_MAP_LPARSHORT | NPU2_XTS_PID_MAP_PASID);
-	if (id < 0) {
-		rc = OPAL_PARAMETER;
-		goto out;
-	}
-
-	/* And zero the entry */
-	npu2_write(p, NPU2_XTS_PID_MAP + id*0x20, 0);
-out:
 	unlock(&p->lock);
 	return rc;
 }
@@ -2169,7 +2184,7 @@ static int opal_npu_map_lpar(uint64_t phb_id, uint64_t bdf, uint64_t lparid,
 			     uint64_t lpcr)
 {
 	struct phb *phb = pci_get_phb(phb_id);
-	struct npu2 *p = phb_to_npu2(phb);
+	struct npu2 *p;
 	struct npu2_dev *ndev = NULL;
 	uint64_t xts_bdf_lpar, rc = OPAL_SUCCESS;
 	int i;
@@ -2184,15 +2199,13 @@ static int opal_npu_map_lpar(uint64_t phb_id, uint64_t bdf, uint64_t lparid,
 		 * future. */
 		return OPAL_UNSUPPORTED;
 
+	p = phb_to_npu2_nvlink(phb);
 	lock(&p->lock);
 
 	/* Find any existing entries and update them */
-	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_VALID, 0UL, 1);
-	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_BDF, xts_bdf_lpar, bdf);
+	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_BDF, 0L, bdf);
 	id = npu_table_search(p, NPU2_XTS_BDF_MAP, 8, NPU2_XTS_BDF_MAP_SIZE,
-			      &xts_bdf_lpar,
-			      NPU2_XTS_BDF_MAP_VALID |
-			      NPU2_XTS_BDF_MAP_BDF);
+			      &xts_bdf_lpar, NPU2_XTS_BDF_MAP_BDF);
 	if (id < 0) {
 		/* No existing mapping found, find space for a new one */
 		xts_bdf_lpar = 0;
@@ -2207,16 +2220,17 @@ static int opal_npu_map_lpar(uint64_t phb_id, uint64_t bdf, uint64_t lparid,
 		goto out;
 	}
 
-	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_VALID, 0UL, 1);
+	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_UNFILT, 0UL, 1);
 	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_BDF, xts_bdf_lpar, bdf);
 
 	/* We only support radix for the moment */
 	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_XLAT, xts_bdf_lpar, 0x3);
 	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_LPARID, xts_bdf_lpar, lparid);
+	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_LPARSHORT, xts_bdf_lpar, id);
 
 	/* Need to find an NVLink to send the ATSDs for this device over */
 	for (i = 0; i < p->total_devices; i++) {
-		if (p->devices[i].gpu_bdfn == bdf) {
+		if (p->devices[i].nvlink.gpu_bdfn == bdf) {
 			ndev = &p->devices[i];
 			break;
 		}

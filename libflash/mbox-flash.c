@@ -42,7 +42,7 @@
 /* Same technique as BUILD_BUG_ON from linux */
 #define CHECK_HANDLER_SIZE(handlers) ((void)sizeof(char[1 - 2*!!(ARRAY_SIZE(handlers) != (MBOX_COMMAND_COUNT + 1))]))
 
-#define MBOX_DEFAULT_TIMEOUT 30
+#define MBOX_DEFAULT_TIMEOUT 3 /* seconds */
 
 #define MSG_CREATE(init_command) { .command = init_command }
 
@@ -334,15 +334,14 @@ static int wait_for_bmc(struct mbox_flash_data *mbox_flash, unsigned int timeout
 {
 	unsigned long last = 1, start = tb_to_secs(mftb());
 	prlog(PR_TRACE, "Waiting for BMC\n");
-	while (mbox_flash->busy && timeout_sec) {
+	while (mbox_flash->busy && timeout_sec > last) {
 		long now = tb_to_secs(mftb());
 		if (now - start > last) {
-			timeout_sec--;
-			last = now - start;
 			if (last < timeout_sec / 2)
 				prlog(PR_TRACE, "Been waiting for the BMC for %lu secs\n", last);
 			else
 				prlog(PR_ERR, "BMC NOT RESPONDING %lu second wait\n", last);
+			last++;
 		}
 		/*
 		 * Both functions are important.
@@ -666,8 +665,6 @@ static int mbox_window_move(struct mbox_flash_data *mbox_flash,
 		return 0;
 	}
 
-	prlog(PR_DEBUG, "Adjusting the window\n");
-
 	/* V1 needs to remember where it has opened the window, note it
 	 * here.
 	 * If we're running V2 the response to the CREATE_*_WINDOW command
@@ -706,9 +703,17 @@ static int mbox_window_move(struct mbox_flash_data *mbox_flash,
 	 * bug will be obvious from the barf.
 	 */
 	if (len != 0 && *size == 0) {
+		prlog(PR_ERR, "Failed read/write!\n");
+		prlog(PR_ERR, "Please update your BMC firmware\n");
 		prlog(PR_ERR, "Move window is indicating size zero!\n");
 		prlog(PR_ERR, "pos: 0x%" PRIx64 ", len: 0x%" PRIx64 "\n", pos, len);
 		prlog(PR_ERR, "win pos: 0x%08x win size: 0x%08x\n", win->cur_pos, win->size);
+		/*
+		 * In practice skiboot gets stuck and this eventually
+		 * brings down the host. Just fail pass the error back
+		 * up and hope someone makes a good decision
+		 */
+		return MBOX_R_SYSTEM_ERROR;
 	}
 
 	return rc;
@@ -940,9 +945,6 @@ static void mbox_flash_attn(uint8_t attn, void *priv)
 	} else {
 		mbox_flash->pause = false;
 	}
-
-	if (attn & MBOX_ATTN_BMC_DAEMON_READY)
-		attn &= ~MBOX_ATTN_BMC_DAEMON_READY;
 }
 
 static void mbox_flash_callback(struct bmc_mbox_msg *msg, void *priv)

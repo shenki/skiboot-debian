@@ -35,6 +35,7 @@
 #include <xive.h>
 #include <sbe-p9.h>
 #include <phys-map.h>
+#include <occ.h>
 
 static LIST_HEAD(psis);
 static u64 psi_link_timer;
@@ -74,7 +75,7 @@ void psi_disable_link(struct psi *psi)
 
 		/* Mask errors in SEMR */
 		reg = in_be64(psi->regs + PSIHB_SEMR);
-		reg = ((0xfffull << 36) | (0xfffull << 20));
+		reg &= ((0xfffull << 36) | (0xfffull << 20));
 		out_be64(psi->regs + PSIHB_SEMR, reg);
 		printf("PSI: SEMR set to %llx\n", reg);
 
@@ -377,7 +378,7 @@ static int64_t psi_p7_get_xive(struct irq_source *is, uint32_t isn __unused,
 static uint64_t psi_p7_irq_attributes(struct irq_source *is __unused,
 				      uint32_t isn __unused)
 {
-	return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_FREQUENT;
+	return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_FREQUENT | IRQ_ATTR_TYPE_LSI;
 }
 
 static const uint32_t psi_p8_irq_to_xivr[P8_IRQ_PSI_IRQ_COUNT] = {
@@ -530,7 +531,7 @@ static uint64_t psi_p8_irq_attributes(struct irq_source *is, uint32_t isn)
 	    psi_ext_irq_policy == EXTERNAL_IRQ_POLICY_LINUX)
 		return IRQ_ATTR_TARGET_LINUX;
 
-	attr = IRQ_ATTR_TARGET_OPAL;
+	attr = IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TYPE_LSI;
 	if (idx == P8_IRQ_PSI_EXTERNAL || idx == P8_IRQ_PSI_LPC ||
 	    idx == P8_IRQ_PSI_FSP)
 		attr |= IRQ_ATTR_TARGET_FREQUENT;
@@ -605,7 +606,7 @@ static void psihb_p9_interrupt(struct irq_source *is, uint32_t isn)
 		printf("PSI: DIO irq received\n");
 		break;
 	case P9_PSI_IRQ_PSU:
-		sbe_interrupt(psi->chip_id);
+		p9_sbe_interrupt(psi->chip_id);
 		break;
 	}
 }
@@ -634,7 +635,7 @@ static uint64_t psi_p9_irq_attributes(struct irq_source *is __unused,
 	 if (is_lpc_serirq)
 		 return lpc_get_irq_policy(psi->chip_id, idx - P9_PSI_IRQ_LPC_SIRQ0);
 
-	return IRQ_ATTR_TARGET_OPAL;
+	return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TYPE_LSI;
 }
 
 static char *psi_p9_irq_name(struct irq_source *is, uint32_t isn)

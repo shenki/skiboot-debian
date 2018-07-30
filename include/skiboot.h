@@ -63,41 +63,6 @@ static inline bool is_rodata(const void *p)
 }
 #endif
 
-#define OPAL_BOOT_COMPLETE 0x1
-/* Debug descriptor. This structure is pointed to by the word at offset
- * 0x80 in the sapphire binary
- */
-struct debug_descriptor {
-	u8	eye_catcher[8];	/* "OPALdbug" */
-#define DEBUG_DESC_VERSION	1
-	u32	version;
-	u8	console_log_levels;	/* high 4 bits in memory,
-					 * low 4 bits driver (e.g. uart). */
-	u8	state_flags; /* various state flags - OPAL_BOOT_COMPLETE etc */
-	u16	reserved2;
-	u32	reserved[2];
-
-	/* Memory console */
-	u64	memcons_phys;
-	u32	memcons_tce;
-	u32	memcons_obuf_tce;
-	u32	memcons_ibuf_tce;
-
-	/* Traces */
-	u64	trace_mask;
-	u32	num_traces;
-#define DEBUG_DESC_MAX_TRACES	256
-	u64	trace_phys[DEBUG_DESC_MAX_TRACES];
-	u32	trace_size[DEBUG_DESC_MAX_TRACES];
-	u32	trace_tce[DEBUG_DESC_MAX_TRACES];
-};
-extern struct debug_descriptor debug_descriptor;
-
-static inline bool opal_booting(void)
-{
-	return !(debug_descriptor.state_flags & OPAL_BOOT_COMPLETE);
-}
-
 /* Console logging
  * Update console_get_level() if you add here
  */
@@ -236,14 +201,13 @@ extern int preload_capp_ucode(void);
 extern void preload_io_vpd(void);
 extern void probe_npu(void);
 extern void probe_npu2(void);
+extern void probe_npu2_opencapi(void);
 extern void uart_init(void);
 extern void mbox_init(void);
 extern void early_uart_init(void);
 extern void homer_init(void);
-extern void occ_pstates_init(void);
 extern void slw_init(void);
 extern void add_cpu_idle_state_properties(void);
-extern void occ_fsp_init(void);
 extern void lpc_rtc_init(void);
 
 /* flash support */
@@ -276,23 +240,6 @@ enum {
 extern void uart_set_console_policy(int policy);
 extern bool uart_enabled(void);
 
-/* OCC interrupt for P8 */
-extern void occ_p8_interrupt(uint32_t chip_id);
-extern void occ_send_dummy_interrupt(void);
-
-/* OCC interrupt for P9 */
-extern void occ_p9_interrupt(uint32_t chip_id);
-
-/* OCC load support */
-extern void occ_poke_load_queue(void);
-
-/* OCC/Host PNOR ownership */
-enum pnor_owner {
-	PNOR_OWNER_HOST,
-	PNOR_OWNER_EXTERNAL,
-};
-extern void occ_pnor_set_owner(enum pnor_owner owner);
-
 /* PRD */
 extern void prd_psi_interrupt(uint32_t proc);
 extern void prd_tmgt_interrupt(uint32_t proc);
@@ -322,12 +269,6 @@ extern void xive_late_init(void);
 /* SLW reinit function for switching core settings */
 extern int64_t slw_reinit(uint64_t flags);
 
-/* SLW update timer function */
-extern void slw_update_timer_expiry(uint64_t new_target);
-
-/* Is SLW timer available ? */
-extern bool slw_timer_ok(void);
-
 /* Patch SPR in SLW image */
 extern int64_t opal_slw_set_reg(uint64_t cpu_pir, uint64_t sprn, uint64_t val);
 
@@ -350,12 +291,4 @@ extern int fake_nvram_info(uint32_t *total_size);
 extern int fake_nvram_start_read(void *dst, uint32_t src, uint32_t len);
 extern int fake_nvram_write(uint32_t offset, void *src, uint32_t size);
 
-/* OCC Inband Sensors */
-extern void occ_sensors_init(void);
-extern int occ_sensor_read(u32 handle, u64 *data);
-extern int occ_sensor_group_clear(u32 group_hndl, int token);
-extern void occ_add_sensor_groups(struct dt_node *sg, u32  *phandles,
-				  u32 *ptype, int nr_phandles, int chipid);
-
-extern int occ_sensor_group_enable(u32 group_hndl, int token, bool enable);
 #endif /* __SKIBOOT_H */

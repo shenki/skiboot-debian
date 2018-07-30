@@ -20,7 +20,7 @@
 #include <sensor.h>
 #include <device.h>
 #include <cpu.h>
-#include <occ-sensor.h>
+#include <occ.h>
 
 enum sensor_attr {
 	SENSOR_SAMPLE,
@@ -154,7 +154,7 @@ static void scale_sensor(struct occ_sensor_name *md, u64 *sensor)
 		for (i = labs(exp); i > 0; i--)
 			*sensor *= 10;
 	} else {
-		for (i = labs(exp); sensor && i > 0; i--)
+		for (i = labs(exp); i > 0; i--)
 			*sensor /= 10;
 	}
 }
@@ -171,7 +171,7 @@ static void scale_energy(struct occ_sensor_name *md, u64 *sensor)
 	exp = factor & 0xFF;
 
 	if (exp > 0) {
-		for (i = labs(exp); sensor && i > 0; i--)
+		for (i = labs(exp); i > 0; i--)
 			*sensor /= 10;
 	} else {
 		for (i = labs(exp); i > 0; i--)
@@ -491,7 +491,7 @@ static void add_sensor_node(const char *loc, const char *type, int i, int attr,
 	*phandle = node->phandle;
 }
 
-void occ_sensors_init(void)
+bool occ_sensors_init(void)
 {
 	struct proc_chip *chip;
 	struct dt_node *sg, *exports;
@@ -500,13 +500,13 @@ void occ_sensors_init(void)
 
 	/* OCC inband sensors is only supported in P9 */
 	if (proc_gen != proc_gen_p9)
-		return;
+		return false;
 
 	/* Sensors are copied to BAR2 OCC Common Area */
 	chip = next_chip(NULL);
 	if (!chip->occ_common_base) {
 		prerror("OCC: Unassigned OCC Common Area. No sensors found\n");
-		return;
+		return false;
 	}
 
 	occ_sensor_base = chip->occ_common_base + OCC_SENSOR_DATA_BLOCK_OFFSET;
@@ -514,7 +514,7 @@ void occ_sensors_init(void)
 	sg = dt_new(opal_node, "sensor-groups");
 	if (!sg) {
 		prerror("OCC: Failed to create sensor groups node\n");
-		return;
+		return false;
 	}
 	dt_add_property_string(sg, "compatible", "ibm,opal-sensor-group");
 	dt_add_property_cells(sg, "#address-cells", 1);
@@ -543,6 +543,7 @@ void occ_sensors_init(void)
 		for (i = 0; i < hb->nr_sensors; i++) {
 			const char *type, *loc;
 			struct cpu_thread *c = NULL;
+			uint32_t pir = 0;
 
 			if (md[i].structure_type != OCC_SENSOR_READING_FULL)
 				continue;
@@ -565,6 +566,7 @@ void occ_sensors_init(void)
 						break;
 				if (!c)
 					continue;
+				pir = c->pir;
 			}
 
 			type = get_sensor_type_string(md[i].type);
@@ -572,7 +574,7 @@ void occ_sensors_init(void)
 
 			add_sensor_node(loc, type, i, SENSOR_SAMPLE, &md[i],
 					&phandles[phcount], &ptype[phcount],
-					c->pir, occ_num, chip->id);
+					pir, occ_num, chip->id);
 			phcount++;
 
 			/* Add energy sensors */
@@ -581,7 +583,7 @@ void occ_sensors_init(void)
 				add_sensor_node(loc, "energy", i,
 						SENSOR_ACCUMULATOR, &md[i],
 						&phandles[phcount], &ptype[phcount],
-						c->pir, occ_num, chip->id);
+						pir, occ_num, chip->id);
 				phcount++;
 			}
 
@@ -593,14 +595,16 @@ void occ_sensors_init(void)
 	}
 
 	if (!occ_num)
-		return;
+		return false;
 
 	exports = dt_find_by_path(dt_root, "/ibm,opal/firmware/exports");
 	if (!exports) {
 		prerror("OCC: dt node /ibm,opal/firmware/exports not found\n");
-		return;
+		return false;
 	}
 
 	dt_add_property_u64s(exports, "occ_inband_sensors", occ_sensor_base,
 			     OCC_SENSOR_DATA_BLOCK_SIZE * occ_num);
+
+	return true;
 }

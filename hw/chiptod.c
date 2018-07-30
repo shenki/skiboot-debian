@@ -970,11 +970,11 @@ bool chiptod_wakeup_resync(void)
 	return false;
 }
 
-static int chiptod_recover_tod_errors(void)
+static int __chiptod_recover_tod_errors(void)
 {
 	uint64_t terr;
 	uint64_t treset = 0;
-	int i;
+	int i, rc = -1;
 	int32_t chip_id = this_cpu()->chip_id;
 
 	/* Read TOD error register */
@@ -990,6 +990,7 @@ static int chiptod_recover_tod_errors(void)
 		(terr & TOD_ERR_DELAY_COMPL_PARITY) ||
 		(terr & TOD_ERR_TOD_REGISTER_PARITY)) {
 		chiptod_reset_tod_errors();
+		rc = 1;
 	}
 
 	/*
@@ -1023,7 +1024,19 @@ static int chiptod_recover_tod_errors(void)
 		return 0;
 	}
 	/* We have handled all the TOD errors routed to hypervisor */
-	return 1;
+	if (treset)
+		rc = 1;
+	return rc;
+}
+
+int chiptod_recover_tod_errors(void)
+{
+	int rc;
+
+	lock(&chiptod_lock);
+	rc = __chiptod_recover_tod_errors();
+	unlock(&chiptod_lock);
+	return rc;
 }
 
 static int32_t chiptod_get_active_master(void)
@@ -1370,16 +1383,9 @@ static bool tfmr_recover_tb_errors(uint64_t tfmr)
 	return true;
 }
 
-static bool tfmr_recover_non_tb_errors(uint64_t tfmr)
+bool tfmr_recover_local_errors(uint64_t tfmr)
 {
 	uint64_t tfmr_reset_errors = 0;
-
-	/*
-	 * write 1 to bit 26 to clear TFMR HDEC parity error.
-	 * HDEC register has already been reset to zero as part pre-recovery.
-	 */
-	if (tfmr & SPR_TFMR_HDEC_PARITY_ERROR)
-		tfmr_reset_errors |= SPR_TFMR_HDEC_PARITY_ERROR;
 
 	if (tfmr & SPR_TFMR_DEC_PARITY_ERR) {
 		/* Set DEC with all ones */
@@ -1390,11 +1396,11 @@ static bool tfmr_recover_non_tb_errors(uint64_t tfmr)
 	}
 
 	/*
-	 * Reset PURR/SPURR to recover. We also need help from KVM
-	 * layer to handle this change in PURR/SPURR. That needs
-	 * to be handled in kernel KVM layer. For now, to recover just
-	 * reset it.
-	 */
+	* Reset PURR/SPURR to recover. We also need help from KVM
+	* layer to handle this change in PURR/SPURR. That needs
+	* to be handled in kernel KVM layer. For now, to recover just
+	* reset it.
+	*/
 	if (tfmr & SPR_TFMR_PURR_PARITY_ERR) {
 		/* set PURR register with sane value or reset it. */
 		mtspr(SPR_PURR, 0);
@@ -1432,7 +1438,7 @@ static bool tfmr_recover_non_tb_errors(uint64_t tfmr)
  *	MT(TFMR) bits 11 and 60 are b’1’
  *	MT(HMER) all bits 1 except for bits 4,5
  */
-static bool chiptod_recover_tfmr_error(void)
+bool recover_corrupt_tfmr(void)
 {
 	uint64_t tfmr;
 
@@ -1468,6 +1474,40 @@ static bool chiptod_recover_tfmr_error(void)
 	return true;
 }
 
+void tfmr_cleanup_core_errors(uint64_t tfmr)
+{
+	/* If HDEC is bad, clean it on all threads before we clear the
+	 * error condition.
+	 */
+	if (tfmr & SPR_TFMR_HDEC_PARITY_ERROR)
+		mtspr(SPR_HDEC, 0);
+
+	/* If TB is invalid, clean it on all threads as well, it will be
+	 * restored after the next rendez-vous
+	 */
+	if (!(tfmr & SPR_TFMR_TB_VALID)) {
+		mtspr(SPR_TBWU, 0);
+		mtspr(SPR_TBWU, 0);
+	}
+}
+
+int tfmr_clear_core_errors(uint64_t tfmr)
+{
+	uint64_t tfmr_reset_errors = 0;
+
+	/* return -1 if there is nothing to be fixed. */
+	if (!(tfmr & SPR_TFMR_HDEC_PARITY_ERROR))
+		return -1;
+
+	tfmr_reset_errors |= SPR_TFMR_HDEC_PARITY_ERROR;
+
+	/* Write TFMR twice to clear the error */
+	mtspr(SPR_TFMR, base_tfmr | tfmr_reset_errors);
+	mtspr(SPR_TFMR, base_tfmr | tfmr_reset_errors);
+
+	return 1;
+}
+
 /*
  * Recover from TB and TOD errors.
  * Timebase register is per core and first thread that gets chance to
@@ -1481,11 +1521,12 @@ static bool chiptod_recover_tfmr_error(void)
  *	1	<= Successfully recovered from errors
  *	-1	<= No errors found. Errors are already been fixed.
  */
-int chiptod_recover_tb_errors(void)
+int chiptod_recover_tb_errors(bool *out_resynced)
 {
 	uint64_t tfmr;
 	int rc = -1;
-	int thread_id;
+
+	*out_resynced = false;
 
 	if (chiptod_primary < 0)
 		return 0;
@@ -1494,32 +1535,6 @@ int chiptod_recover_tb_errors(void)
 
 	/* Get fresh copy of TFMR */
 	tfmr = mfspr(SPR_TFMR);
-
-	/*
-	 * Check for TFMR parity error and recover from it.
-	 * We can not trust any other bits in TFMR If it is corrupt. Fix this
-	 * before we do anything.
-	 */
-	if (tfmr & SPR_TFMR_TFMR_CORRUPT) {
-		if (!chiptod_recover_tfmr_error()) {
-			rc = 0;
-			goto error_out;
-		}
-	}
-
-	/* Get fresh copy of TFMR */
-	tfmr = mfspr(SPR_TFMR);
-
-	/*
-	 * Workaround for HW logic bug in Power9
-	 * Even after clearing TB residue error by one thread it does not
-	 * get reflected to other threads on same core.
-	 * Check if TB is already valid and skip the checking of TB errors.
-	 */
-
-	if ((proc_gen == proc_gen_p9) && (tfmr & SPR_TFMR_TB_RESIDUE_ERR)
-						&& (tfmr & SPR_TFMR_TB_VALID))
-		goto skip_tb_error_clear;
 
 	/*
 	 * Check for TB errors.
@@ -1544,7 +1559,6 @@ int chiptod_recover_tb_errors(void)
 		}
 	}
 
-skip_tb_error_clear:
 	/*
 	 * Check for TOD sync check error.
 	 * On TOD errors, bit 51 of TFMR is set. If this bit is on then we
@@ -1552,7 +1566,7 @@ skip_tb_error_clear:
 	 * Bit 33 of TOD error register indicates sync check error.
 	 */
 	if (tfmr & SPR_TFMR_CHIP_TOD_INTERRUPT)
-		rc = chiptod_recover_tod_errors();
+		rc = __chiptod_recover_tod_errors();
 
 	/* Check if TB is running. If not then we need to get it running. */
 	if (!(tfmr & SPR_TFMR_TB_VALID)) {
@@ -1574,35 +1588,9 @@ skip_tb_error_clear:
 		if (!chiptod_to_tb())
 			goto error_out;
 
+		*out_resynced = true;
+
 		/* We have successfully able to get TB running. */
-		rc = 1;
-	}
-
-	/*
-	 * Workaround for HW logic bug in power9.
-	 * In idea case (without the HW bug) only one thread from the core
-	 * would have fallen through tfmr_recover_non_tb_errors() to clear
-	 * HDEC parity error on TFMR.
-	 *
-	 * Hence to achieve same behavior, allow only thread 0 to clear the
-	 * HDEC parity error. And for rest of the threads just reset the bit
-	 * to avoid other threads to fall through tfmr_recover_non_tb_errors().
-	 */
-	thread_id = cpu_get_thread_index(this_cpu());
-	if ((proc_gen == proc_gen_p9) && thread_id)
-		tfmr &= ~SPR_TFMR_HDEC_PARITY_ERROR;
-
-	/*
-	 * Now that TB is running, check for TFMR non-TB errors.
-	 */
-	if ((tfmr & SPR_TFMR_HDEC_PARITY_ERROR) ||
-		(tfmr & SPR_TFMR_PURR_PARITY_ERR) ||
-		(tfmr & SPR_TFMR_SPURR_PARITY_ERR) ||
-		(tfmr & SPR_TFMR_DEC_PARITY_ERR)) {
-		if (!tfmr_recover_non_tb_errors(tfmr)) {
-			rc = 0;
-			goto error_out;
-		}
 		rc = 1;
 	}
 

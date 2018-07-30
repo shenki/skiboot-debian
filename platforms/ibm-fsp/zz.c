@@ -27,6 +27,24 @@
 #include "ibm-fsp.h"
 #include "lxvpd.h"
 
+/* We don't yet create NPU device nodes on ZZ, but these values are correct */
+const struct platform_ocapi zz_ocapi = {
+	.i2c_engine        = 1,
+	.i2c_port          = 4,
+	.i2c_reset_addr    = 0x20,
+	.i2c_reset_odl0    = (1 << 1),
+	.i2c_reset_odl1    = (1 << 6),
+	.i2c_presence_addr = 0x20,
+	.i2c_presence_odl0 = (1 << 2), /* bottom connector */
+	.i2c_presence_odl1 = (1 << 7), /* top connector */
+	/*
+	 * i2c presence detection is broken on ZZ planar < v4 so we
+	 * force the presence until all our systems are upgraded
+	 */
+	.force_presence    = true,
+	.odl_phy_swap      = true,
+};
+
 static bool zz_probe(void)
 {
 	/* FIXME: make this neater when the dust settles */
@@ -71,4 +89,5 @@ DECLARE_PLATFORM(zz) = {
 	.resource_loaded	= fsp_resource_loaded,
 	.sensor_read		= ibm_fsp_sensor_read,
 	.terminate		= ibm_fsp_terminate,
+	.ocapi			= &zz_ocapi,
 };

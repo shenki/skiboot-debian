@@ -4,11 +4,14 @@
 
 #define __TEST__
 #include <timer.h>
+#include <skiboot.h>
 
 #define mftb()	(stamp)
 #define sync()
 #define smt_lowest()
 #define smt_medium()
+
+enum proc_gen proc_gen = proc_gen_p9;
 
 static uint64_t stamp, last;
 struct lock;
@@ -47,10 +50,15 @@ static void expiry(struct timer *t, void *data, uint64_t now)
 	count--;
 }
 
-void slw_update_timer_expiry(uint64_t new_target)
+void p8_sbe_update_timer_expiry(uint64_t new_target)
 {
 	(void)new_target;
 	/* FIXME: do intersting SLW timer sim */
+}
+
+void p9_sbe_update_timer_expiry(uint64_t new_target)
+{
+	(void)new_target;
 }
 
 int main(void)

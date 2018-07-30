@@ -25,6 +25,8 @@
 #include <errorlog.h>
 #include <pel.h>
 #include <opal-msg.h>
+#include <debug_descriptor.h>
+#include <occ.h>
 
 /* OEM SEL fields */
 #define SEL_OEM_ID_0		0x55
@@ -504,8 +506,7 @@ static void sel_power(uint8_t power)
 	switch (power) {
 	case SOFT_OFF:
 		prlog(PR_NOTICE, "Soft shutdown requested\n");
-		if (!(debug_descriptor.state_flags & OPAL_BOOT_COMPLETE) &&
-		    platform.cec_power_down) {
+		if (opal_booting() && platform.cec_power_down) {
 			prlog(PR_NOTICE, "Host not up, shutting down now\n");
 			platform.cec_power_down(IPMI_CHASSIS_PWR_DOWN);
 		} else {
@@ -515,8 +516,7 @@ static void sel_power(uint8_t power)
 		break;
 	case SOFT_REBOOT:
 		prlog(PR_NOTICE, "Soft reboot requested\n");
-		if (!(debug_descriptor.state_flags & OPAL_BOOT_COMPLETE) &&
-		    platform.cec_reboot) {
+		if (opal_booting() && platform.cec_reboot) {
 			prlog(PR_NOTICE, "Host not up, rebooting now\n");
 			platform.cec_reboot();
 		} else {

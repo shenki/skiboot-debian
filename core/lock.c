@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2018 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <processor.h>
 #include <cpu.h>
 #include <console.h>
+#include <timebase.h>
 
 /* Set to bust locks. Note, this is initialized to true because our
  * lock debugging code is not going to work until we have the per
@@ -28,6 +29,7 @@
 bool bust_locks = true;
 
 #ifdef DEBUG_LOCKS
+static struct lock dl_lock = LOCK_UNLOCKED;
 
 static void lock_error(struct lock *l, const char *reason, uint16_t err)
 {
@@ -61,9 +63,104 @@ static void unlock_check(struct lock *l)
 		lock_error(l, "Releasing lock we don't hold depth", 4);
 }
 
+/* Find circular dependencies in the lock requests. */
+static bool check_deadlock(void)
+{
+	uint32_t lock_owner, start, i;
+	struct cpu_thread *next_cpu;
+	struct lock *next;
+
+	next  = this_cpu()->requested_lock;
+	start = this_cpu()->pir;
+	i = 0;
+
+	while (i < cpu_max_pir) {
+
+		if (!next)
+			return false;
+
+		if (!(next->lock_val & 1) || next->in_con_path)
+			return false;
+
+		lock_owner = next->lock_val >> 32;
+
+		if (lock_owner == start)
+			return true;
+
+		next_cpu = find_cpu_by_pir(lock_owner);
+
+		if (!next_cpu)
+			return false;
+
+		next = next_cpu->requested_lock;
+		i++;
+	}
+
+	return false;
+}
+
+static void add_lock_request(struct lock *l)
+{
+	struct cpu_thread *curr = this_cpu();
+
+	if (curr->state != cpu_state_active &&
+	    curr->state != cpu_state_os)
+		return;
+
+	/*
+	 * For deadlock detection we must keep the lock states constant
+	 * while doing the deadlock check.
+	 */
+	for (;;) {
+		if (try_lock(&dl_lock))
+			break;
+		smt_lowest();
+		while (dl_lock.lock_val)
+			barrier();
+		smt_medium();
+	}
+
+	curr->requested_lock = l;
+
+	if (check_deadlock())
+		lock_error(l, "Deadlock detected", 0);
+
+	unlock(&dl_lock);
+}
+
+static void remove_lock_request(void)
+{
+	this_cpu()->requested_lock = NULL;
+}
+
+#define LOCK_TIMEOUT_MS 5000
+static inline bool lock_timeout(unsigned long start)
+{
+	/* Print warning if lock has been spinning for more than TIMEOUT_MS */
+	unsigned long wait = tb_to_msecs(mftb());
+
+	if (wait - start > LOCK_TIMEOUT_MS) {
+		/*
+		 * If the timebase is invalid, we shouldn't
+		 * throw an error. This is possible with pending HMIs
+		 * that need to recover TB.
+		 */
+		if( !(mfspr(SPR_TFMR) & SPR_TFMR_TB_VALID))
+			return false;
+		prlog(PR_WARNING, "WARNING: Lock has been "\
+		      "spinning for %lums\n", wait - start);
+		backtrace();
+		return true;
+	}
+
+	return false;
+}
 #else
 static inline void lock_check(struct lock *l) { };
 static inline void unlock_check(struct lock *l) { };
+static inline void add_lock_request(struct lock *l) { };
+static inline void remove_lock_request(void) { };
+static inline bool lock_timeout(unsigned long s) { return false; }
 #endif /* DEBUG_LOCKS */
 
 bool lock_held_by_me(struct lock *l)
@@ -108,10 +205,28 @@ bool try_lock_caller(struct lock *l, const char *owner)
 
 void lock_caller(struct lock *l, const char *owner)
 {
+	bool timeout_warn = false;
+	unsigned long start = 0;
+
 	if (bust_locks)
 		return;
 
 	lock_check(l);
+
+	if (try_lock(l))
+		return;
+	add_lock_request(l);
+
+#ifdef DEBUG_LOCKS
+	/*
+	 * Ensure that we get a valid start value
+	 * as we may be handling TFMR errors and taking
+	 * a lock to do so, so timebase could be garbage
+	 */
+	if( (mfspr(SPR_TFMR) & SPR_TFMR_TB_VALID))
+		start = tb_to_msecs(mftb());
+#endif
+
 	for (;;) {
 		if (try_lock_caller(l, owner))
 			break;
@@ -119,7 +234,12 @@ void lock_caller(struct lock *l, const char *owner)
 		while (l->lock_val)
 			barrier();
 		smt_medium();
+
+		if (start && !timeout_warn)
+			timeout_warn = lock_timeout(start);
 	}
+
+	remove_lock_request();
 }
 
 void unlock(struct lock *l)
@@ -176,6 +296,7 @@ void drop_my_locks(bool warn)
 {
 	struct lock *l;
 
+	disable_fast_reboot("Lock corruption");
 	while((l = list_pop(&this_cpu()->locks_held, struct lock, list)) != NULL) {
 		if (warn)
 			prlog(PR_ERR, "  %s\n", l->owner);

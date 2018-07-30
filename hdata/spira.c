@@ -1,4 +1,4 @@
-/* Copyright 2013-2017 IBM Corp.
+/* Copyright 2013-2018 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -88,16 +88,15 @@ __section(".cpuctrl.data") struct cpu_ctl_init_data cpu_ctl_init_data = {
  * To help the FSP distinguishing between TCE tokens and actual physical
  * addresses, we set the top bit to 1 on physical addresses
  */
-#define ADDR_TOP_BIT	(1ul << 63)
 
 __section(".mdst.data") struct dump_mdst_table init_mdst_table[2] = {
 	{
-		.addr = CPU_TO_BE64(INMEM_CON_START | ADDR_TOP_BIT),
+		.addr = CPU_TO_BE64(INMEM_CON_START | HRMOR_BIT),
 		.type = CPU_TO_BE32(DUMP_REGION_CONSOLE),
 		.size = CPU_TO_BE32(INMEM_CON_LEN),
 	},
 	{
-		.addr = CPU_TO_BE64(HBRT_CON_START | ADDR_TOP_BIT),
+		.addr = CPU_TO_BE64(HBRT_CON_START | HRMOR_BIT),
 		.type = CPU_TO_BE32(DUMP_REGION_HBRT_LOG),
 		.size = CPU_TO_BE32(HBRT_CON_LEN),
 	},
@@ -558,9 +557,13 @@ static bool add_xscom_sppcrd(uint64_t xscom_base)
 		if (version >= 0x000a) {
 			vpd = HDIF_get_idata(hdif, SPPCRD_IDATA_MODULE_VPD,
 					     &vpd_sz);
-			if (CHECK_SPPTR(vpd))
+			if (CHECK_SPPTR(vpd)) {
 				dt_add_property(np, "ibm,module-vpd", vpd,
 						vpd_sz);
+				vpd_data_parse(np, vpd, vpd_sz);
+				if (vpd_node)
+					dt_add_proc_vendor(vpd_node, vpd, vpd_sz);
+			}
 		}
 
 		/*
@@ -577,6 +580,9 @@ static bool add_xscom_sppcrd(uint64_t xscom_base)
 			parse_i2c_devs(hdif, SPPCRD_IDATA_HOST_I2C, np);
 			add_vas_node(np, i);
 			add_ecid_data(hdif, np);
+
+			if (be32_to_cpu(cinfo->verif_exist_flags) & CHIP_VERIFY_MASTER_PROC)
+				dt_add_property(np, "primary", NULL, 0);
 		}
 
 		/*
@@ -1202,7 +1208,9 @@ static void add_iplparams_features(const struct HDIF_common_hdr *iplp)
 		uint64_t flags;
 
 		/* the name field isn't necessarily null terminated */
-		strncpy(name, feature->name, sizeof(feature->name));
+		BUILD_ASSERT(sizeof(name) > sizeof(feature->name));
+		strncpy(name, feature->name, sizeof(name)-1);
+		name[sizeof(name)-1] = '\0';
 		flags = be64_to_cpu(feature->flags);
 
 		prlog(PR_DEBUG, "IPLPARAMS: FW feature %s = %016"PRIx64"\n",
@@ -1482,6 +1490,7 @@ static void add_npu(struct dt_node *xscom, const struct HDIF_array_hdr *links,
 		}
 
 		dt_add_property_string(node, "compatible", "ibm,npu-link");
+		dt_add_property_string(node, "ibm,npu-link-type", "nvlink");
 		dt_add_property_cells(node, "reg", link_count);
 		dt_add_property_cells(node, "ibm,npu-link-index", link_count);
 		dt_add_property_cells(node, "ibm,workbook-link-id", link_id);
@@ -1528,7 +1537,13 @@ static void add_npu(struct dt_node *xscom, const struct HDIF_array_hdr *links,
 				continue;
 			}
 
-			name = dt_prop_get_def(slot, "ibm,slot-label",
+			/*
+			 * The slot_id points to a node that indicates that
+			 * this GPU should appear under the slot. Grab the
+			 * slot-label from the parent node that represents
+			 * the actual slot.
+			 */
+			name = dt_prop_get_def(slot->parent, "ibm,slot-label",
 						(char *)"<SLOT NAME MISSING>");
 
 			prlog(PR_DEBUG, "NPU: %04x:%d: Target slot %s\n",
@@ -1619,7 +1634,7 @@ static void fixup_spira(void)
 	if (!HDIF_check(&spiras->hdr, SPIRAS_HDIF_SIG))
 		return;
 
-	prlog(PR_NOTICE, "SPIRA-S found.\n");
+	prlog(PR_DEBUG, "SPIRA-S found.\n");
 
 	spira.ntuples.sp_subsys = spiras->ntuples.sp_subsys;
 	spira.ntuples.ipl_parms = spiras->ntuples.ipl_parms;

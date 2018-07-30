@@ -757,9 +757,23 @@ static void parse_one_slot(const struct slot_map_entry *entry,
 		dt_add_property_cells(node, "lanes-reversed",
 				be16_to_cpu(entry->lane_reverse));
 
-	if (strnlen(entry->name, sizeof(entry->name)))
+	if (strnlen(entry->name, sizeof(entry->name))) {
+		/*
+		 * HACK: On some platforms (witherspoon) the slot label is
+		 * applied to the device rather than the pcie downstream port
+		 * that has the slot under it. Hack around this by moving the
+		 * slot label up if the parent port doesn't have one.
+		 */
+		if (dt_node_is_compatible(node->parent, "ibm,pcie-port") &&
+		    !dt_find_property(node->parent, "ibm,slot-label")) {
+			dt_add_property_nstr(node->parent, "ibm,slot-label",
+					entry->name, sizeof(entry->name));
+		}
+
 		dt_add_property_nstr(node, "ibm,slot-label",
 				entry->name, sizeof(entry->name));
+	}
+
 	if (entry->type == st_slot || entry->type == st_rc_slot)
 		dt_add_property(node, "ibm,pluggable", NULL, 0);
 
@@ -834,7 +848,6 @@ static void io_parse_slots(const struct HDIF_common_hdr *sp_iohubs, int hub_id)
 static void io_parse_fru(const void *sp_iohubs)
 {
 	unsigned int i;
-	struct dt_node *hn;
 	int count;
 
 	count = HDIF_get_iarray_size(sp_iohubs, CECHUB_FRU_IO_HUBS);
@@ -849,6 +862,7 @@ static void io_parse_fru(const void *sp_iohubs)
 	for (i = 0; i < count; i++) {
 		const struct cechub_io_hub *hub;
 		unsigned int size, hub_id;
+		struct dt_node *hn;
 		uint32_t chip_id;
 
 		hub = HDIF_get_iarray_item(sp_iohubs, CECHUB_FRU_IO_HUBS,
@@ -892,26 +906,25 @@ static void io_parse_fru(const void *sp_iohubs)
 		case CECHUB_HUB_MURANO:
 		case CECHUB_HUB_MURANO_SEGU:
 			prlog(PR_INFO, "CEC:     Murano !\n");
-			hn = io_add_p8(hub, sp_iohubs);
+			io_add_p8(hub, sp_iohubs);
 			break;
 		case CECHUB_HUB_VENICE_WYATT:
 			prlog(PR_INFO, "CEC:     Venice !\n");
-			hn = io_add_p8(hub, sp_iohubs);
+			io_add_p8(hub, sp_iohubs);
 			break;
 		case CECHUB_HUB_NIMBUS_SFORAZ:
 		case CECHUB_HUB_NIMBUS_MONZA:
 		case CECHUB_HUB_NIMBUS_LAGRANGE:
 			prlog(PR_INFO, "CEC:     Nimbus !\n");
-			hn = io_add_p9(hub, sp_iohubs);
+			io_add_p9(hub, sp_iohubs);
 			break;
 		case CECHUB_HUB_CUMULUS_DUOMO:
 			prlog(PR_INFO, "CEC:     Cumulus !\n");
-			hn = io_add_p9(hub, sp_iohubs);
+			io_add_p9(hub, sp_iohubs);
 			break;
 		default:
 			prlog(PR_ERR, "CEC:     Hub ID 0x%04x unsupported !\n",
 			      hub_id);
-			hn = NULL;
 		}
 
 		chip_id = pcid_to_chip_id(be32_to_cpu(hub->proc_chip_id));

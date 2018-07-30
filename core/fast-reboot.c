@@ -16,9 +16,11 @@
 
 #include <skiboot.h>
 #include <cpu.h>
+#include <console.h>
 #include <fsp.h>
 #include <psi.h>
 #include <opal.h>
+#include <mem_region.h>
 #include <xscom.h>
 #include <interrupts.h>
 #include <cec.h>
@@ -70,15 +72,27 @@ void disable_fast_reboot(const char *reason)
 	fast_reboot_disabled = reason;
 }
 
+/*
+ * This is called by the reboot CPU after all other CPUs have been
+ * quiesced and stopped, to perform various sanity checks on firmware
+ * data (and potentially hardware), to determine whether the fast
+ * reboot should go ahead.
+ */
+static bool fast_reboot_sanity_check(void)
+{
+	if (!mem_check_all()) {
+		prlog(PR_NOTICE, "REST: Fast reboot failed due to inconsistent "
+				"firmware data\n");
+		return false;
+	}
+
+	return true;
+}
+
 void fast_reboot(void)
 {
 	struct cpu_thread *cpu;
 	static int fast_reboot_count = 0;
-
-	if (proc_gen == proc_gen_p9) {
-		if (!nvram_query_eq("experimental-fast-reset","feeling-lucky"))
-			return;
-	}
 
 	if (!chip_quirk(QUIRK_MAMBO_CALLOUTS) &&
 			(proc_gen != proc_gen_p8 && proc_gen != proc_gen_p9)) {
@@ -108,8 +122,6 @@ void fast_reboot(void)
 		return;
 	}
 
-	/* Should mem_check() all regions before allowing fast reboot? */
-
 	prlog(PR_NOTICE, "RESET: Initiating fast reboot %d...\n", ++fast_reboot_count);
 	fast_boot_release = false;
 	sync();
@@ -118,6 +130,11 @@ void fast_reboot(void)
 	if (sreset_all_prepare()) {
 		prlog(PR_NOTICE, "RESET: Fast reboot failed to prepare "
 				"secondaries for system reset\n");
+		opal_quiesce(QUIESCE_RESUME, -1);
+		return;
+	}
+
+	if (!fast_reboot_sanity_check()) {
 		opal_quiesce(QUIESCE_RESUME, -1);
 		return;
 	}
@@ -147,7 +164,7 @@ void fast_reboot(void)
 	}
 
 	/* Ensure all the sresets get through */
-	if (!cpu_state_wait_all_others(cpu_state_present, msecs_to_tb(100))) {
+	if (!cpu_state_wait_all_others(cpu_state_present, msecs_to_tb(1000))) {
 		prlog(PR_NOTICE, "RESET: Fast reboot timed out waiting for "
 				"secondaries to call in\n");
 		return;
@@ -158,6 +175,8 @@ void fast_reboot(void)
 
 	/* This resets our quiesce state ready to enter the new kernel. */
 	opal_quiesce(QUIESCE_RESUME_FAST_REBOOT, -1);
+
+	console_complete_flush();
 
 	asm volatile("ba	0x100\n\t" : : : "memory");
 	for (;;)
@@ -223,6 +242,7 @@ static void check_split_core(void)
 		/* Setup LPCR to wakeup on external interrupts only */
 		mtspr(SPR_LPCR, ((mfspr(SPR_LPCR) & ~SPR_LPCR_P8_PECE) |
 				 SPR_LPCR_P8_PECE2));
+		isync();
 		/* Go to nap (doesn't return) */
 		enter_nap();
 	}
@@ -335,6 +355,22 @@ void __noreturn fast_reboot_entry(void)
 	cpu_set_sreset_enable(true);
 	cpu_set_ipi_enable(true);
 
+	if (!chip_quirk(QUIRK_MAMBO_CALLOUTS)) {
+		/*
+		 * mem_region_clear_unused avoids these preload regions
+		 * so it can run along side image preloading. Clear these
+		 * regions now to catch anything not overwritten by
+		 * preload.
+		 *
+		 * Mambo may have embedded payload here, so don't clear
+		 * it at all. The OS may have already overwritten it, so
+		 * mambo really should reserve memory regions for this, if
+		 * fast reboot is to work reliably.
+		 */
+		memset(KERNEL_LOAD_BASE, 0, KERNEL_LOAD_SIZE);
+		memset(INITRAMFS_LOAD_BASE, 0, INITRAMFS_LOAD_SIZE);
+	}
+
 	/* Start preloading kernel and ramdisk */
 	start_preload_kernel();
 
@@ -362,6 +398,8 @@ void __noreturn fast_reboot_entry(void)
 	}
 
 	ipmi_set_fw_progress_sensor(IPMI_FW_PCI_INIT);
+
+	mem_region_clear_unused();
 
 	/* Load and boot payload */
 	load_and_boot_kernel(true);

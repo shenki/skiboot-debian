@@ -61,10 +61,10 @@ struct cpu_thread {
 	uint64_t			save_r1;
 	void				*icp_regs;
 	uint32_t			in_opal_call;
+	uint32_t			quiesce_opal_call;
 	uint32_t			con_suspend;
 	struct list_head		locks_held;
 	bool				con_need_flush;
-	bool				quiesce_opal_call;
 	bool				in_mcount;
 	bool				in_poller;
 	bool				in_reinit;
@@ -97,9 +97,8 @@ struct cpu_thread {
 	 */
 	uint32_t			core_hmi_state; /* primary only */
 	uint32_t			*core_hmi_state_ptr;
-	/* Mask to indicate thread id in core. */
-	uint8_t				thread_mask;
 	bool				tb_invalid;
+	bool				tb_resynced;
 
 	/* For use by XICS emulation on XIVE */
 	struct xive_cpu_state		*xstate;
@@ -120,6 +119,11 @@ struct cpu_thread {
 	u32				sensor_attr;
 	u32				token;
 	bool				dts_read_in_progress;
+
+#ifdef DEBUG_LOCKS
+	/* The lock requested by this cpu, used for deadlock detection */
+	struct lock			*requested_lock;
+#endif
 };
 
 /* This global is set to 1 to allow secondaries to callin,
@@ -152,6 +156,7 @@ static inline void __nomcount cpu_relax(void)
 /* Initialize CPUs */
 void pre_init_boot_cpu(void);
 void init_boot_cpu(void);
+void init_cpu_max_pir(void);
 void init_all_cpus(void);
 
 /* This brings up our secondaries */
@@ -305,6 +310,7 @@ static inline void cpu_give_self_os(void)
 
 extern unsigned long __attrconst cpu_stack_bottom(unsigned int pir);
 extern unsigned long __attrconst cpu_stack_top(unsigned int pir);
+extern unsigned long __attrconst cpu_emergency_stack_top(unsigned int pir);
 
 extern void cpu_idle_job(void);
 extern void cpu_idle_delay(unsigned long delay);

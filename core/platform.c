@@ -58,11 +58,11 @@ static int64_t opal_cec_reboot(void)
 
 	opal_quiesce(QUIESCE_HOLD, -1);
 
-	console_complete_flush();
-
 	/* Try fast-reset unless explicitly disabled */
 	if (!nvram_query_eq("fast-reset","0"))
 		fast_reboot();
+
+	console_complete_flush();
 
 	if (platform.cec_reboot)
 		return platform.cec_reboot();
@@ -97,6 +97,7 @@ static int64_t opal_cec_reboot2(uint32_t reboot_type, char *diag)
 			prerror("OPAL: failed to log an error\n");
 		}
 		disable_fast_reboot("Reboot due to Platform Error");
+		console_complete_flush();
 		return xscom_trigger_xstop();
 	case OPAL_REBOOT_FULL_IPL:
 		disable_fast_reboot("full IPL reboot requested");
@@ -168,6 +169,25 @@ static int generic_start_preload_resource(enum resource_id id, uint32_t subid,
 	return OPAL_EMPTY;
 }
 
+/* These values will work for a ZZ booted using BML */
+const struct platform_ocapi generic_ocapi = {
+	.i2c_engine        = 1,
+	.i2c_port          = 4,
+	.i2c_reset_addr    = 0x20,
+	.i2c_reset_odl0    = (1 << 1),
+	.i2c_reset_odl1    = (1 << 6),
+	.i2c_presence_addr = 0x20,
+	.i2c_presence_odl0 = (1 << 2), /* bottom connector */
+	.i2c_presence_odl1 = (1 << 7), /* top connector */
+	/*
+	 * The ZZs we typically use for BML/generic platform tend to
+	 * have old planars and presence detection is broken there, so
+	 * force presence.
+	 */
+	.force_presence    = true,
+	.odl_phy_swap      = true,
+};
+
 static struct bmc_platform generic_bmc = {
 	.name = "generic",
 };
@@ -183,6 +203,7 @@ static struct platform generic_platform = {
 	.cec_power_down	= generic_cec_power_down,
 	.start_preload_resource	= generic_start_preload_resource,
 	.resource_loaded	= generic_resource_loaded,
+	.ocapi		= &generic_ocapi,
 };
 
 const struct bmc_platform *bmc_platform = &generic_bmc;

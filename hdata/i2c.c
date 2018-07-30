@@ -1,3 +1,19 @@
+/* Copyright 2017-2018 IBM Corp.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * 	http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <device.h>
 #include <cpu.h>
 #include <vpd.h>
@@ -15,8 +31,8 @@ struct i2c_dev {
 
 	/* i2c slave info */
 	uint8_t type;
-	uint8_t i2c_addr;
-	uint8_t i2c_port;
+	uint8_t dev_addr;
+	uint8_t dev_port;
 	uint8_t __reserved;
 
 	__be32 purpose;
@@ -120,8 +136,8 @@ struct hdat_i2c_label {
 
 static struct hdat_i2c_label hdat_i2c_labels[] = {
 	{ 0x1, "led-controller" },
-	{ 0x2, "eeprom-pgood" },
-	{ 0x3, "eeprom-control" },
+	{ 0x2, "pci-hotplug-pgood" },
+	{ 0x3, "pci-hotplug-control" },
 	{ 0x4, "tpm" },
 	{ 0x5, "module-vpd" },
 	{ 0x6, "dimm SPD" },
@@ -181,7 +197,7 @@ static bool is_zeros(const void *p, size_t size)
 struct host_i2c_hdr {
 	const struct HDIF_array_hdr hdr;
 	__be32 version;
-} __packed;
+} __packed __align(0x4);
 
 int parse_i2c_devs(const struct HDIF_common_hdr *hdr, int idata_index,
 	struct dt_node *xscom)
@@ -191,7 +207,7 @@ int parse_i2c_devs(const struct HDIF_common_hdr *hdr, int idata_index,
 	const struct i2c_dev *dev;
 	const char *label, *name, *compat;
 	const struct host_i2c_hdr *ahdr;
-	uint32_t i2c_addr;
+	uint32_t dev_addr;
 	uint32_t version;
 	uint32_t size;
 	uint32_t purpose;
@@ -224,8 +240,8 @@ int parse_i2c_devs(const struct HDIF_common_hdr *hdr, int idata_index,
 	}
 
 	if (version == 2) {
-		prerror("I2C: v%d found, but not supported. Parsing as v1\n",
-			version);
+		prlog(PR_INFO, "I2C: v%d found, but not supported. Parsing as v1\n",
+		      version);
 	} else if (version > 2) {
 		prerror("I2C: v%d found, but not supported! THIS IS A BUG\n",
 			version);
@@ -245,6 +261,16 @@ int parse_i2c_devs(const struct HDIF_common_hdr *hdr, int idata_index,
 			continue;
 		}
 
+		/*
+		 * On some systems the CFAM I2C master is represented in the
+		 * host I2C table as engine 6. There are only 4 (0, 1, 2, 3)
+		 * engines accessible to the host via XSCOM so filter out
+		 * engines outside this range so we don't create bogus
+		 * i2cm@<addr> nodes.
+		 */
+		if (dev->i2cm_engine >= 4 && proc_gen == proc_gen_p9)
+			continue;
+
 		i2cm = get_i2cm_node(xscom, dev->i2cm_engine);
 		bus = get_bus_node(i2cm, dev->i2cm_port,
 			be16_to_cpu(dev->i2c_bus_freq));
@@ -254,7 +280,7 @@ int parse_i2c_devs(const struct HDIF_common_hdr *hdr, int idata_index,
 		 * justified quantity (i.e it includes the R/W bit). So we need
 		 * to strip it off to get an address linux can use.
 		 */
-		i2c_addr = dev->i2c_addr >> 1;
+		dev_addr = dev->dev_addr >> 1;
 
 		purpose = be32_to_cpu(dev->purpose);
 		type = map_type(dev->type);
@@ -288,25 +314,44 @@ int parse_i2c_devs(const struct HDIF_common_hdr *hdr, int idata_index,
 		 * hdat. Log both cases to see what/where/why.
 		 */
 		if (!type || dev->type == 0xFF)
-			prlog(PR_WARNING, "HDAT I2C: found e%dp%d - %s@%x (%#x:%s)\n",
-			      dev->i2cm_engine, dev->i2cm_port, name, i2c_addr,
-			      purpose, label);
+			prlog(PR_WARNING, "HDAT I2C: found e%dp%d - %s@%x dp:%02x (%#x:%s)\n",
+			      dev->i2cm_engine, dev->i2cm_port, name, dev_addr,
+			      dev->dev_port, purpose, label);
 		else
-			prlog(PR_TRACE, "HDAT I2C: found e%dp%d - %s@%x (%#x:%s)\n",
-			      dev->i2cm_engine, dev->i2cm_port, name, i2c_addr,
-			      purpose, label);
+			prlog(PR_DEBUG, "HDAT I2C: found e%dp%d - %s@%x dp:%02x (%#x:%s)\n",
+			      dev->i2cm_engine, dev->i2cm_port, name, dev_addr,
+			      dev->dev_port, purpose, label);
 
-		node = dt_new_addr(bus, name, i2c_addr);
+		/*
+		 * Multi-port device require special handling since we need to
+		 * generate the device-specific DT bindings. For now we're just
+		 * going to ignore them since these devices are owned by FW
+		 * any way.
+		 */
+		if (dev->dev_port != 0xff)
+			continue;
+
+		node = dt_new_addr(bus, name, dev_addr);
 		if (!node)
 			continue;
 
-		dt_add_property_cells(node, "reg", i2c_addr);
+		dt_add_property_cells(node, "reg", dev_addr);
 		dt_add_property_cells(node, "link-id",
 			be32_to_cpu(dev->i2c_link));
 		if (compat)
 			dt_add_property_string(node, "compatible", compat);
 		if (label)
 			dt_add_property_string(node, "label", label);
+
+		/*
+		 * Set a default timeout of 2s on the ports with a TPM. This is
+		 * to work around a bug with certain TPM firmwares that can
+		 * clock stretch for long periods of time and will lock up
+		 * until they are power cycled if a STOP condition is sent
+		 * during this period.
+		 */
+		if (dev->type == 0x3)
+			dt_add_property_cells(bus, "timeout-ms", 2000);
 
 		/* XXX: SLCA index? */
 	}

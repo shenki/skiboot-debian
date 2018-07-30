@@ -43,7 +43,7 @@ struct cpu_stack {
 	};
 } __align(STACK_SIZE);
 
-static struct cpu_stack *cpu_stacks = (struct cpu_stack *)CPU_STACKS_BASE;
+static struct cpu_stack * const cpu_stacks = (struct cpu_stack *)CPU_STACKS_BASE;
 unsigned int cpu_thread_count;
 unsigned int cpu_max_pir;
 struct cpu_thread *boot_cpu;
@@ -57,6 +57,7 @@ static bool ipi_enabled;
 static bool pm_enabled;
 static bool current_hile_mode;
 static bool current_radix_mode;
+static bool tm_suspend_enabled;
 
 unsigned long cpu_secondary_start __force_data = 0;
 
@@ -78,13 +79,16 @@ unsigned long __attrconst cpu_stack_bottom(unsigned int pir)
 
 unsigned long __attrconst cpu_stack_top(unsigned int pir)
 {
-	/* This is the top of the MC stack which is above the normal
-	 * stack, which means a SP between cpu_stack_bottom() and
-	 * cpu_stack_top() can either be a normal stack pointer or
-	 * a Machine Check stack pointer
-	 */
+	/* This is the top of the normal stack. */
 	return ((unsigned long)&cpu_stacks[pir]) +
 		NORMAL_STACK_SIZE - STACK_TOP_GAP;
+}
+
+unsigned long __attrconst cpu_emergency_stack_top(unsigned int pir)
+{
+	/* This is the top of the emergency stack, above the normal stack. */
+	return ((unsigned long)&cpu_stacks[pir]) +
+		NORMAL_STACK_SIZE + EMERGENCY_STACK_SIZE - STACK_TOP_GAP;
 }
 
 static void cpu_wake(struct cpu_thread *cpu)
@@ -200,6 +204,8 @@ struct cpu_job *__cpu_queue_job(struct cpu_thread *cpu,
 
 	/* Can't be scheduled, run it now */
 	if (cpu == NULL) {
+		if (!this_cpu()->job_has_no_return)
+			this_cpu()->job_has_no_return = no_return;
 		func(data);
 		job->complete = true;
 		return job;
@@ -347,6 +353,7 @@ static void cpu_idle_p8(enum cpu_wake_cause wake_on)
 		lpcr |= SPR_LPCR_P8_PECE2 | SPR_LPCR_P8_PECE3;
 		mtspr(SPR_LPCR, lpcr);
 	}
+	isync();
 
 	/* Enter nap */
 	enter_p8_pm_state(false);
@@ -369,8 +376,6 @@ static void cpu_idle_p9(enum cpu_wake_cause wake_on)
 		prlog_once(PR_DEBUG, "cpu_idle_p9 called pm disabled\n");
 		return;
 	}
-
-	msgclr(); /* flush pending messages */
 
 	/* Synchronize with wakers */
 	if (wake_on == cpu_wake_on_job) {
@@ -397,29 +402,32 @@ static void cpu_idle_p9(enum cpu_wake_cause wake_on)
 
 		/* HV DBELL and DEC */
 		lpcr |= SPR_LPCR_P9_PECEL1 | SPR_LPCR_P9_PECEL3;
-		mtspr(SPR_LPCR, lpcr);
 	}
 
 	mtspr(SPR_LPCR, lpcr);
+	isync();
 
 	if (sreset_enabled) {
 		/* stop with EC=1 (sreset) and ESL=1 (enable thread switch). */
-		/* PSSCR SD=0 ESL=1 EC=1 PSSL=0 TR=3 MTL=0 RL=3 */
+		/* PSSCR SD=0 ESL=1 EC=1 PSSL=0 TR=3 MTL=0 RL=1 */
 		psscr = PPC_BIT(42) | PPC_BIT(43) |
-			PPC_BITMASK(54, 55) | PPC_BITMASK(62,63);
+			PPC_BITMASK(54, 55) | PPC_BIT(63);
 		enter_p9_pm_state(psscr);
 	} else {
 		/* stop with EC=0 (resumes) which does not require sreset. */
-		/* PSSCR SD=0 ESL=0 EC=0 PSSL=0 TR=3 MTL=0 RL=3 */
-		psscr = PPC_BITMASK(54, 55) | PPC_BITMASK(62,63);
+		/* PSSCR SD=0 ESL=0 EC=0 PSSL=0 TR=3 MTL=0 RL=1 */
+		psscr = PPC_BITMASK(54, 55) | PPC_BIT(63);
 		enter_p9_pm_lite_state(psscr);
 	}
 
-skip_sleep:
+	/* Clear doorbell */
+	p9_dbell_receive();
+
+ skip_sleep:
 	/* Restore */
+	sync();
 	cpu->in_idle = false;
 	cpu->in_sleep = false;
-	p9_dbell_receive();
 }
 
 static void cpu_idle_pm(enum cpu_wake_cause wake_on)
@@ -449,6 +457,7 @@ void cpu_idle_job(void)
 		while (!cpu_check_jobs(cpu)) {
 			if (pm_enabled)
 				break;
+			cpu_relax();
 			barrier();
 		}
 		smt_medium();
@@ -732,7 +741,7 @@ struct cpu_thread *next_ungarded_primary(struct cpu_thread *cpu)
 {
 	do {
 		cpu = next_cpu(cpu);
-	} while(cpu && cpu->state == cpu_state_unavailable && cpu->primary != cpu);
+	} while(cpu && (cpu->state == cpu_state_unavailable || cpu->primary != cpu));
 
 	return cpu;
 }
@@ -824,6 +833,11 @@ static void init_cpu_thread(struct cpu_thread *t,
 			    enum cpu_thread_state state,
 			    unsigned int pir)
 {
+	/* offset within cpu_thread to prevent stack_guard clobber */
+	const size_t guard_skip = container_off_var(t, stack_guard) +
+		sizeof(t->stack_guard);
+
+	memset(t + guard_skip, 0, sizeof(struct cpu_thread) - guard_skip);
 	init_lock(&t->dctl_lock);
 	init_lock(&t->job_lock);
 	list_head_init(&t->job_queue);
@@ -878,7 +892,7 @@ void __nomcount pre_init_boot_cpu(void)
 
 void init_boot_cpu(void)
 {
-	unsigned int i, pir, pvr;
+	unsigned int pir, pvr;
 
 	pir = mfspr(SPR_PIR);
 	pvr = mfspr(SPR_PVR);
@@ -913,23 +927,20 @@ void init_boot_cpu(void)
 		proc_gen = proc_gen_unknown;
 	}
 
-	/* Get a CPU thread count and an initial max PIR based on family */
+	/* Get a CPU thread count based on family */
 	switch(proc_gen) {
 	case proc_gen_p7:
 		cpu_thread_count = 4;
-		cpu_max_pir = SPR_PIR_P7_MASK;
 		prlog(PR_INFO, "CPU: P7 generation processor"
 		      " (max %d threads/core)\n", cpu_thread_count);
 		break;
 	case proc_gen_p8:
 		cpu_thread_count = 8;
-		cpu_max_pir = SPR_PIR_P8_MASK;
 		prlog(PR_INFO, "CPU: P8 generation processor"
 		      " (max %d threads/core)\n", cpu_thread_count);
 		break;
 	case proc_gen_p9:
 		cpu_thread_count = 4;
-		cpu_max_pir = SPR_PIR_P9_MASK;
 		prlog(PR_INFO, "CPU: P9 generation processor"
 		      " (max %d threads/core)\n", cpu_thread_count);
 		break;
@@ -941,24 +952,13 @@ void init_boot_cpu(void)
 
 	prlog(PR_DEBUG, "CPU: Boot CPU PIR is 0x%04x PVR is 0x%08x\n",
 	      pir, pvr);
-	prlog(PR_DEBUG, "CPU: Initial max PIR set to 0x%x\n", cpu_max_pir);
 
 	/*
-	 * Adjust top of RAM to include CPU stacks. While we *could* have
-	 * less RAM than this... during early boot, it's enough of a check
-	 * until we start parsing device tree / hdat and find out for sure
+	 * Adjust top of RAM to include the boot CPU stack. If we have less
+	 * RAM than this, it's not possible to boot.
 	 */
+	cpu_max_pir = pir;
 	top_of_ram += (cpu_max_pir + 1) * STACK_SIZE;
-
-	/* Clear the CPU structs */
-	for (i = 0; i <= cpu_max_pir; i++) {
-		/* boot CPU already cleared and we don't want to clobber
-		 * its stack guard value.
-		 */
-		if (i == pir)
-			continue;
-		memset(&cpu_stacks[i].cpu, 0, sizeof(struct cpu_thread));
-	}
 
 	/* Setup boot CPU state */
 	boot_cpu = &cpu_stacks[pir].cpu;
@@ -978,6 +978,7 @@ static void enable_large_dec(bool on)
 		lpcr &= ~SPR_LPCR_P9_LD;
 
 	mtspr(SPR_LPCR, lpcr);
+	isync();
 }
 
 #define HIGH_BIT (1ull << 63)
@@ -1012,14 +1013,60 @@ static int find_dec_bits(void)
 	return bits;
 }
 
+static void init_tm_suspend_mode_property(void)
+{
+	struct dt_node *node;
+
+	/* If we don't find anything, assume TM suspend is enabled */
+	tm_suspend_enabled = true;
+
+	node = dt_find_by_path(dt_root, "/ibm,opal/fw-features/tm-suspend-mode");
+	if (!node)
+		return;
+
+	if (dt_find_property(node, "disabled"))
+		tm_suspend_enabled = false;
+}
+
+void init_cpu_max_pir(void)
+{
+	struct dt_node *cpus, *cpu;
+
+	cpus = dt_find_by_path(dt_root, "/cpus");
+	assert(cpus);
+
+	/* Iterate all CPUs in the device-tree */
+	dt_for_each_child(cpus, cpu) {
+		unsigned int pir, server_no;
+
+		/* Skip cache nodes */
+		if (strcmp(dt_prop_get(cpu, "device_type"), "cpu"))
+			continue;
+
+		server_no = dt_prop_get_u32(cpu, "reg");
+
+		/* If PIR property is absent, assume it's the same as the
+		 * server number
+		 */
+		pir = dt_prop_get_u32_def(cpu, "ibm,pir", server_no);
+
+		if (cpu_max_pir < pir + cpu_thread_count - 1)
+			cpu_max_pir = pir + cpu_thread_count - 1;
+	}
+
+	prlog(PR_DEBUG, "CPU: New max PIR set to 0x%x\n", cpu_max_pir);
+}
+
 void init_all_cpus(void)
 {
 	struct dt_node *cpus, *cpu;
-	unsigned int thread, new_max_pir = 0;
+	unsigned int thread;
 	int dec_bits = find_dec_bits();
 
 	cpus = dt_find_by_path(dt_root, "/cpus");
 	assert(cpus);
+
+	init_tm_suspend_mode_property();
 
 	/* Iterate all CPUs in the device-tree */
 	dt_for_each_child(cpus, cpu) {
@@ -1052,7 +1099,6 @@ void init_all_cpus(void)
 		      " State=%d\n", pir, server_no, state);
 
 		/* Setup thread 0 */
-		assert(pir <= cpu_max_pir);
 		t = pt = &cpu_stacks[pir].cpu;
 		if (t != boot_cpu) {
 			init_cpu_thread(t, state, pir);
@@ -1064,19 +1110,17 @@ void init_all_cpus(void)
 		t->node = cpu;
 		t->chip_id = chip_id;
 		t->icp_regs = NULL; /* Will be set later */
+#ifdef DEBUG_LOCKS
+		t->requested_lock = NULL;
+#endif
 		t->core_hmi_state = 0;
 		t->core_hmi_state_ptr = &t->core_hmi_state;
-		t->thread_mask = 1;
 
 		/* Add associativity properties */
 		add_core_associativity(t);
 
 		/* Add the decrementer width property */
 		dt_add_property_cells(cpu, "ibm,dec-bits", dec_bits);
-
-		/* Adjust max PIR */
-		if (new_max_pir < (pir + cpu_thread_count - 1))
-			new_max_pir = pir + cpu_thread_count - 1;
 
 		/* Iterate threads */
 		p = dt_find_property(cpu, "ibm,ppc-interrupt-server#s");
@@ -1094,13 +1138,9 @@ void init_all_cpus(void)
 			t->node = cpu;
 			t->chip_id = chip_id;
 			t->core_hmi_state_ptr = &pt->core_hmi_state;
-			t->thread_mask = 1 << thread;
 		}
 		prlog(PR_INFO, "CPU:  %d secondary threads\n", thread);
 	}
-	cpu_max_pir = new_max_pir;
-	prlog(PR_DEBUG, "CPU: New max PIR set to 0x%x\n", new_max_pir);
-	adjust_cpu_stacks_alloc();
 }
 
 void cpu_bringup(void)
@@ -1266,17 +1306,30 @@ static void cpu_change_hid0(void *__req)
 static int64_t cpu_change_all_hid0(struct hid0_change_req *req)
 {
 	struct cpu_thread *cpu;
+	struct cpu_job **jobs;
+
+	jobs = zalloc(sizeof(struct cpu_job *) * cpu_max_pir + 1);
+	assert(jobs);
 
 	for_each_available_cpu(cpu) {
 		if (!cpu_is_thread0(cpu))
 			continue;
-		if (cpu == this_cpu()) {
-			cpu_change_hid0(req);
+		if (cpu == this_cpu())
 			continue;
-		}
-		cpu_wait_job(cpu_queue_job(cpu, "cpu_change_hid0",
-			cpu_change_hid0, req), true);
+		jobs[cpu->pir] = cpu_queue_job(cpu, "cpu_change_hid0",
+						cpu_change_hid0, req);
 	}
+
+	/* this cpu */
+	cpu_change_hid0(req);
+
+	for_each_available_cpu(cpu) {
+		if (jobs[cpu->pir])
+			cpu_wait_job(jobs[cpu->pir], true);
+	}
+
+	free(jobs);
+
 	return OPAL_SUCCESS;
 }
 
@@ -1298,20 +1351,35 @@ static void cpu_cleanup_one(void *param __unused)
 {
 	mtspr(SPR_AMR, 0);
 	mtspr(SPR_IAMR, 0);
+	mtspr(SPR_PCR, 0);
 }
 
 static int64_t cpu_cleanup_all(void)
 {
 	struct cpu_thread *cpu;
+	struct cpu_job **jobs;
+
+	jobs = zalloc(sizeof(struct cpu_job *) * cpu_max_pir + 1);
+	assert(jobs);
 
 	for_each_available_cpu(cpu) {
-		if (cpu == this_cpu()) {
-			cpu_cleanup_one(NULL);
+		if (cpu == this_cpu())
 			continue;
-		}
-		cpu_wait_job(cpu_queue_job(cpu, "cpu_cleanup",
-					   cpu_cleanup_one, NULL), true);
+		jobs[cpu->pir] = cpu_queue_job(cpu, "cpu_cleanup",
+						cpu_cleanup_one, NULL);
 	}
+
+	/* this cpu */
+	cpu_cleanup_one(NULL);
+
+	for_each_available_cpu(cpu) {
+		if (jobs[cpu->pir])
+			cpu_wait_job(jobs[cpu->pir], true);
+	}
+
+	free(jobs);
+
+
 	return OPAL_SUCCESS;
 }
 
@@ -1436,11 +1504,10 @@ static int64_t opal_reinit_cpus(uint64_t flags)
 	if (flags & OPAL_REINIT_CPUS_TM_SUSPEND_DISABLED) {
 		flags &= ~OPAL_REINIT_CPUS_TM_SUSPEND_DISABLED;
 
-		/*
-		 * Pending a hostboot change we can't determine the status of
-		 * this, so it always fails.
-		 */
-		rc = OPAL_UNSUPPORTED;
+		if (tm_suspend_enabled)
+			rc = OPAL_UNSUPPORTED;
+		else
+			rc = OPAL_SUCCESS;
 	}
 
 	/* Handle P8 DD1 SLW reinit */

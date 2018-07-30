@@ -76,7 +76,7 @@ struct pci_device {
 	uint32_t		vdid;
 	uint32_t		sub_vdid;
 #define PCI_VENDOR_ID(x)	((x) & 0xFFFF)
-#define PCI_DEVICE_ID(x)	((x) >> 8)
+#define PCI_DEVICE_ID(x)	((x) >> 16)
 	uint32_t		class;
 	uint64_t		cap_list;
 	struct {
@@ -333,6 +333,10 @@ struct phb_ops {
 	/* PCI peer-to-peer setup */
 	void (*set_p2p)(struct phb *phb, uint64_t mode, uint64_t flags,
 			uint16_t pe_number);
+
+	/* Get/set PBCQ Tunnel BAR register */
+	void (*get_tunnel_bar)(struct phb *phb, uint64_t *addr);
+	int64_t (*set_tunnel_bar)(struct phb *phb, uint64_t addr);
 };
 
 enum phb_type {
@@ -344,6 +348,7 @@ enum phb_type {
 	phb_type_pcie_v3,
 	phb_type_pcie_v4,
 	phb_type_npu_v2,
+	phb_type_npu_v2_opencapi,
 };
 
 struct phb {
@@ -431,6 +436,7 @@ extern int64_t pci_find_ecap(struct phb *phb, uint16_t bdfn, uint16_t cap,
 			     uint8_t *version);
 extern void pci_init_capabilities(struct phb *phb, struct pci_device *pd);
 extern bool pci_wait_crs(struct phb *phb, uint16_t bdfn, uint32_t *out_vdid);
+extern void pci_restore_slot_bus_configs(struct pci_slot *slot);
 extern void pci_device_init(struct phb *phb, struct pci_device *pd);
 extern struct pci_device *pci_walk_dev(struct phb *phb,
 				       struct pci_device *pd,

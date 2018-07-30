@@ -21,6 +21,8 @@ try = $(shell set -e; if ($(1)) >/dev/null 2>&1; \
 try-cflag = $(call try,$(1) $(2) -x c -c /dev/null -o /dev/null,$(2))
 test_cflag = $(call try,$(1) $(2) -x c -c /dev/null -o /dev/null,1,0)
 
+cc-name := $(shell $(CC) -v 2>&1 | grep -q "clang version" && echo clang || echo gcc)
+
 # Base warnings
 CWARNS := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 	  -Werror-implicit-function-declaration -Wdeclaration-after-statement \
@@ -29,6 +31,7 @@ CWARNS := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 	  -Wwrite-strings -Wcast-align \
 	  -Winit-self \
 	  -Wframe-larger-than=1024 \
+	  -Wno-stringop-truncation \
 	  -Werror
 
 # Host tools and options
@@ -69,7 +72,7 @@ endif
 CFLAGS := -fno-strict-aliasing -pie -fpie -fno-pic -mbig-endian -m64
 CFLAGS += -mcpu=power7
 CFLAGS += -Wl,--oformat,elf64-powerpc
-CFLAGS += -ffixed-r13
+CFLAGS += $(call try-cflag,$(CC),-ffixed-r13)
 CFLAGS += $(call try-cflag,$(CC),-std=gnu11)
 ifeq ($(ELF_ABI_v2),1)
 CFLAGS += $(call try-cflag,$(CC),-mabi=elfv2)
@@ -126,7 +129,8 @@ LDFLAGS += -Wl,-pie
 LDFLAGS += -Wl,-Ttext-segment,$(LD_TEXT) -Wl,-N -Wl,--build-id=none
 LDFLAGS += -Wl,--no-multi-toc
 LDFLAGS += -mcpu=power7 -mbig-endian -Wl,--oformat,elf64-powerpc
-
+LDFLAGS_FINAL = -EB -m elf64ppc --no-multi-toc -N --build-id=none --whole-archive
+LDFLAGS_FINAL += -static -nostdlib -pie -Ttext-segment=$(LD_TEXT) --oformat=elf64-powerpc
 LDRFLAGS=-melf64ppc
 # Debug stuff
 #LDFLAGS += -Wl,-v -Wl,-Map,foomap 
@@ -142,13 +146,36 @@ else
 AFLAGS += $(call try-cflag,$(CC),-mabi=elfv1)
 endif
 
+ifeq ($(cc-name),clang)
+CLANG_TARGET    := --target=powerpc64-linux-gnu -mcpu=pwr8
+GCC_TOOLCHAIN   := $(realpath $(dir $(shell which $(LD)))/..)
+ifneq ($(GCC_TOOLCHAIN),)
+CLANG_GCC_TC    := --gcc-toolchain=$(GCC_TOOLCHAIN)
+endif
+CFLAGS += $(CLANG_TARGET) $(CLANG_GCC_TC)
+AFLAGS += $(CLANG_TARGET) $(CLANG_GCC_TC)
+LDFLAGS += $(CLANG_TARGET) $(CLANG_GCC_TC)
+
+# Workarounds
+# TODO: Fix the issues these hide, and remove them
+CFLAGS += -Wno-cast-align \
+	-Wno-unused-command-line-argument \
+	-Wno-unknown-warning-option \
+	-Wno-gnu-variable-sized-type-not-at-end \
+	-Wno-address-of-packed-member
+
+# pci_add_device_nodes is the largest, at 2048 with clang-7 (smaller with older
+# versions)
+CFLAGS += -Wframe-larger-than=2048
+endif
+
 # Special tool flags:
 # Do not use the floating point unit
 CFLAGS += -msoft-float
 # Do not use string instructions
-CFLAGS += -mno-string
+CFLAGS += $(call try-cflag,$(CC),-mno-string)
 # do not use load/store multiple word instrcutions
-CFLAGS += -mno-multiple
+CFLAGS += $(call try-cflag,$(CC),-mno-multiple)
 # do not use any automatic vector foo
 # While it would be safe during boot, we don't save/restore across OPAL calls
 CFLAGS += $(call try-cflag,$(CC),-mno-vsx) \
@@ -213,8 +240,8 @@ OBJS += $(LIBC) $(CCAN) $(DEVSRC_OBJ) $(LIBPORE)
 OBJS_NO_VER = $(OBJS)
 ALL_OBJS = $(OBJS) version.o
 
-ALL_OBJS_1 = $(ALL_OBJS) asm/dummy_map.o
-ALL_OBJS_2 = $(ALL_OBJS) asm/real_map.o
+ALL_OBJS_1 = $(TARGET).tmp.a asm/dummy_map.o
+ALL_OBJS_2 = $(TARGET).tmp.a asm/real_map.o
 
 $(TARGET).lid.xz: $(TARGET).lid
 	$(call Q,XZ, cat $^ | xz -9 -C crc32 > $@, $@)
@@ -228,13 +255,17 @@ $(TARGET).lid.stb: $(TARGET).lid libstb/create-container
 $(TARGET).lid.xz.stb: $(TARGET).lid.xz libstb/create-container
 	$(call Q,STB-DEVELOPMENT-SIGNED-CONTAINER,$(SRC)/libstb/sign-with-local-keys.sh $< $@ $(SRC)/libstb/keys/ PAYLOAD,$@)
 
+$(TARGET).tmp.a: $(ALL_OBJS)
+	@rm -f $(TARGET).tmp.a
+	$(call Q,AR, $(AR) rcsTPD $@ $(ALL_OBJS), $@)
+
 $(TARGET).tmp.elf: $(ALL_OBJS_1) $(TARGET).lds $(KERNEL)
-	$(call Q,LD, $(CC) $(LDFLAGS) -T $(TARGET).lds $(ALL_OBJS_1) -o $@, $@)
+	$(call Q,LD, $(LD) $(LDFLAGS_FINAL) -o $@ -T $(TARGET).lds $(ALL_OBJS_1), $@)
 
 asm/real_map.o : $(TARGET).tmp.map
 
 $(TARGET).elf: $(ALL_OBJS_2) $(TARGET).lds $(KERNEL)
-	$(call Q,LD, $(CC) $(LDFLAGS) -T $(TARGET).lds $(ALL_OBJS_2) -o $@, $@)
+	$(call Q,LD, $(LD) $(LDFLAGS_FINAL) -o $@ -T $(TARGET).lds $(ALL_OBJS_2), $@)
 
 $(SUBDIRS):
 	$(call Q,MKDIR,mkdir -p $@, $@)
@@ -286,13 +317,16 @@ skiboot.info: coverage external/pflash/pflash.info external/gard/gard.info
 	lcov -q -a $@ -a external/gard/gard.info -o $@
 	lcov -q -r $@ $(LCOV_EXCLUDE) -o $@ --rc lcov_branch_coverage=1
 
+doc:
+	make -C doc html
+
 tags:
 	find . -name '*.[chS]' | xargs ctags
 
 TAGS:
 	find . -name '*.[chS]' | xargs etags
 
-.PHONY: tags TAGS check coverage
+.PHONY: tags TAGS check coverage doc
 
 cscope:
 	find . -name '*.[chS]' | xargs cscope

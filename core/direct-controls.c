@@ -29,21 +29,27 @@ extern unsigned long callthru_tcl(const char *str, int len);
 
 static void mambo_sreset_cpu(struct cpu_thread *cpu)
 {
+	uint32_t chip_id = pir_to_chip_id(cpu->pir);
 	uint32_t core_id = pir_to_core_id(cpu->pir);
 	uint32_t thread_id = pir_to_thread_id(cpu->pir);
 	char tcl_cmd[50];
 
-	snprintf(tcl_cmd, sizeof(tcl_cmd), "mysim cpu 0:%i:%i start_thread 0x100", core_id, thread_id);
+	snprintf(tcl_cmd, sizeof(tcl_cmd),
+			"mysim cpu %i:%i:%i start_thread 0x100",
+			chip_id, core_id, thread_id);
 	callthru_tcl(tcl_cmd, strlen(tcl_cmd));
 }
 
 static void mambo_stop_cpu(struct cpu_thread *cpu)
 {
+	uint32_t chip_id = pir_to_chip_id(cpu->pir);
 	uint32_t core_id = pir_to_core_id(cpu->pir);
 	uint32_t thread_id = pir_to_thread_id(cpu->pir);
 	char tcl_cmd[50];
 
-	snprintf(tcl_cmd, sizeof(tcl_cmd), "mysim cpu 0:%i:%i stop_thread", core_id, thread_id);
+	snprintf(tcl_cmd, sizeof(tcl_cmd),
+			"mysim cpu %i:%i:%i stop_thread",
+			chip_id, core_id, thread_id);
 	callthru_tcl(tcl_cmd, strlen(tcl_cmd));
 }
 
@@ -267,10 +273,14 @@ static int p8_sreset_thread(struct cpu_thread *cpu)
 #define P9_QUIESCE_POLL_INTERVAL	100
 #define P9_QUIESCE_TIMEOUT		100000
 
+#define P9_CORE_THREAD_STATE		0x10ab3
+#define P9_THREAD_INFO			0x10a9b
+
 #define P9_EC_DIRECT_CONTROLS		0x10a9c
 #define P9_THREAD_STOP(t)		PPC_BIT(7 + 8*(t))
 #define P9_THREAD_CONT(t)		PPC_BIT(6 + 8*(t))
 #define P9_THREAD_SRESET(t)		PPC_BIT(4 + 8*(t))
+#define P9_THREAD_CLEAR_MAINT(t)	PPC_BIT(3 + 8*(t))
 #define P9_THREAD_PWR(t)		PPC_BIT(32 + 8*(t))
 
 /* EC_PPM_SPECIAL_WKUP_HYP */
@@ -305,7 +315,7 @@ static int p9_core_set_special_wakeup(struct cpu_thread *cpu)
 		prlog(PR_ERR, "Could not set special wakeup on %u:%u:"
 				" Unable to write PPM_SPECIAL_WKUP_HYP.\n",
 				chip_id, core_id);
-		return OPAL_HARDWARE;
+		goto out_fail;
 	}
 
 	for (i = 0; i < P9_SPWKUP_TIMEOUT / P9_SPWKUP_POLL_INTERVAL; i++) {
@@ -315,9 +325,22 @@ static int p9_core_set_special_wakeup(struct cpu_thread *cpu)
 					chip_id, core_id);
 			goto out_fail;
 		}
-		if (val & P9_SPECIAL_WKUP_DONE)
-			return 0;
-
+		if (val & P9_SPECIAL_WKUP_DONE) {
+			/*
+			 * CORE_GATED will be unset on a successful special
+			 * wakeup of the core which indicates that the core is
+			 * out of stop state. If CORE_GATED is still set then
+			 * raise error.
+			 */
+			if (dctl_core_is_gated(cpu)) {
+				prlog(PR_ERR, "Failed special wakeup on %u:%u"
+						" as CORE_GATED is set\n",
+						chip_id, core_id);
+				goto out_fail;
+			} else {
+				return 0;
+			}
+		}
 		time_wait_us(P9_SPWKUP_POLL_INTERVAL);
 	}
 
@@ -326,10 +349,11 @@ static int p9_core_set_special_wakeup(struct cpu_thread *cpu)
 			chip_id, core_id);
 
 out_fail:
-	/* De-assert special wakeup after a small delay. */
-	time_wait_us(1);
-	xscom_write(chip_id, swake_addr, 0);
-
+	/*
+	 * As per the special wakeup protocol we should not de-assert
+	 * the special wakeup on the core until WAKEUP_DONE is set.
+	 * So even on error do not de-assert.
+	 */
 	return OPAL_HARDWARE;
 }
 
@@ -338,12 +362,8 @@ static int p9_core_clear_special_wakeup(struct cpu_thread *cpu)
 	uint32_t chip_id = pir_to_chip_id(cpu->pir);
 	uint32_t core_id = pir_to_core_id(cpu->pir);
 	uint32_t swake_addr;
-	uint32_t sshhyp_addr;
-	uint64_t val;
-	int i;
 
 	swake_addr = XSCOM_ADDR_P9_EC_SLAVE(core_id, EC_PPM_SPECIAL_WKUP_HYP);
-	sshhyp_addr = XSCOM_ADDR_P9_EC_SLAVE(core_id, P9_EC_PPM_SSHHYP);
 
 	/*
 	 * De-assert special wakeup after a small delay.
@@ -357,25 +377,14 @@ static int p9_core_clear_special_wakeup(struct cpu_thread *cpu)
 				chip_id, core_id);
 		return OPAL_HARDWARE;
 	}
-	time_wait_us(1);
 
-	for (i = 0; i < P9_SPWKUP_TIMEOUT / P9_SPWKUP_POLL_INTERVAL; i++) {
-		if (xscom_read(chip_id, sshhyp_addr, &val)) {
-			prlog(PR_ERR, "Could not clear special wakeup on %u:%u:"
-					" Unable to read PPM_SSHHYP.\n",
-					chip_id, core_id);
-			return OPAL_HARDWARE;
-		}
-		if (!(val & P9_SPECIAL_WKUP_DONE))
-			return 0;
-
-		time_wait_us(P9_SPWKUP_POLL_INTERVAL);
-	}
-
-	prlog(PR_ERR, "Could not clear special wakeup on %u:%u:"
-			" timeout waiting for clear of SPECIAL_WKUP_DONE.\n",
-			chip_id, core_id);
-	return OPAL_HARDWARE;
+	/*
+	 * Don't wait for de-assert to complete as other components
+	 * could have requested for special wkeup. Wait for 10ms to
+	 * avoid back-to-back asserts
+	 */
+	time_wait_us(10000);
+	return 0;
 }
 
 static int p9_thread_quiesced(struct cpu_thread *cpu)
@@ -407,6 +416,72 @@ static int p9_thread_quiesced(struct cpu_thread *cpu)
 	return 0;
 }
 
+static int p9_cont_thread(struct cpu_thread *cpu)
+{
+	uint32_t chip_id = pir_to_chip_id(cpu->pir);
+	uint32_t core_id = pir_to_core_id(cpu->pir);
+	uint32_t thread_id = pir_to_thread_id(cpu->pir);
+	uint32_t cts_addr;
+	uint32_t ti_addr;
+	uint32_t dctl_addr;
+	uint64_t core_thread_state;
+	uint64_t thread_info;
+	bool active, stop;
+	int rc;
+
+	rc = p9_thread_quiesced(cpu);
+	if (rc < 0)
+		return rc;
+	if (!rc) {
+		prlog(PR_ERR, "Could not cont thread %u:%u:%u:"
+				" Thread is not quiesced.\n",
+				chip_id, core_id, thread_id);
+		return OPAL_BUSY;
+	}
+
+	cts_addr = XSCOM_ADDR_P9_EC(core_id, P9_CORE_THREAD_STATE);
+	ti_addr = XSCOM_ADDR_P9_EC(core_id, P9_THREAD_INFO);
+	dctl_addr = XSCOM_ADDR_P9_EC(core_id, P9_EC_DIRECT_CONTROLS);
+
+	if (xscom_read(chip_id, cts_addr, &core_thread_state)) {
+		prlog(PR_ERR, "Could not resume thread %u:%u:%u:"
+				" Unable to read CORE_THREAD_STATE.\n",
+				chip_id, core_id, thread_id);
+		return OPAL_HARDWARE;
+	}
+	if (core_thread_state & PPC_BIT(56 + thread_id))
+		stop = true;
+	else
+		stop = false;
+
+	if (xscom_read(chip_id, ti_addr, &thread_info)) {
+		prlog(PR_ERR, "Could not resume thread %u:%u:%u:"
+				" Unable to read THREAD_INFO.\n",
+				chip_id, core_id, thread_id);
+		return OPAL_HARDWARE;
+	}
+	if (thread_info & PPC_BIT(thread_id))
+		active = true;
+	else
+		active = false;
+
+	if (!active || stop) {
+		if (xscom_write(chip_id, dctl_addr, P9_THREAD_CLEAR_MAINT(thread_id))) {
+			prlog(PR_ERR, "Could not resume thread %u:%u:%u:"
+				      " Unable to write EC_DIRECT_CONTROLS.\n",
+				      chip_id, core_id, thread_id);
+		}
+	} else {
+		if (xscom_write(chip_id, dctl_addr, P9_THREAD_CONT(thread_id))) {
+			prlog(PR_ERR, "Could not resume thread %u:%u:%u:"
+				      " Unable to write EC_DIRECT_CONTROLS.\n",
+				      chip_id, core_id, thread_id);
+		}
+	}
+
+	return 0;
+}
+
 static int p9_stop_thread(struct cpu_thread *cpu)
 {
 	uint32_t chip_id = pir_to_chip_id(cpu->pir);
@@ -421,10 +496,12 @@ static int p9_stop_thread(struct cpu_thread *cpu)
 	rc = p9_thread_quiesced(cpu);
 	if (rc < 0)
 		return rc;
-	if (rc)
-		prlog(PR_WARNING, "Stopping thread %u:%u:%u warning:"
-				" thread is quiesced already.\n",
+	if (rc) {
+		prlog(PR_ERR, "Could not stop thread %u:%u:%u:"
+				" Thread is quiesced already.\n",
 				chip_id, core_id, thread_id);
+		return OPAL_BUSY;
+	}
 
 	if (xscom_write(chip_id, dctl_addr, P9_THREAD_STOP(thread_id))) {
 		prlog(PR_ERR, "Could not stop thread %u:%u:%u:"
@@ -447,30 +524,7 @@ static int p9_stop_thread(struct cpu_thread *cpu)
 			" Unable to quiesce thread.\n",
 			chip_id, core_id, thread_id);
 
-	if (xscom_write(chip_id, dctl_addr, P9_THREAD_CONT(thread_id))) {
-		prlog(PR_ERR, "Could not resume thread %u:%u:%u:"
-				" Unable to write EC_DIRECT_CONTROLS.\n",
-				chip_id, core_id, thread_id);
-	}
-
 	return OPAL_HARDWARE;
-}
-
-static int p9_cont_thread(struct cpu_thread *cpu)
-{
-	uint32_t chip_id = pir_to_chip_id(cpu->pir);
-	uint32_t core_id = pir_to_core_id(cpu->pir);
-	uint32_t thread_id = pir_to_thread_id(cpu->pir);
-	uint32_t dctl_addr;
-
-	dctl_addr = XSCOM_ADDR_P9_EC(core_id, P9_EC_DIRECT_CONTROLS);
-	if (xscom_write(chip_id, dctl_addr, P9_THREAD_CONT(thread_id))) {
-		prlog(PR_ERR, "Could not resume thread %u:%u:%u:"
-				" Unable to write EC_DIRECT_CONTROLS.\n",
-				chip_id, core_id, thread_id);
-	}
-
-	return 0;
 }
 
 static int p9_sreset_thread(struct cpu_thread *cpu)

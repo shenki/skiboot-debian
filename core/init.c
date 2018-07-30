@@ -50,6 +50,10 @@
 #include <libstb/trustedboot.h>
 #include <phys-map.h>
 #include <imc.h>
+#include <dts.h>
+#include <sbe-p9.h>
+#include <debug_descriptor.h>
+#include <occ.h>
 
 enum proc_gen proc_gen;
 unsigned int pcie_max_link_speed;
@@ -59,7 +63,7 @@ static size_t kernel_size;
 static bool kernel_32bit;
 
 /* We backup the previous vectors here before copying our own */
-static uint8_t old_vectors[0x2000];
+static uint8_t old_vectors[EXCEPTION_VECTORS_END];
 
 #ifdef SKIBOOT_GCOV
 void skiboot_gcov_done(void);
@@ -379,9 +383,9 @@ static bool load_kernel(void)
 		 * If the kernel is at 0, restore it as it was overwritten
 		 * by our vectors.
 		 */
-		if (kernel_entry < 0x2000) {
+		if (kernel_entry < EXCEPTION_VECTORS_END) {
 			cpu_set_sreset_enable(false);
-			memcpy(NULL, old_vectors, 0x2000);
+			memcpy(NULL, old_vectors, EXCEPTION_VECTORS_END);
 			sync_icache();
 		}
 	} else {
@@ -428,13 +432,13 @@ static bool load_kernel(void)
 				    SECURE_BOOT_HEADERS_SIZE + kernel_size);
 	}
 
-	trustedboot_exit_boot_services();
-
 	return true;
 }
 
 static void load_initramfs(void)
 {
+	uint64_t *initramfs_start;
+	void *stb_container = NULL;
 	int loaded;
 
 	loaded = wait_for_resource_loaded(RESOURCE_ID_INITRAMFS,
@@ -443,18 +447,32 @@ static void load_initramfs(void)
 	if (loaded != OPAL_SUCCESS || !initramfs_size)
 		return;
 
+	if (stb_is_container(INITRAMFS_LOAD_BASE, initramfs_size)) {
+		stb_container = INITRAMFS_LOAD_BASE;
+		initramfs_start = INITRAMFS_LOAD_BASE + SECURE_BOOT_HEADERS_SIZE;
+	} else {
+		initramfs_start = INITRAMFS_LOAD_BASE;
+	}
+
 	dt_check_del_prop(dt_chosen, "linux,initrd-start");
 	dt_check_del_prop(dt_chosen, "linux,initrd-end");
 
 	printf("INIT: Initramfs loaded, size: %zu bytes\n", initramfs_size);
 
 	dt_add_property_u64(dt_chosen, "linux,initrd-start",
-			(uint64_t)INITRAMFS_LOAD_BASE);
+			(uint64_t)initramfs_start);
 	dt_add_property_u64(dt_chosen, "linux,initrd-end",
-			(uint64_t)INITRAMFS_LOAD_BASE + initramfs_size);
-}
+			(uint64_t)initramfs_start + initramfs_size);
 
-int64_t mem_dump_free(void);
+	if (chip_quirk(QUIRK_MAMBO_CALLOUTS)) {
+		secureboot_verify(RESOURCE_ID_INITRAMFS,
+				  stb_container,
+				  SECURE_BOOT_HEADERS_SIZE + initramfs_size);
+		trustedboot_measure(RESOURCE_ID_INITRAMFS,
+				    stb_container,
+				    SECURE_BOOT_HEADERS_SIZE + initramfs_size);
+	}
+}
 
 void *fdt;
 
@@ -484,9 +502,12 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 
 	load_initramfs();
 
+	trustedboot_exit_boot_services();
+
 	ipmi_set_fw_progress_sensor(IPMI_FW_OS_BOOT);
 
-	occ_pstates_init();
+	if (fsp_present())
+		occ_pstates_init();
 
 	if (!is_reboot) {
 		/* We wait for the nvram read to complete here so we can
@@ -501,7 +522,8 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 		 * OCC takes few secs to boot.  Call this as late as
 		 * as possible to avoid delay.
 		 */
-		occ_sensors_init();
+		if (!occ_sensors_init())
+			dts_sensor_create_nodes(sensor_node);
 
 	} else {
 		/* fdt will be rebuilt */
@@ -553,12 +575,19 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	prlog(PR_DEBUG, "INIT: stdout-path: %s\n", stdoutp ? stdoutp : "");
 
 
-	printf("INIT: Starting kernel at 0x%llx, fdt at %p %u bytes)\n",
+	printf("INIT: Starting kernel at 0x%llx, fdt at %p %u bytes\n",
 	       kernel_entry, fdt, fdt_totalsize(fdt));
 
 	debug_descriptor.state_flags |= OPAL_BOOT_COMPLETE;
 
 	fdt_set_boot_cpuid_phys(fdt, this_cpu()->pir);
+
+	/* Check there is something there before we branch to it */
+	if (*(uint32_t *)kernel_entry == 0) {
+		prlog(PR_EMERG, "FATAL: Kernel is zeros, can't execute!\n");
+		assert(0);
+	}
+
 	if (kernel_32bit)
 		start_kernel32(kernel_entry, fdt, mem_top);
 	start_kernel(kernel_entry, fdt, mem_top);
@@ -734,14 +763,16 @@ void copy_exception_vectors(void)
 	/* Backup previous vectors as this could contain a kernel
 	 * image.
 	 */
-	memcpy(old_vectors, NULL, 0x2000);
+	memcpy(old_vectors, NULL, EXCEPTION_VECTORS_END);
 
-	/* Copy from 0x100 to 0x2000, avoid below 0x100 as this is
-	 * the boot flag used by CPUs still potentially entering
+	/* Copy from 0x100 to EXCEPTION_VECTORS_END, avoid below 0x100 as
+	 * this is the boot flag used by CPUs still potentially entering
 	 * skiboot.
 	 */
-	BUILD_ASSERT((&reset_patch_end - &reset_patch_start) < 0x1f00);
-	memcpy((void *)0x100, (void *)(SKIBOOT_BASE + 0x100), 0x1f00);
+	BUILD_ASSERT((&reset_patch_end - &reset_patch_start) <
+			EXCEPTION_VECTORS_END - 0x100);
+	memcpy((void *)0x100, (void *)(SKIBOOT_BASE + 0x100),
+			EXCEPTION_VECTORS_END - 0x100);
 	sync_icache();
 }
 
@@ -843,7 +874,7 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	prlog(PR_DEBUG, "initial console log level: memory %d, driver %d\n",
 	       (debug_descriptor.console_log_levels >> 4),
 	       (debug_descriptor.console_log_levels & 0x0f));
-	prlog(PR_TRACE, "You will not see this\n");
+	prlog(PR_TRACE, "OPAL is Powered By Linked-List Technology.\n");
 
 #ifdef SKIBOOT_GCOV
 	skiboot_gcov_done();
@@ -926,6 +957,12 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	lpc_init();
 
 	/*
+	 * This should be done before mem_region_init, so the stack
+	 * region length can be set according to the maximum PIR.
+	 */
+	init_cpu_max_pir();
+
+	/*
 	 * Now, we init our memory map from the device-tree, and immediately
 	 * reserve areas which we know might contain data coming from
 	 * HostBoot. We need to do these things before we start doing
@@ -937,6 +974,11 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* Reserve HOMER and OCC area */
 	homer_init();
 
+	/* Initialize the rest of the cpu thread structs */
+	init_all_cpus();
+	if (proc_gen == proc_gen_p9)
+		cpu_set_ipi_enable(true);
+
 	/* Add the /opal node to the device-tree */
 	add_opal_node();
 
@@ -947,11 +989,6 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 * Note: Timebases still not synchronized.
 	 */
 	probe_platform();
-
-	/* Initialize the rest of the cpu thread structs */
-	init_all_cpus();
-	if (proc_gen == proc_gen_p9)
-		cpu_set_ipi_enable(true);
 
 	/* Allocate our split trace buffers now. Depends add_opal_node() */
 	init_trace_buffers();
@@ -996,6 +1033,12 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 */
 	chiptod_init();
 
+	/*
+	 * SBE uses TB value for scheduling timer. Hence init after
+	 * chiptod init
+	 */
+	p9_sbe_init();
+
 	/* Initialize i2c */
 	p8_i2c_init();
 
@@ -1038,6 +1081,17 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	op_display(OP_LOG, OP_MOD_INIT, 0x0002);
 
+	/*
+	 * On some POWER9 BMC systems, we need to initialise the OCC
+	 * before the NPU to facilitate NVLink/OpenCAPI presence
+	 * detection, so we set it up as early as possible. On FSP
+	 * systems, Hostboot starts booting the OCC later, so we delay
+	 * OCC initialisation as late as possible to give it the
+	 * maximum time to boot up.
+	 */
+	if (!fsp_present())
+		occ_pstates_init();
+
 	pci_nvram_init();
 
 	preload_io_vpd();
@@ -1065,6 +1119,8 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* Probe NPUs */
 	probe_npu();
 	probe_npu2();
+	/* TODO: Eventually, we'll do NVLink and OpenCAPI together */
+	probe_npu2_opencapi();
 
 	/* Initialize PCI */
 	pci_init_slots();

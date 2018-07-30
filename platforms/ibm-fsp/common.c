@@ -22,6 +22,8 @@
 #include <console.h>
 #include <hostservices.h>
 #include <ipmi.h>
+#include <debug_descriptor.h>
+#include <occ.h>
 
 #include "ibm-fsp.h"
 

@@ -145,15 +145,13 @@ static void phb4_init_hw(struct phb4 *p, bool first_init);
 #define PHBLOGCFG(p, fmt, a...) do {} while (0)
 #endif
 
+#define PHB4_CAN_STORE_EOI(p) \
+	(XIVE_STORE_EOI_ENABLED && ((p)->rev >= PHB4_REV_NIMBUS_DD20))
+
 static bool verbose_eeh;
 static bool pci_tracing;
 static bool pci_eeh_mmio;
 static bool pci_retry_all;
-
-enum capi_dma_tvt {
-	CAPI_DMA_TVT0,
-	CAPI_DMA_TVT1,
-};
 
 /* Note: The "ASB" name is historical, practically this means access via
  * the XSCOM backdoor
@@ -274,7 +272,7 @@ static int64_t phb4_pcicfg_check(struct phb4 *p, uint32_t bdfn,
 		return OPAL_HARDWARE;
 
 	/* Check PHB state */
-	if (p->state == PHB4_STATE_BROKEN)
+	if (p->broken)
 		return OPAL_HARDWARE;
 
 	/* Fetch the PE# from cache */
@@ -621,6 +619,8 @@ static int64_t phb4_get_reserved_pe_number(struct phb *phb)
 static void phb4_root_port_init(struct phb *phb, struct pci_device *dev,
 				int ecap, int aercap)
 {
+	struct phb4 *p = phb_to_phb4(phb);
+	struct pci_slot *slot = dev->slot;
 	uint16_t bdfn = dev->bdfn;
 	uint16_t val16;
 	uint32_t val32;
@@ -635,6 +635,24 @@ static void phb4_root_port_init(struct phb *phb, struct pci_device *dev,
 			phb->slot->ops.prepare_link_change;
 
 	// FIXME: check recommended init values for phb4
+
+	/*
+	 * Enable the bridge slot capability in the root port's config
+	 * space. This should probably be done *before* we start
+	 * scanning config space, but we need a pci_device struct to
+	 * exist before we do a slot lookup so *faaaaaaaaaaaaaart*
+	 */
+	if (slot && slot->pluggable && slot->power_limit) {
+		uint64_t val;
+
+		val = in_be64(p->regs + PHB_PCIE_SCR);
+		val |= PHB_PCIE_SCR_SLOT_CAP;
+		out_be64(p->regs + PHB_PCIE_SCR, val);
+
+		/* update the cached slotcap */
+		pci_cfg_read32(phb, bdfn, ecap + PCICAP_EXP_SLOTCAP,
+				&slot->slot_cap);
+	}
 
 	/* Enable SERR and parity checking */
 	pci_cfg_read16(phb, bdfn, PCI_CFG_CMD, &val16);
@@ -2148,18 +2166,6 @@ static void phb4_prepare_link_change(struct pci_slot *slot, bool is_up)
 		out_be64(p->regs + PHB_REGB_ERR_FAT_ENABLE,
 			 0xde0fff91035743ffull);
 
-		/*
-		 * We might lose the bus numbers during the reset operation
-		 * and we need to restore them. Otherwise, some adapters (e.g.
-		 * IPR) can't be probed properly by the kernel. We don't need
-		 * to restore bus numbers for every kind of reset, however,
-		 * it's not harmful to always restore the bus numbers, which
-		 * simplifies the logic.
-		 */
-		pci_restore_bridge_buses(slot->phb, slot->pd);
-		if (slot->phb->ops->device_init)
-			pci_walk_dev(slot->phb, slot->pd,
-				     slot->phb->ops->device_init, NULL);
 	} else {
 		/* Mask AER receiver error */
 		phb4_pcicfg_read32(&p->phb, 0, p->aercap +
@@ -2187,7 +2193,7 @@ static int64_t phb4_get_presence_state(struct pci_slot *slot, uint8_t *val)
 	uint64_t hps, dtctl;
 
 	/* Test for PHB in error state ? */
-	if (p->state == PHB4_STATE_BROKEN)
+	if (p->broken)
 		return OPAL_HARDWARE;
 
 	/* Check hotplug status */
@@ -2363,7 +2369,7 @@ static void phb4_dump_capp_err_regs(struct phb4 *p)
 /* Check if AIB is fenced via PBCQ NFIR */
 static bool phb4_fenced(struct phb4 *p)
 {
-	uint64_t nfir_p, nfir_n, err_aib;
+	uint64_t nfir_p, nfir_p_wof, nfir_n, nfir_n_wof, err_aib;
 	uint64_t err_rpt0, err_rpt1;
 
 	/* Already fenced ? */
@@ -2383,7 +2389,11 @@ static bool phb4_fenced(struct phb4 *p)
 	xscom_read(p->chip_id,
 		   p->pci_stk_xscom + XPEC_PCI_STK_PCI_FIR, &nfir_p);
 	xscom_read(p->chip_id,
+		   p->pci_stk_xscom + XPEC_PCI_STK_PCI_FIR_WOF, &nfir_p_wof);
+	xscom_read(p->chip_id,
 		   p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR, &nfir_n);
+	xscom_read(p->chip_id,
+		   p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR_WOF, &nfir_n_wof);
 	xscom_read(p->chip_id,
 		   p->pe_stk_xscom + XPEC_NEST_STK_ERR_RPT0, &err_rpt0);
 	xscom_read(p->chip_id,
@@ -2392,14 +2402,15 @@ static bool phb4_fenced(struct phb4 *p)
 		   p->pci_stk_xscom + XPEC_PCI_STK_PBAIB_ERR_REPORT, &err_aib);
 
 	PHBERR(p, "            PCI FIR=%016llx\n", nfir_p);
+	PHBERR(p, "        PCI FIR WOF=%016llx\n", nfir_p_wof);
 	PHBERR(p, "           NEST FIR=%016llx\n", nfir_n);
+	PHBERR(p, "       NEST FIR WOF=%016llx\n", nfir_n_wof);
 	PHBERR(p, "           ERR RPT0=%016llx\n", err_rpt0);
 	PHBERR(p, "           ERR RPT1=%016llx\n", err_rpt1);
 	PHBERR(p, "            AIB ERR=%016llx\n", err_aib);
 
 	/* Mark ourselves fenced */
 	p->flags |= PHB4_AIB_FENCED;
-	p->state = PHB4_STATE_FENCED;
 
 	/* dump capp error registers in case phb was fenced due to capp */
 	if (nfir_n & XPEC_NEST_STK_PCI_NFIR_CXA_PE_CAPP)
@@ -2494,12 +2505,33 @@ static bool phb4_adapter_in_whitelist(uint32_t vdid)
 	return false;
 }
 
+static struct pci_card_id lane_eq_disable[] = {
+	{ 0x10de, 0x17fd }, /* Nvidia GM200GL [Tesla M40] */
+	{ 0x10de, 0x1db4 }, /* Nvidia GV100 */
+};
+
+static bool phb4_lane_eq_retry_whitelist(uint32_t vdid)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lane_eq_disable); i++)
+		if ((lane_eq_disable[i].vendor == VENDOR(vdid)) &&
+		    (lane_eq_disable[i].device == DEVICE(vdid)))
+			return true;
+	return false;
+}
+
+static void phb4_lane_eq_change(struct phb4 *p, uint32_t vdid)
+{
+	p->lane_eq_en = !phb4_lane_eq_retry_whitelist(vdid);
+}
+
 #define min(x,y) ((x) < (y) ? x : y)
 
-static bool phb4_link_optimal(struct pci_slot *slot)
+static bool phb4_link_optimal(struct pci_slot *slot, uint32_t *vdid)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
-	uint32_t vdid;
+	uint32_t id;
 	uint16_t bdfn;
 	uint8_t trained_speed, phb_speed, dev_speed, target_speed;
 	uint8_t trained_width, phb_width, dev_width, target_width;
@@ -2516,7 +2548,7 @@ static bool phb4_link_optimal(struct pci_slot *slot)
 	/* Get device capability */
 	bdfn = 0x0100; /* bus=1 dev=0 device=0 */
 	/* Since this is the first access, we need to wait for CRS */
-	if (!pci_wait_crs(slot->phb, bdfn , &vdid))
+	if (!pci_wait_crs(slot->phb, bdfn , &id))
 		return true;
 	phb4_get_info(slot->phb, bdfn, &dev_speed, &dev_width);
 
@@ -2526,16 +2558,20 @@ static bool phb4_link_optimal(struct pci_slot *slot)
 	target_width = min(phb_width, dev_width);
 	optimal_width = (trained_width >= target_width);
 	optimal = optimal_width && optimal_speed;
-	retry_enabled = phb4_chip_retry_workaround() &&
-		phb4_adapter_in_whitelist(vdid);
+	retry_enabled = (phb4_chip_retry_workaround() &&
+			 phb4_adapter_in_whitelist(id)) ||
+		phb4_lane_eq_retry_whitelist(id);
 
-	PHBDBG(p, "LINK: Card [%04x:%04x] %s Retry:%s\n", VENDOR(vdid),
-	       DEVICE(vdid), optimal ? "Optimal" : "Degraded",
+	PHBDBG(p, "LINK: Card [%04x:%04x] %s Retry:%s\n", VENDOR(id),
+	       DEVICE(id), optimal ? "Optimal" : "Degraded",
 	       retry_enabled ? "enabled" : "disabled");
 	PHBDBG(p, "LINK: Speed Train:GEN%i PHB:GEN%i DEV:GEN%i%s\n",
 	       trained_speed, phb_speed, dev_speed, optimal_speed ? "" : " *");
 	PHBDBG(p, "LINK: Width Train:x%02i PHB:x%02i DEV:x%02i%s\n",
 	       trained_width, phb_width, dev_width, optimal_width ? "" : " *");
+
+	if (vdid)
+		*vdid = id;
 
 	if (!retry_enabled)
 		return true;
@@ -2582,6 +2618,7 @@ static int64_t phb4_poll_link(struct pci_slot *slot)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
 	uint64_t reg;
+	uint32_t vdid;
 
 	switch (slot->state) {
 	case PHB4_SLOT_NORMAL:
@@ -2618,9 +2655,8 @@ static int64_t phb4_poll_link(struct pci_slot *slot)
 		}
 
 		if (slot->retries-- == 0) {
-			PHBERR(p, "LINK: Timeout waiting for electrical link\n");
-			PHBDBG(p, "LINK: DLP train control: 0x%016llx\n", reg);
-			return OPAL_HARDWARE;
+			PHBDBG(p, "LINK: No in-band presence\n");
+			return OPAL_SUCCESS;
 		}
 		/* Retry */
 		return pci_slot_set_sm_timeout(slot, msecs_to_tb(10));
@@ -2657,16 +2693,19 @@ static int64_t phb4_poll_link(struct pci_slot *slot)
 		}
 		if (reg & PHB_PCIE_DLP_TL_LINKACT) {
 			PHBDBG(p, "LINK: Link is stable\n");
-			if (!phb4_link_optimal(slot)) {
+			if (!phb4_link_optimal(slot, &vdid)) {
 				PHBDBG(p, "LINK: Link degraded\n");
-				if (slot->link_retries)
+				if (slot->link_retries) {
+					phb4_lane_eq_change(p, vdid);
 					return phb4_retry_state(slot);
+				}
 				/*
 				 * Link is degraded but no more retries, so
 				 * settle for what we have :-(
 				 */
 				PHBERR(p, "LINK: Degraded but no more retries\n");
 			}
+			pci_restore_slot_bus_configs(slot);
 			pci_slot_set_state(slot, PHB4_SLOT_NORMAL);
 			return OPAL_SUCCESS;
 		}
@@ -2745,6 +2784,7 @@ static int64_t phb4_freset(struct pci_slot *slot)
 	struct phb4 *p = phb_to_phb4(slot->phb);
 	uint8_t presence = 1;
 	uint64_t reg;
+	uint16_t reg16;
 
 	switch(slot->state) {
 	case PHB4_SLOT_NORMAL:
@@ -2763,6 +2803,12 @@ static int64_t phb4_freset(struct pci_slot *slot)
 		phb4_prepare_link_change(slot, false);
 		/* fall through */
 	case PHB4_SLOT_FRESET_START:
+		phb4_pcicfg_read16(&p->phb, 0, p->ecap + PCICAP_EXP_LCTL,
+				   &reg16);
+		reg16 |= PCICAP_EXP_LCTL_LINK_DIS;
+		phb4_pcicfg_write16(&p->phb, 0, p->ecap + PCICAP_EXP_LCTL,
+				    reg16);
+
 		if (!p->skip_perst) {
 			PHBDBG(p, "FRESET: Assert\n");
 			reg = in_be64(p->regs + PHB_PCIE_CRESET);
@@ -2797,11 +2843,18 @@ static int64_t phb4_freset(struct pci_slot *slot)
 		pci_slot_set_state(slot,
 			PHB4_SLOT_FRESET_DEASSERT_DELAY);
 
+		/* Move on to link poll right away */
+		return pci_slot_set_sm_timeout(slot, 1);
+	case PHB4_SLOT_FRESET_DEASSERT_DELAY:
+		PHBDBG(p, "FRESET: Starting training\n");
+		phb4_pcicfg_read16(&p->phb, 0, p->ecap + PCICAP_EXP_LCTL,
+				   &reg16);
+		reg16 &= ~(PCICAP_EXP_LCTL_LINK_DIS);
+		phb4_pcicfg_write16(&p->phb, 0, p->ecap + PCICAP_EXP_LCTL,
+				    reg16);
+
 		phb4_training_trace(p);
 
-		/* Move on to link poll right away */
-		return pci_slot_set_sm_timeout(slot, msecs_to_tb(1));
-	case PHB4_SLOT_FRESET_DEASSERT_DELAY:
 		pci_slot_set_state(slot, PHB4_SLOT_LINK_START);
 		return slot->ops.poll_link(slot);
 	default:
@@ -2829,25 +2882,75 @@ static int64_t load_capp_ucode(struct phb4 *p)
 	return rc;
 }
 
-static void do_capp_recovery_scoms(struct phb4 *p)
+static int do_capp_recovery_scoms(struct phb4 *p)
 {
-	uint64_t reg;
-	uint32_t offset;
+	uint64_t rc, reg, end;
+	uint64_t offset = PHB4_CAPP_REG_OFFSET(p);
 
-	PHBDBG(p, "Doing CAPP recovery scoms\n");
 
-	offset = PHB4_CAPP_REG_OFFSET(p);
-	/* disable snoops */
-	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0);
-	load_capp_ucode(p);
-	/* clear err rpt reg*/
-	xscom_write(p->chip_id, CAPP_ERR_RPT_CLR + offset, 0);
-	/* clear capp fir */
-	xscom_write(p->chip_id, CAPP_FIR + offset, 0);
-
+	/* Get the status of CAPP recovery */
 	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
-	reg &= ~(PPC_BIT(0) | PPC_BIT(1));
-	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, reg);
+
+	/* No recovery in progress ignore */
+	if ((reg & PPC_BIT(0)) == 0) {
+		PHBDBG(p, "CAPP: No recovery in progress\n");
+		return OPAL_SUCCESS;
+	}
+
+	PHBDBG(p, "CAPP: Waiting for recovery to complete\n");
+	/* recovery timer failure period 168ms */
+	end = mftb() + msecs_to_tb(168);
+	while ((reg & (PPC_BIT(1) | PPC_BIT(5) | PPC_BIT(9))) == 0) {
+
+		time_wait_ms(5);
+		xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
+
+		if (end && tb_compare(mftb(), end) != TB_AAFTERB) {
+			PHBERR(p, "CAPP: Capp recovery Timed-out.\n");
+			end = 0;
+			break;
+		}
+	}
+
+	/* Check if the recovery failed or passed */
+	if (reg & PPC_BIT(1)) {
+		PHBDBG(p, "Doing CAPP recovery scoms\n");
+		/* disable snoops */
+		xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0);
+		load_capp_ucode(p);
+
+		/* clear err rpt reg*/
+		xscom_write(p->chip_id, CAPP_ERR_RPT_CLR + offset, 0);
+
+		/* clear capp fir */
+		xscom_write(p->chip_id, CAPP_FIR + offset, 0);
+
+		/* Just reset Bit-0,1 and dont touch any other bit */
+		xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
+		reg &= ~(PPC_BIT(0) | PPC_BIT(1));
+		xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, reg);
+
+		PHBDBG(p, "CAPP recovery complete\n");
+		rc = OPAL_SUCCESS;
+
+	} else {
+		/* Most likely will checkstop here due to FIR ACTION for
+		 * failed recovery. So this message would never be logged.
+		 * But if we still enter here then return an error forcing a
+		 * fence of the PHB.
+		 */
+		if (reg  & PPC_BIT(5))
+			PHBERR(p, "CAPP: Capp recovery Failed\n");
+		else if (reg  & PPC_BIT(9))
+			PHBERR(p, "CAPP: Capp recovery hang detected\n");
+		else if (end != 0)
+			PHBERR(p, "CAPP: Unknown recovery failure\n");
+
+		PHBDBG(p, "CAPP: Err/Status-reg=0x%016llx\n", reg);
+		rc = OPAL_HARDWARE;
+	}
+
+	return rc;
 }
 
 static int64_t phb4_creset(struct pci_slot *slot)
@@ -2856,7 +2959,7 @@ static int64_t phb4_creset(struct pci_slot *slot)
 	uint64_t pbcq_status, reg;
 
 	/* Don't even try fixing a broken PHB */
-	if (p->state == PHB4_STATE_BROKEN)
+	if (p->broken)
 		return OPAL_HARDWARE;
 
 	switch (slot->state) {
@@ -2906,8 +3009,9 @@ static int64_t phb4_creset(struct pci_slot *slot)
 			PHBDBG(p, "CRESET: No pending transactions\n");
 
 			/* capp recovery */
-			if (p->flags & PHB4_CAPP_RECOVERY)
-				do_capp_recovery_scoms(p);
+			if ((p->flags & PHB4_CAPP_RECOVERY) &&
+			    (do_capp_recovery_scoms(p) != OPAL_SUCCESS))
+				goto error;
 
 			/* Clear errors in PFIR and NFIR */
 			xscom_write(p->chip_id, p->pci_stk_xscom + 0x1,
@@ -2955,7 +3059,7 @@ static int64_t phb4_creset(struct pci_slot *slot)
 
 error:
 	/* Mark the PHB as dead and expect it to be removed */
-	p->state = PHB4_STATE_BROKEN;
+	p->broken = true;
 	return OPAL_HARDWARE;
 }
 
@@ -3059,7 +3163,7 @@ static int64_t phb4_eeh_freeze_status(struct phb *phb, uint64_t pe_number,
 	*pci_error_type = OPAL_EEH_NO_ERROR;
 
 	/* Check dead */
-	if (p->state == PHB4_STATE_BROKEN) {
+	if (p->broken) {
 		*freeze_state = OPAL_EEH_STOPPED_MMIO_DMA_FREEZE;
 		*pci_error_type = OPAL_EEH_PHB_ERROR;
 		if (severity)
@@ -3122,7 +3226,7 @@ static int64_t phb4_eeh_freeze_clear(struct phb *phb, uint64_t pe_number,
 	int32_t i;
 	bool frozen_pe = false;
 
-	if (p->state == PHB4_STATE_BROKEN)
+	if (p->broken)
 		return OPAL_HARDWARE;
 
 	/* Summary. If nothing, move to clearing the PESTs which can
@@ -3179,7 +3283,7 @@ static int64_t phb4_eeh_freeze_set(struct phb *phb, uint64_t pe_number,
 	struct phb4 *p = phb_to_phb4(phb);
 	uint64_t data;
 
-	if (p->state == PHB4_STATE_BROKEN)
+	if (p->broken)
 		return OPAL_HARDWARE;
 
 	if (pe_number >= p->num_pes)
@@ -3218,7 +3322,7 @@ static int64_t phb4_eeh_next_error(struct phb *phb,
 	int32_t i, j;
 
 	/* If the PHB is broken, we needn't go forward */
-	if (p->state == PHB4_STATE_BROKEN) {
+	if (p->broken) {
 		*pci_error_type = OPAL_EEH_PHB_ERROR;
 		*severity = OPAL_EEH_SEV_PHB_DEAD;
 		return OPAL_SUCCESS;
@@ -3520,7 +3624,7 @@ static int64_t phb4_get_diag_data(struct phb *phb,
 
 	if (diag_buffer_len < sizeof(struct OpalIoPhb4ErrorData))
 		return OPAL_PARAMETER;
-	if (p->state == PHB4_STATE_BROKEN)
+	if (p->broken)
 		return OPAL_HARDWARE;
 
 	/*
@@ -3674,7 +3778,11 @@ static void phb4_init_capp_regs(struct phb4 *p, uint32_t capp_eng)
 	}
 	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, reg);
 
-	/* Initialize CI Store Buffers */
+	/* The transport control register needs to be loaded in two
+	 * steps. Once the register values have been set, we have to
+	 * write bit 63 to a '1', which loads the register values into
+	 * the ci store buffer logic.
+	 */
 	xscom_read(p->chip_id, TRANSPORT_CONTROL + offset, &reg);
 	reg |= PPC_BIT(63);
 	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, reg);
@@ -3732,7 +3840,7 @@ static void phb4_init_capp_regs(struct phb4 *p, uint32_t capp_eng)
 static void phb4_init_capp_errors(struct phb4 *p)
 {
 	/* Init_77: TXE Error AIB Fence Enable Register */
-	out_be64(p->regs + 0x0d30,	0xdff7bf0bf7ddfff0ull);
+	out_be64(p->regs + 0x0d30,	0xdff7bf0ff7ddfff0ull);
 
 	/* Init_86: RXE_ARB Error AIB Fence Enable Register */
 	out_be64(p->regs + 0x0db0,	0xfbffd7bbfb7fbfefull);
@@ -3746,6 +3854,39 @@ static void phb4_init_capp_errors(struct phb4 *p)
 	/* Init_113: PHB Error AIB Fence Enable Register */
 	out_be64(p->regs + 0x0cb0,	0x35777073ff000000ull);
 }
+
+ /*
+ * The capi indicator is over the 8 most significant bits on p9 (and
+ * not 16). We stay away from bits 59 (TVE select), 60 and 61 (MSI)
+ *
+ * For the mask, we keep bit 59 in, as capi messages must hit TVE#0.
+ * Bit 56 is not part of the mask, so that a NBW message (see below)
+ * is also considered a capi message.
+ */
+#define CAPIIND		0x0200
+#define CAPIMASK	0xFE00
+
+/*
+ * Non-Blocking Write messages are a subset of capi messages, so the
+ * indicator is the same as capi + an extra bit (56) to differentiate.
+ * Mask is the same as capi + the extra bit
+ */
+#define NBWIND		0x0300
+#define NBWMASK		0xFF00
+
+/*
+ * The ASN indicator is used for tunneled operations (as_notify and
+ * atomics).  Tunneled operation messages can be sent in PCI mode as
+ * well as CAPI mode.
+ *
+ * The format of those messages is specific and, for as_notify
+ * messages, the address field is hijacked to encode the LPID/PID/TID
+ * of the target thread, so those messages should not go through
+ * translation. They must hit TVE#1. Therefore bit 59 is part of the
+ * indicator.
+ */
+#define ASNIND		0x0C00
+#define ASNMASK		0xFF00
 
 /* Power Bus Common Queue Registers
  * All PBCQ and PBAIB registers are accessed via SCOM
@@ -3765,11 +3906,11 @@ static void phb4_init_capp_errors(struct phb4 *p)
  *             = 000000C0 for Stack2
  */
 static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
-				enum capi_dma_tvt dma_tvt,
 				uint32_t capp_eng)
 {
 	uint64_t reg, start_addr, end_addr, stq_eng, dma_eng;
-	int i;
+	uint64_t mbt0, mbt1;
+	int i, window_num = -1;
 
 	/* CAPP Control Register */
 	xscom_read(p->chip_id, p->pe_xscom + XPEC_NEST_CAPP_CNTL, &reg);
@@ -3791,8 +3932,6 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 		return OPAL_HARDWARE;
 	}
 
-	/* CAPP Control Register. Enable CAPP Mode */
-	reg = 0x8000000000000000ULL; /* PEC works in CAPP Mode */
 	if (p->index == CAPP0_PHB_INDEX) {
 		/* PBCQ is operating as a x16 stack
 		 * - The maximum number of engines give to CAPP will be
@@ -3802,17 +3941,37 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 		stq_eng = 0x000E000000000000ULL; /* 14 CAPP msg engines */
 		dma_eng = 0x0000FFFFFFFFFFFFULL; /* 48 CAPP Read machines */
 	}
+
 	if (p->index == CAPP1_PHB_INDEX) {
-		/* PBCQ is operating as a x8 stack
-		 * - The maximum number of engines given to CAPP should
-		 * be 6 and will be assigned in the order of 7 to 2.
-		 * - 0-30 (Read machines) are available for capp use.
-		 */
-		stq_eng = 0x0006000000000000ULL; /* 6 CAPP msg engines */
-		dma_eng = 0x0000FFFFF00E0000ULL; /* 30 Read machines for CAPP Minus 20-27 for DMA */
+		/* Check if PEC is in x8 or x16 mode */
+		xscom_read(p->chip_id, XPEC_PCI2_CPLT_CONF1, &reg);
+
+		if ((reg & XPEC_PCI2_IOVALID_MASK) == XPEC_PCI2_IOVALID_X16) {
+			/* PBCQ is operating as a x16 stack
+			 * - The maximum number of engines give to CAPP will be
+			 * 14 and will be assigned in the order of STQ 15 to 2.
+			 * - 0-47 (Read machines) are available for capp use.
+			 */
+			stq_eng = 0x000E000000000000ULL;
+			dma_eng = 0x0000FFFFFFFFFFFFULL;
+		} else {
+
+			/* PBCQ is operating as a x8 stack
+			 * - The maximum number of engines given to CAPP should
+			 * be 6 and will be assigned in the order of 7 to 2.
+			 * - 0-30 (Read machines) are available for capp use.
+			 */
+			stq_eng = 0x0006000000000000ULL;
+			/* 30 Read machines for CAPP Minus 20-27 for DMA */
+			dma_eng = 0x0000FFFFF00E0000ULL;
+		}
 	}
+
 	if (capp_eng & CAPP_MIN_STQ_ENGINES)
 		stq_eng = 0x0002000000000000ULL; /* 2 capp msg engines */
+
+	/* CAPP Control Register. Enable CAPP Mode */
+	reg = 0x8000000000000000ULL; /* PEC works in CAPP Mode */
 	reg |= stq_eng;
 	if (capp_eng & CAPP_MAX_DMA_READ_ENGINES)
 		dma_eng = 0x0000FF0000000000ULL; /* 16 CAPP Read machines */
@@ -3833,23 +3992,13 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 
 	/*
 	 * Bit [0:7] XSL_DSNCTL[capiind]
-	 * Init_25 - CAPI Compare/Mask
+	 * Init_26 - CAPI Compare/Mask
 	 */
 	out_be64(p->regs + PHB_CAPI_CMPM,
-		 0x0200FE0000000000Ull | PHB_CAPI_CMPM_ENABLE);
+		 ((u64)CAPIIND << 48) |
+		 ((u64)CAPIMASK << 32) | PHB_CAPI_CMPM_ENABLE);
 
 	if (!(p->rev == PHB4_REV_NIMBUS_DD10)) {
-		/* Init_24 - ASN Compare/Mask */
-		out_be64(p->regs + PHB_PBL_ASN_CMPM,
-			 0x0400FF0000000000Ull | PHB_PBL_ASN_ENABLE);
-
-		/* PBCQ Tunnel Bar Register
-		 * Write Tunnel register to match PSL TNR register
-		 */
-		xscom_write(p->chip_id,
-			    p->pe_stk_xscom + XPEC_NEST_STK_TUNNEL_BAR,
-			    0x020000E000000000);
-
 		/* PB AIB Hardware Control Register
 		 * Wait 32 PCI clocks for a credit to become available
 		 * before rejecting.
@@ -3894,53 +4043,54 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 	p->tve_cache[pe_number * 2] =
 		tve_encode_50b_noxlate(start_addr, end_addr);
 
-	/* TVT#1: DMA, all memory, in bypass mode */
-	if (dma_tvt == CAPI_DMA_TVT1) {
-		start_addr = (1ull << 59);
-		end_addr   = start_addr + 0x0003ffffffffffffull;
-		p->tve_cache[pe_number * 2 + 1] =
-			tve_encode_50b_noxlate(start_addr, end_addr);
-	}
+	/* TVT#1: CAPI window + DMA, all memory, in bypass mode */
+	start_addr = (1ull << 59);
+	end_addr   = start_addr + 0x0003ffffffffffffull;
+	p->tve_cache[pe_number * 2 + 1] =
+		tve_encode_50b_noxlate(start_addr, end_addr);
 
 	phb4_ioda_sel(p, IODA3_TBL_TVT, 0, true);
 	for (i = 0; i < p->tvt_size; i++)
 		out_be64(p->regs + PHB_IODA_DATA0, p->tve_cache[i]);
 
-	/* set mbt bar to pass capi mmio window. First applied cleared
-	 * values to HW
+	/* set mbt bar to pass capi mmio window and keep the other
+	 * mmio values
 	 */
+	mbt0 = IODA3_MBT0_ENABLE | IODA3_MBT0_TYPE_M64 |
+	       SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
+	       SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
+	       (0x0002000000000000ULL & IODA3_MBT0_BASE_ADDR);
+
+	mbt1 = IODA3_MBT1_ENABLE |
+	       (0x00ff000000000000ULL & IODA3_MBT1_MASK) |
+	       SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, 0ull, pe_number);
+
 	for (i = 0; i < p->mbt_size; i++) {
-		p->mbt_cache[i][0] = 0;
-		p->mbt_cache[i][1] = 0;
+		/* search if the capi mmio window is already present */
+		if ((p->mbt_cache[i][0] == mbt0) &&
+		    (p->mbt_cache[i][1] == mbt1))
+			break;
+
+		/* search a free entry */
+		if ((window_num == -1) &&
+		   ((!(p->mbt_cache[i][0] & IODA3_MBT0_ENABLE)) &&
+		    (!(p->mbt_cache[i][1] & IODA3_MBT1_ENABLE))))
+			window_num = i;
 	}
-	phb4_ioda_sel(p, IODA3_TBL_MBT, 0, true);
-	for (i = 0; i < p->mbt_size; i++) {
-		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][0]);
-		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][1]);
-	}
 
-	p->mbt_cache[0][0] = IODA3_MBT0_ENABLE |
-			     IODA3_MBT0_TYPE_M64 |
-		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
-		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
-		(p->mm0_base & IODA3_MBT0_BASE_ADDR);
-	p->mbt_cache[0][1] = IODA3_MBT1_ENABLE |
-		((~(p->mm0_size - 1)) & IODA3_MBT1_MASK) |
-		SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, 0ull, pe_number);
+	if (window_num >= 0 && i == p->mbt_size) {
+		/* no capi mmio window found, so add it */
+		p->mbt_cache[window_num][0] = mbt0;
+		p->mbt_cache[window_num][1] = mbt1;
 
-	p->mbt_cache[1][0] = IODA3_MBT0_ENABLE |
-			     IODA3_MBT0_TYPE_M64 |
-		SETFIELD(IODA3_MBT0_MODE, 0ull, IODA3_MBT0_MODE_SINGLE_PE) |
-		SETFIELD(IODA3_MBT0_MDT_COLUMN, 0ull, 0) |
-		(0x0002000000000000ULL & IODA3_MBT0_BASE_ADDR);
-	p->mbt_cache[1][1] = IODA3_MBT1_ENABLE |
-		(0x00ff000000000000ULL & IODA3_MBT1_MASK) |
-		SETFIELD(IODA3_MBT1_SINGLE_PE_NUM, 0ull, pe_number);
-
-	phb4_ioda_sel(p, IODA3_TBL_MBT, 0, true);
-	for (i = 0; i < p->mbt_size; i++) {
-		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][0]);
-		out_be64(p->regs + PHB_IODA_DATA0, p->mbt_cache[i][1]);
+		phb4_ioda_sel(p, IODA3_TBL_MBT, window_num << 1, true);
+		out_be64(p->regs + PHB_IODA_DATA0, mbt0);
+		out_be64(p->regs + PHB_IODA_DATA0, mbt1);
+	} else if (i == p->mbt_size) {
+		/* mbt cache full, this case should never happen */
+		PHBERR(p, "CAPP: Failed to add CAPI mmio window\n");
+	} else {
+		/* duplicate entry. Nothing to do */
 	}
 
 	phb4_init_capp_errors(p);
@@ -3949,10 +4099,8 @@ static int64_t enable_capi_mode(struct phb4 *p, uint64_t pe_number,
 
 	if (!chiptod_capp_timebase_sync(p->chip_id, CAPP_TFMR,
 					CAPP_TB,
-					PHB4_CAPP_REG_OFFSET(p))) {
+					PHB4_CAPP_REG_OFFSET(p)))
 		PHBERR(p, "CAPP: Failed to sync timebase\n");
-		return OPAL_HARDWARE;
-	}
 
 	/* set callbacks to handle HMI events */
 	capi_ops.get_capp_info = &phb4_get_capp_info;
@@ -3965,7 +4113,7 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 {
 	struct phb4 *p = phb_to_phb4(phb);
 	struct proc_chip *chip = get_chip(p->chip_id);
-	uint64_t reg;
+	uint64_t reg, ret;
 	uint32_t offset;
 
 
@@ -3989,33 +4137,31 @@ static int64_t phb4_set_capi_mode(struct phb *phb, uint64_t mode,
 	}
 
 	switch (mode) {
-	case OPAL_PHB_CAPI_MODE_PCIE:
-		return OPAL_UNSUPPORTED;
-
 	case OPAL_PHB_CAPI_MODE_CAPI:
-		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT0,
+		ret = enable_capi_mode(p, pe_number,
 					CAPP_MAX_STQ_ENGINES |
 					CAPP_MIN_DMA_READ_ENGINES);
-
-	case OPAL_PHB_CAPI_MODE_DMA:
-		/* shouldn't be called, enabled by default on p9 */
-		return OPAL_UNSUPPORTED;
-
+		disable_fast_reboot("CAPP being enabled");
+		break;
 	case OPAL_PHB_CAPI_MODE_DMA_TVT1:
-		return enable_capi_mode(p, pe_number, CAPI_DMA_TVT1,
+		ret = enable_capi_mode(p, pe_number,
 					CAPP_MIN_STQ_ENGINES |
 					CAPP_MAX_DMA_READ_ENGINES);
-
-	case OPAL_PHB_CAPI_MODE_SNOOP_OFF:
-		/* shouldn't be called */
-		return OPAL_UNSUPPORTED;
-
+		disable_fast_reboot("CAPP being enabled");
+		break;
 	case OPAL_PHB_CAPI_MODE_SNOOP_ON:
-		/* nothing to do */
-		return OPAL_SUCCESS;
+		/* nothing to do P9 if CAPP is alreay enabled */
+		ret = OPAL_SUCCESS;
+		break;
+
+	case OPAL_PHB_CAPI_MODE_PCIE: /* shouldn't be called on p9*/
+	case OPAL_PHB_CAPI_MODE_DMA: /* Enabled by default on p9 */
+	case OPAL_PHB_CAPI_MODE_SNOOP_OFF: /* shouldn't be called on p9*/
+	default:
+		ret = OPAL_UNSUPPORTED;
 	}
 
-	return OPAL_UNSUPPORTED;
+	return ret;
 }
 
 static void phb4_p2p_set_initiator(struct phb4 *p, uint16_t pe_number)
@@ -4095,6 +4241,53 @@ static int64_t phb4_set_capp_recovery(struct phb *phb)
 	return 0;
 }
 
+/*
+ * Return the address out of a PBCQ Tunnel Bar register.
+ */
+static void phb4_get_tunnel_bar(struct phb *phb, uint64_t *addr)
+{
+	struct phb4 *p = phb_to_phb4(phb);
+	uint64_t val;
+
+	xscom_read(p->chip_id, p->pe_stk_xscom + XPEC_NEST_STK_TUNNEL_BAR,
+		   &val);
+	*addr = val >> 8;
+}
+
+/*
+ * Set PBCQ Tunnel Bar register.
+ * Store addr bits [8:50] in PBCQ Tunnel Bar register bits [0:42].
+ * Note that addr bits [8:50] must also match PSL_TNR_ADDR[8:50].
+ * Reset register if val == 0.
+ *
+ * This interface is required to let device drivers set the Tunnel Bar
+ * value of their choice.
+ *
+ * Compatibility with older versions of linux, that do not set the
+ * Tunnel Bar with phb4_set_tunnel_bar(), is ensured by enable_capi_mode(),
+ * that will set the default value that used to be assumed.
+ */
+static int64_t phb4_set_tunnel_bar(struct phb *phb, uint64_t addr)
+{
+	struct phb4 *p = phb_to_phb4(phb);
+	uint64_t mask = 0x00FFFFFFFFFFE000ULL;
+
+	if (!addr) {
+		/* Reset register */
+		xscom_write(p->chip_id,
+			    p->pe_stk_xscom + XPEC_NEST_STK_TUNNEL_BAR, addr);
+		return OPAL_SUCCESS;
+	}
+	if ((addr & ~mask))
+		return OPAL_PARAMETER;
+	if (!(addr & mask))
+		return OPAL_PARAMETER;
+
+	xscom_write(p->chip_id, p->pe_stk_xscom + XPEC_NEST_STK_TUNNEL_BAR,
+		    (addr & mask) << 8);
+	return OPAL_SUCCESS;
+}
+
 static const struct phb_ops phb4_ops = {
 	.cfg_read8		= phb4_pcicfg_read8,
 	.cfg_read16		= phb4_pcicfg_read16,
@@ -4130,6 +4323,8 @@ static const struct phb_ops phb4_ops = {
 	.set_capi_mode		= phb4_set_capi_mode,
 	.set_p2p		= phb4_set_p2p,
 	.set_capp_recovery	= phb4_set_capp_recovery,
+	.get_tunnel_bar         = phb4_get_tunnel_bar,
+	.set_tunnel_bar         = phb4_set_tunnel_bar,
 };
 
 static void phb4_init_ioda3(struct phb4 *p)
@@ -4164,7 +4359,8 @@ static void phb4_init_ioda3(struct phb4 *p)
 	/* See enable_capi_mode() */
 
 	/* Init_25 - ASN Compare/Mask */
-	/* See enable_capi_mode() */
+	out_be64(p->regs + PHB_ASN_CMPM, ((u64)ASNIND << 48) |
+		 ((u64)ASNMASK << 32) | PHB_ASN_CMPM_ENABLE);
 
 	/* Init_26 - CAPI Compare/Mask */
 	/* See enable_capi_mode() */
@@ -4309,7 +4505,7 @@ static void phb4_init_errors(struct phb4 *p)
 	out_be64(p->regs + 0x0d08,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0d18,	0xffffff0fffffffffull);
 	out_be64(p->regs + 0x0d28,	0x0000400a00000000ull);
-	out_be64(p->regs + 0x0d30,	0xdff7bd01f7ddfff0ull); /* XXX CAPI has diff. value */
+	out_be64(p->regs + 0x0d30,	0xdff7bd05f7ddfff0ull); /* XXX CAPI has diff. value */
 	out_be64(p->regs + 0x0d40,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0d48,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0d50,	0x0000000000000000ull);
@@ -4463,6 +4659,13 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 				 be64_to_cpu(p->lane_eq[7]));
 		}
 	}
+	if (!p->lane_eq_en) {
+		/* Read modify write and set to 2 bits */
+		PHBDBG(p, "LINK: Disabling Lane EQ\n");
+		val = in_be64(p->regs + PHB_PCIE_DLP_CTL);
+		val |= PHB_PCIE_DLP_CTL_BYPASS_PH2 | PHB_PCIE_DLP_CTL_BYPASS_PH2;
+		out_be64(p->regs + PHB_PCIE_DLP_CTL, val);
+	}
 
 	/* Init_14 - Clear link training */
 	phb4_pcicfg_write32(&p->phb, 0, 0x78,
@@ -4487,7 +4690,8 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 		val |= SETFIELD(PHB_CTRLR_TVT_ADDR_SEL, 0ull, TVT_DD1_2_PER_PE);
 	} else {
 		val |= SETFIELD(PHB_CTRLR_TVT_ADDR_SEL, 0ull, TVT_2_PER_PE);
-		val |= PHB_CTRLR_IRQ_STORE_EOI;
+		if (PHB4_CAN_STORE_EOI(p))
+			val |= PHB_CTRLR_IRQ_STORE_EOI;
 	}
 
 	if (!pci_eeh_mmio)
@@ -4560,13 +4764,13 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 	out_be64(p->regs + PHB_TIMEOUT_CTRL1,			0x0015150000150000ull);
 
 	/* Init_134 - Timeout Control Register 2 */
-	out_be64(p->regs + PHB_TIMEOUT_CTRL2,			0x0000181700000000ull);
+	out_be64(p->regs + PHB_TIMEOUT_CTRL2,			0x0000151500000000ull);
 
 	/* Init_135 - PBL Timeout Control Register */
 	out_be64(p->regs + PHB_PBL_TIMEOUT_CTRL,		0x2013000000000000ull);
 
 	/* Mark the PHB as functional which enables all the various sequences */
-	p->state = PHB4_STATE_FUNCTIONAL;
+	p->broken = false;
 
 	PHBDBG(p, "Initialization complete\n");
 
@@ -4574,7 +4778,7 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 
  failed:
 	PHBERR(p, "Initialization failed\n");
-	p->state = PHB4_STATE_BROKEN;
+	p->broken = true;
 }
 
 /* FIXME: Use scoms rather than MMIO incase we are fenced */
@@ -4769,6 +4973,10 @@ static void phb4_add_properties(struct phb4 *p)
 
 	/* Indicate to Linux that CAPP timebase sync is supported */
 	dt_add_property_string(np, "ibm,capp-timebase-sync", NULL);
+
+	/* Tell Linux Compare/Mask indication values */
+	dt_add_property_cells(np, "ibm,phb-indications", CAPIIND, ASNIND,
+			      NBWIND);
 }
 
 static bool phb4_calculate_windows(struct phb4 *p)
@@ -4827,7 +5035,7 @@ static void phb4_err_interrupt(struct irq_source *is, uint32_t isn)
 				OPAL_EVENT_PCI_ERROR);
 
 	/* If the PHB is broken, go away */
-	if (p->state == PHB3_STATE_BROKEN)
+	if (p->broken)
 		return;
 
 	/*
@@ -4846,7 +5054,7 @@ static uint64_t phb4_lsi_attributes(struct irq_source *is __unused,
 	uint32_t idx = isn - p->base_lsi;
 
 	if (idx == PHB3_LSI_PCIE_INF || idx == PHB3_LSI_PCIE_ER)
-		return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_RARE;
+		return IRQ_ATTR_TARGET_OPAL | IRQ_ATTR_TARGET_RARE | IRQ_ATTR_TYPE_LSI;
 #endif
 	return IRQ_ATTR_TARGET_LINUX;
 }
@@ -4929,7 +5137,6 @@ static void phb4_create(struct dt_node *np)
 	p->phb.ops = &phb4_ops;
 	p->phb.phb_type = phb_type_pcie_v4;
 	p->phb.scan_map = 0x1; /* Only device 0 to scan */
-	p->state = PHB4_STATE_UNINITIALIZED;
 
 	if (!phb4_calculate_windows(p))
 		return;
@@ -5021,6 +5228,7 @@ static void phb4_create(struct dt_node *np)
 	PHBINF(p, "Max link speed: GEN%i\n", p->max_link_speed);
 
 	/* Check for lane equalization values from HB or HDAT */
+	p->lane_eq_en = true;
 	p->lane_eq = dt_prop_get_def_size(np, "ibm,lane-eq", NULL, &lane_eq_len);
 	if (p->rev == PHB4_REV_NIMBUS_DD10)
 		lane_eq_len_req = 8 * 8;
@@ -5078,10 +5286,16 @@ static void phb4_create(struct dt_node *np)
 	/* Load capp microcode into capp unit */
 	load_capp_ucode(p);
 
-	/* Register all interrupt sources with XIVE */
-	irq_flags = XIVE_SRC_SHIFT_BUG | XIVE_SRC_TRIGGER_PAGE;
-	if (p->rev >= PHB4_REV_NIMBUS_DD20)
+	/* Compute XIVE source flags depending on PHB revision */
+	irq_flags = 0;
+	if (p->rev == PHB4_REV_NIMBUS_DD10)
+		irq_flags |= XIVE_SRC_SHIFT_BUG;
+	if (PHB4_CAN_STORE_EOI(p))
 		irq_flags |= XIVE_SRC_STORE_EOI;
+	else
+		irq_flags |= XIVE_SRC_TRIGGER_PAGE;
+
+	/* Register all interrupt sources with XIVE */
 	xive_register_hw_source(p->base_msi, p->num_irqs - 8, 16,
 				p->int_mmio, irq_flags, NULL, NULL);
 
@@ -5101,7 +5315,7 @@ static void phb4_create(struct dt_node *np)
 	return;
 
  failed:
-	p->state = PHB4_STATE_BROKEN;
+	p->broken = true;
 
 	/* Tell Linux it's broken */
 	dt_add_property_string(np, "status", "error");
@@ -5188,6 +5402,10 @@ static void phb4_probe_stack(struct dt_node *stk_node, uint32_t pec_index,
 		prerror("PHB[%d:%d] No MMIO windows enabled !\n", gcid, phb_num);
 		return;
 	}
+
+	/* Clear errors in PFIR and NFIR */
+	xscom_write(gcid, pci_stack + XPEC_PCI_STK_PCI_FIR, 0);
+	xscom_write(gcid, nest_stack + XPEC_NEST_STK_PCI_NFIR, 0);
 
 	/* Check ETU reset */
 	xscom_read(gcid, pci_stack + XPEC_PCI_STK_ETU_RESET, &val);

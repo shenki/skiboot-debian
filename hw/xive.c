@@ -487,6 +487,9 @@ struct xive {
 	void		*q_ovf;
 };
 
+#define XIVE_CAN_STORE_EOI(x) \
+	(XIVE_STORE_EOI_ENABLED && ((x)->rev >= XIVE_REV_2))
+
 /* Global DT node */
 static struct dt_node *xive_dt_node;
 
@@ -1751,7 +1754,11 @@ static bool xive_config_init(struct xive *x)
 
 	/* Enable StoreEOI */
 	val = xive_regr(x, VC_SBC_CONFIG);
-	val |= VC_SBC_CONF_CPLX_CIST | VC_SBC_CONF_CIST_BOTH;
+	if (XIVE_CAN_STORE_EOI(x))
+		val |= VC_SBC_CONF_CPLX_CIST | VC_SBC_CONF_CIST_BOTH;
+	else
+		xive_dbg(x, "store EOI is disabled\n");
+
 	val |= VC_SBC_CONF_NO_UPD_PRF;
 	xive_regw(x, VC_SBC_CONFIG, val);
 
@@ -2797,7 +2804,7 @@ void xive_register_ipi_source(uint32_t base, uint32_t count, void *data,
 	assert(s);
 
 	/* Store EOI supported on DD2.0 */
-	if (x->rev >= XIVE_REV_2)
+	if (XIVE_CAN_STORE_EOI(x))
 		flags |= XIVE_SRC_STORE_EOI;
 
 	/* Callbacks assume the MMIO base corresponds to the first
@@ -2905,7 +2912,7 @@ static struct xive *init_one_xive(struct dt_node *np)
 
 	/* Register built-in source controllers (aka IPIs) */
 	flags = XIVE_SRC_EOI_PAGE1 | XIVE_SRC_TRIGGER_PAGE;
-	if (x->rev >= XIVE_REV_2)
+	if (XIVE_CAN_STORE_EOI(x))
 		flags |= XIVE_SRC_STORE_EOI;
 	__xive_register_source(x, &x->ipis, x->int_base,
 			       x->int_hw_bot - x->int_base, IPI_ESB_SHIFT,
@@ -3226,7 +3233,7 @@ void xive_late_init(void)
 {
 	struct cpu_thread *c;
 
-	prlog(PR_NOTICE, "SLW: Configuring self-restore for NCU_SPEC_BAR\n");
+	prlog(PR_INFO, "SLW: Configuring self-restore for NCU_SPEC_BAR\n");
 	for_each_present_cpu(c) {
 		if(cpu_is_thread0(c)) {
 			struct proc_chip *chip = get_chip(c->chip_id);
@@ -4395,6 +4402,7 @@ static int64_t opal_xive_set_vp_info(uint64_t vp_id,
 				xive_dbg(x, "Attempt at enabling single escalate"
 					 " on xive rev %d failed\n",
 					 x->rev);
+				unlock(&x->lock);
 				return OPAL_PARAMETER;
 			}
 			rc = xive_setup_silent_gather(vp_id, true);
@@ -4421,8 +4429,8 @@ static int64_t opal_xive_set_vp_info(uint64_t vp_id,
 	if (!(flags & OPAL_XIVE_VP_ENABLED))
 		xive_vpc_scrub_clean(x, blk, idx);
 
-	unlock(&x->lock);
 bail:
+	unlock(&x->lock);
 	return rc;
 }
 

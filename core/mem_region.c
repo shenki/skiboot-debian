@@ -1,4 +1,4 @@
-/* Copyright 2013-2017 IBM Corp.
+/* Copyright 2013-2018 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,9 +25,6 @@
 #include <types.h>
 #include <mem_region.h>
 #include <mem_region-malloc.h>
-
-int64_t mem_dump_free(void);
-void mem_dump_allocs(void);
 
 /* Memory poisoning on free (if POISON_MEM_REGION set to 1) */
 #ifdef DEBUG
@@ -622,6 +619,18 @@ bool mem_check(const struct mem_region *region)
 	return true;
 }
 
+bool mem_check_all(void)
+{
+	struct mem_region *r;
+
+	list_for_each(&regions, r, list) {
+		if (!mem_check(r))
+			return false;
+	}
+
+	return true;
+}
+
 static struct mem_region *new_region(const char *name,
 				     uint64_t start, uint64_t len,
 				     struct dt_node *node,
@@ -912,15 +921,6 @@ bool mem_range_is_reserved(uint64_t start, uint64_t size)
 	return false;
 }
 
-void adjust_cpu_stacks_alloc(void)
-{
-	/* CPU stacks start at 0, then when we know max possible PIR,
-	 * we adjust, then when we bring all CPUs online we know the
-	 * runtime max PIR, so we adjust this a few times during boot.
-	 */
-	skiboot_cpu_stacks.len = (cpu_max_pir + 1) * STACK_SIZE;
-}
-
 static void mem_region_parse_reserved_properties(void)
 {
 	const struct dt_property *names, *ranges;
@@ -1054,7 +1054,11 @@ void mem_region_init(void)
 		unlock(&mem_region_lock);
 	}
 
-	adjust_cpu_stacks_alloc();
+	/*
+	 * This is called after we know the maximum PIR of all CPUs,
+	 * so we can dynamically set the stack length.
+	 */
+	skiboot_cpu_stacks.len = (cpu_max_pir + 1) * STACK_SIZE;
 
 	lock(&mem_region_lock);
 
@@ -1158,6 +1162,71 @@ void mem_region_release_unused(void)
 			}
 			list_add(&regions, &for_linux->list);
 		}
+	}
+	unlock(&mem_region_lock);
+}
+
+static void mem_clear_range(uint64_t s, uint64_t e)
+{
+	uint64_t res_start, res_end;
+
+	/* Skip exception vectors */
+	if (s < EXCEPTION_VECTORS_END)
+		s = EXCEPTION_VECTORS_END;
+
+	/* Skip kernel preload area */
+	res_start = (uint64_t)KERNEL_LOAD_BASE;
+	res_end = res_start + KERNEL_LOAD_SIZE;
+
+	if (s >= res_start && s < res_end)
+	       s = res_end;
+	if (e > res_start && e <= res_end)
+	       e = res_start;
+	if (e <= s)
+		return;
+	if (s < res_start && e > res_end) {
+		mem_clear_range(s, res_start);
+		mem_clear_range(res_end, e);
+		return;
+	}
+
+	/* Skip initramfs preload area */
+	res_start = (uint64_t)INITRAMFS_LOAD_BASE;
+	res_end = res_start + INITRAMFS_LOAD_SIZE;
+
+	if (s >= res_start && s < res_end)
+	       s = res_end;
+	if (e > res_start && e <= res_end)
+	       e = res_start;
+	if (e <= s)
+		return;
+	if (s < res_start && e > res_end) {
+		mem_clear_range(s, res_start);
+		mem_clear_range(res_end, e);
+		return;
+	}
+
+	prlog(PR_NOTICE, "Clearing region %llx-%llx\n",
+	      (long long)s, (long long)e);
+	memset((void *)s, 0, e - s);
+}
+
+void mem_region_clear_unused(void)
+{
+	struct mem_region *r;
+
+	lock(&mem_region_lock);
+	assert(mem_regions_finalised);
+
+	prlog(PR_NOTICE, "Clearing unused memory:\n");
+	list_for_each(&regions, r, list) {
+		/* If it's not unused, ignore it. */
+		if (!(r->type == REGION_OS))
+			continue;
+
+		assert(r != &skiboot_heap);
+
+		mem_clear_range(r->start, r->start + r->len);
 	}
 	unlock(&mem_region_lock);
 }

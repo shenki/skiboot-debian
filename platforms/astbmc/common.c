@@ -137,6 +137,9 @@ void astbmc_init(void)
 	/* Preload PNOR VERSION section */
 	flash_fw_version_preload();
 
+	/* Request BMC information */
+	ipmi_get_bmc_info_request();
+
 	/* As soon as IPMI is up, inform BMC we are in "S0" */
 	ipmi_set_power_state(IPMI_PWR_SYS_S0_WORKING, IPMI_PWR_NOCHANGE);
 
@@ -150,6 +153,9 @@ void astbmc_init(void)
 
 	/* Add ibm,firmware-versions node */
 	flash_dt_add_fw_version();
+
+	/* Add BMC firmware info to device tree */
+	ipmi_dt_add_bmc_info();
 }
 
 int64_t astbmc_ipmi_power_down(uint64_t request)
@@ -207,8 +213,9 @@ static void astbmc_fixup_dt_mbox(struct dt_node *lpc)
 	struct dt_node *mbox;
 	char namebuf[32];
 
-	/* All P9 machines have this and no earlier machines do */
-	if (proc_gen != proc_gen_p9)
+	/* All P9 machines use mbox. P8 machines can indicate they support
+	 * it using the scratch register */
+	if (proc_gen != proc_gen_p9 && !ast_scratch_reg_is_mbox())
 		return;
 
 	/* First check if the mbox interface is already there */
@@ -342,7 +349,8 @@ static void astbmc_fixup_dt(void)
 	   make sure we have one. */
 	astbmc_fixup_dt_system_id();
 
-	astbmc_fixup_bmc_sensors();
+	if (proc_gen == proc_gen_p8)
+		astbmc_fixup_bmc_sensors();
 }
 
 static void astbmc_fixup_psi_bar(void)
@@ -417,11 +425,11 @@ void astbmc_early_init(void)
 
 const struct bmc_platform astbmc_ami = {
 	.name = "AMI",
-	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x32, 0xf0),
+	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
 	.ipmi_oem_pnor_access_status = IPMI_CODE(0x3a, 0x07),
 };
 
 const struct bmc_platform astbmc_openbmc = {
 	.name = "OpenBMC",
-	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x32, 0xf0),
+	.ipmi_oem_partial_add_esel   = IPMI_CODE(0x3a, 0xf0),
 };

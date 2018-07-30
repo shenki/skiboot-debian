@@ -1,6 +1,17 @@
 # need to get images path defined early
 source $env(LIB_DIR)/ppc/util.tcl
 
+#
+# Call tclreadline's Loop to move to friendlier
+# commandline if one exists
+#
+proc readline { } {
+    set readline [catch { package require tclreadline }]
+    if { $readline == 0 } {
+        ::tclreadline::Loop
+    }
+}
+
 proc mconfig { name env_name def } {
     global mconf
     global env
@@ -61,6 +72,9 @@ mconfig net MAMBO_NET none
 # Net: What is the base interface for the tun/tap device
 mconfig tap_base MAMBO_NET_TAP_BASE 0
 
+# Enable (default) or disable the "speculation-policy-favor-security" setting,
+# set to 0 to disable. When enabled it causes Linux's RFI flush to be enabled.
+mconfig speculation_policy_favor_security MAMBO_SPECULATION_POLICY_FAVOR_SECURITY 1
 
 #
 # Create machine config
@@ -93,7 +107,7 @@ if { $default_config == "PEGASUS" } {
 if { $default_config == "P9" } {
     # PVR configured for POWER9 DD2.0 Scale out 24 Core (ie SMT4)
     myconf config processor/initial/PVR 0x4e1200
-    myconf config processor/initial/SIM_CTRL1 0xc228000400000000
+    myconf config processor/initial/SIM_CTRL1 0xc228100400000000
 
     if { $mconf(numa) } {
         myconf config memory_region_id_shift 45
@@ -224,6 +238,61 @@ if { [info exists env(SKIBOOT_INITRD)] } {
     mysim of addprop $chosen_node int "linux,initrd-end"   $cpio_end
 }
 
+# Map persistent memory disks
+if { [info exists env(PMEM_DISK)] } {
+
+    set pmem_files [split $env(PMEM_DISK) ","]
+
+    set pmem_root [mysim of addchild $root_node "pmem" ""]
+    mysim of addprop $pmem_root int "#address-cells" 2
+    mysim of addprop $pmem_root int "#size-cells" 2
+    mysim of addprop $pmem_root empty "ranges" ""
+
+    # Start above where XICS normally is at 0x1A0000000000
+    set pmem_start [expr 0x20000000000]
+    foreach pmem_file $pmem_files {
+	set pmem_file [string trim $pmem_file]
+	set pmem_size [file size $pmem_file]
+	set pmem_start_hex [format %x $pmem_start]
+	set pmem_node [mysim of addchild $pmem_root "pmem@$pmem_start_hex" ""]
+	set reg [list [expr $pmem_start >> 32] [expr $pmem_start & 0xffffffff] [expr $pmem_size >> 32] [expr $pmem_size & 0xffffffff] ]
+	mysim of addprop $pmem_node array "reg" reg
+	mysim of addprop $pmem_node string "compatible" "pmem-region"
+	mysim of addprop $pmem_root empty "volatile" ""
+	if {[catch {mysim memory mmap $pmem_start $pmem_size $pmem_file rw}]} {
+	    puts "ERROR: pmem: 'mysim mmap' command needs newer mambo"
+	    exit
+	}
+	set pmem_start [expr $pmem_start + $pmem_size]
+    }
+}
+
+if { [info exists env(PMEM_VOLATILE)] } {
+
+    set pmem_sizes [split $env(PMEM_VOLATILE) ","]
+
+    set pmem_root [mysim of addchild $root_node "pmem" ""]
+    mysim of addprop $pmem_root int "#address-cells" 2
+    mysim of addprop $pmem_root int "#size-cells" 2
+    mysim of addprop $pmem_root empty "ranges" ""
+
+    # Start above where XICS normally is at 0x1A0000000000
+    if (![info exists pmem_start]) {
+        set pmem_start [expr 0x20000000000]
+    }
+
+    foreach pmem_size $pmem_sizes {
+	set pmem_size [string trim $pmem_size]
+	set pmem_start_hex [format %x $pmem_start]
+	set pmem_node [mysim of addchild $pmem_root "pmem@$pmem_start_hex" ""]
+	set reg [list [expr $pmem_start >> 32] [expr $pmem_start & 0xffffffff] [expr $pmem_size >> 32] [expr $pmem_size & 0xffffffff] ]
+	mysim of addprop $pmem_node array "reg" reg
+	mysim of addprop $pmem_node string "compatible" "pmem-region"
+	mysim of addprop $pmem_root int "volatile" 1
+	set pmem_start [expr $pmem_start + $pmem_size]
+    }
+}
+
 # Default NVRAM is blank and will be formatted by Skiboot if no file is provided
 set fake_nvram_start $cpio_end
 set fake_nvram_size 0x40000
@@ -251,12 +320,30 @@ set reg [list $fake_nvram_start $fake_nvram_size ]
 mysim of addprop $fake_nvram_node array64 "reg" reg
 mysim of addprop $fake_nvram_node empty "name" "ibm,fake-nvram"
 
+set opal_node [mysim of addchild $root_node "ibm,opal" ""]
+
 # Allow P9 to use all idle states
 if { $default_config == "P9" } {
-    set opal_node [mysim of addchild $root_node "ibm,opal" ""]
     set power_mgt_node [mysim of addchild $opal_node "power-mgt" ""]
     mysim of addprop $power_mgt_node int "ibm,enabled-stop-levels" 0xffffffff
 }
+
+proc add_feature_node { parent name { value 1 } } {
+    if { $value != 1 } {
+	set value "disabled"
+    } else {
+	set value "enabled"
+    }
+    set np [mysim of addchild $parent $name ""]
+    mysim of addprop $np empty $value ""
+}
+
+set np [mysim of addchild $opal_node "fw-features" ""]
+add_feature_node $np "speculation-policy-favor-security" $mconf(speculation_policy_favor_security)
+add_feature_node $np "needs-l1d-flush-msr-hv-1-to-0"
+add_feature_node $np "needs-l1d-flush-msr-pr-0-to-1"
+add_feature_node $np "needs-spec-barrier-for-bound-checks"
+
 
 # Init CPUs
 set pir 0
@@ -481,5 +568,7 @@ epapr::of2dtb mysim $mconf(epapr_dt_addr)
 mysim mode fastest
 
 if { [info exists env(SKIBOOT_AUTORUN)] } {
-    mysim go
+    if [catch { mysim go }] {
+	readline
+    }
 }

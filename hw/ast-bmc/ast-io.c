@@ -95,7 +95,28 @@
 #define BMC_SIO_SCR28 0x28
 #define BOOT_FLAGS_VERSION 0x42
 
+/*
+ *  SIO Register 0x29: Boot Flags (normal bit ordering)
+ *
+ *       [7:6] Hostboot Boot mode:
+ *              00 : Normal
+ *              01 : Terminate on first error
+ *              10 : istep mode
+ *              11 : reserved
+ *       [5:4] Boot options
+ *              00 : reserved
+ *              01 : Memboot
+ *              10 : Clear gard
+ *              11 : reserved
+ *       [ 3 ] BMC mbox PNOR driver
+ *       [2:0] Hostboot Log level:
+ *                 000 : Normal
+ *                 001 : Enable Scan trace
+ *                 xxx : reserved
+ */
+
 #define BMC_SIO_SCR29 0x29
+#define BMC_SIO_SCR29_MBOX 0x08
 #define BMC_SIO_SCR29_MEMBOOT 0x10
 
 enum {
@@ -405,6 +426,19 @@ bool ast_is_ahb_lpc_pnor(void)
 
 	boot_flags = bmc_sio_inb(BMC_SIO_SCR29);
 	return !(boot_flags & BMC_SIO_SCR29_MEMBOOT);
+}
+
+bool ast_scratch_reg_is_mbox(void)
+{
+	uint8_t boot_version;
+	uint8_t boot_flags;
+
+	boot_version = bmc_sio_inb(BMC_SIO_SCR28);
+	if (boot_version != BOOT_FLAGS_VERSION)
+		return false;
+
+	boot_flags = bmc_sio_inb(BMC_SIO_SCR29);
+	return boot_flags & BMC_SIO_SCR29_MBOX;
 }
 
 void ast_setup_ibt(uint16_t io_base, uint8_t irq)
