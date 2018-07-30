@@ -1,3 +1,11 @@
+skiboot (6.1-1ubuntu1) UNRELEASED; urgency=medium
+
+  * New upstream version 6.1
+  * d/patches/0002-opal-prd-Insert-powernv_flash-module.patch removed as it's
+    applied upstream
+
+ -- Joel Stanley <joel@jms.id.au>  Mon, 30 Jul 2018 16:39:28 +0930
+
 skiboot (5.10~rc4-2) unstable; urgency=medium
 
   * Fix opal-prd spinning and consuming 100% CPU
